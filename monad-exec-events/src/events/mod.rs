@@ -87,7 +87,7 @@ pub enum ExecEvent {
         data_bytes: Box<[u8]>,
     },
     TxnCallFrame {
-        txn_index: usize,
+        txn_index: Option<usize>,
         txn_call_frame: monad_exec_txn_call_frame,
         input_bytes: Box<[u8]>,
         return_bytes: Box<[u8]>,
@@ -160,7 +160,7 @@ pub enum ExecEventRef<'ring> {
         data_bytes: &'ring [u8],
     },
     TxnCallFrame {
-        txn_index: usize,
+        txn_index: Option<usize>,
         txn_call_frame: &'ring monad_exec_txn_call_frame,
         input_bytes: &'ring [u8],
         return_bytes: &'ring [u8],
@@ -505,10 +505,7 @@ impl EventDecoder for ExecEventDecoder {
                     .expect("TxnCallFrame event valid");
 
                 ExecEventRef::TxnCallFrame {
-                    txn_index: info
-                        .flow_info
-                        .txn_idx
-                        .expect("TxnCallFrame event has txn_idx in flow_info"),
+                    txn_index: info.flow_info.txn_idx,
                     txn_call_frame,
                     input_bytes,
                     return_bytes,
