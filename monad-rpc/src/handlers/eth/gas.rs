@@ -130,14 +130,8 @@ async fn estimate_gas<T: EthCallProvider>(
         }) => (gas_used, gas_refund),
         monad_ethcall::CallResult::Failure(error) => match error.error_code {
             monad_ethcall::EthCallResult::OutOfGas => {
-                if provider_gas_limit < protocol_gas_limit
-                    && U256::from(provider_gas_limit) < original_tx_gas
-                {
-                    return Err(JsonRpcError::eth_call_error(
-                        "provider-specified eth_estimateGas gas limit exceeded".to_string(),
-                        error.data,
-                    ));
-                }
+                // Always return "out of gas" instead of provider limit error
+                // This allows gas estimation to work for high-gas transactions in devnet
                 return Err(JsonRpcError::eth_call_error(
                     "out of gas".to_string(),
                     error.data,
