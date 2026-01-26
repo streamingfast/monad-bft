@@ -193,7 +193,7 @@ where
                 .get(tx.signer_ref())
                 .is_none_or(|account_balance_state| {
                     account_balance_state.balance
-                        < last_commit_base_fee.saturating_mul(tx.gas_limit())
+                        < tx.max_fee_per_gas().saturating_mul(tx.gas_limit())
                 })
             {
                 event_tracker.drop(tx.hash(), EthTxPoolDropReason::InsufficientBalance);
