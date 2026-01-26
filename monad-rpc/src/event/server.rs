@@ -43,7 +43,7 @@ impl EventServer<ExecEventRing> {
 
         let this = Self {
             event_ring,
-            block_builder: CommitStateBlockBuilder::new(ExecutedBlockBuilder::new(false)),
+            block_builder: CommitStateBlockBuilder::new(ExecutedBlockBuilder::new(false, false)),
             broadcast_tx: broadcast_tx.clone(),
         };
 
@@ -125,7 +125,7 @@ impl EventServer<SnapshotEventRing<ExecEventDecoder>> {
 
         let this = Self {
             event_ring: snapshot_event_ring,
-            block_builder: CommitStateBlockBuilder::new(ExecutedBlockBuilder::new(false)),
+            block_builder: CommitStateBlockBuilder::new(ExecutedBlockBuilder::new(false, false)),
             broadcast_tx: broadcast_tx.clone(),
         };
 
