@@ -64,9 +64,11 @@ impl EthCallExecutor {
 
         let eth_call_executor = unsafe {
             bindings::monad_eth_call_executor_create(
-                low_pool_config,
-                high_pool_config,
+                low_pool_config.num_threads,
+                low_pool_config.num_fibers,
                 node_lru_max_mem,
+                low_pool_config.timeout_sec,
+                high_pool_config.timeout_sec,
                 dbpath.as_c_str().as_ptr(),
             )
         };
