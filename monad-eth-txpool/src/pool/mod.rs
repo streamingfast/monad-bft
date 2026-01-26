@@ -192,8 +192,9 @@ where
             if account_balances
                 .get(tx.signer_ref())
                 .is_none_or(|account_balance_state| {
-                    account_balance_state.balance
-                        < tx.max_fee_per_gas().saturating_mul(tx.gas_limit())
+                    let upfront_cost = tx.value()
+                        .saturating_add(tx.max_fee_per_gas().saturating_mul(tx.gas_limit()));
+                    account_balance_state.balance < upfront_cost
                 })
             {
                 event_tracker.drop(tx.hash(), EthTxPoolDropReason::InsufficientBalance);

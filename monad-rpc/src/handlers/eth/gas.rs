@@ -130,8 +130,6 @@ async fn estimate_gas<T: EthCallProvider>(
         }) => (gas_used, gas_refund),
         monad_ethcall::CallResult::Failure(error) => match error.error_code {
             monad_ethcall::EthCallResult::OutOfGas => {
-                // Always return "out of gas" instead of provider limit error
-                // This allows gas estimation to work for high-gas transactions in devnet
                 return Err(JsonRpcError::eth_call_error(
                     "out of gas".to_string(),
                     error.data,
@@ -243,13 +241,6 @@ pub async fn monad_eth_estimateGas<T: Triedb>(
         }
         (None, data) | (data, None) => data,
     };
-
-    if params.tx.gas > Some(U256::from(provider_gas_limit)) {
-        return Err(JsonRpcError::eth_call_error(
-            "user-specified gas exceeds provider limit".to_string(),
-            None,
-        ));
-    }
 
     let block_key = get_block_key_from_tag(triedb_env, params.block);
     let version_exist = triedb_env
