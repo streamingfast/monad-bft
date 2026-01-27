@@ -56,6 +56,7 @@ pub struct EthAccount {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct ProposedEthHeader {
+    pub parent_hash: [u8; 32],
     pub ommers_hash: [u8; 32],
     pub beneficiary: Address,
     pub transactions_root: [u8; 32],
@@ -79,6 +80,7 @@ pub struct ProposedEthHeader {
 impl ProposedEthHeader {
     fn header_payload_length(&self) -> usize {
         let mut length = 0;
+        length += self.parent_hash.length();
         length += self.ommers_hash.length();
         length += self.beneficiary.length();
         length += self.transactions_root.length();
@@ -117,6 +119,7 @@ impl Encodable for ProposedEthHeader {
             payload_length: self.header_payload_length(),
         };
         list_header.encode(out);
+        self.parent_hash.encode(out);
         self.ommers_hash.encode(out);
         self.beneficiary.encode(out);
         self.transactions_root.encode(out);
@@ -147,6 +150,7 @@ impl Decodable for ProposedEthHeader {
         }
         let starting_len = buf.len();
         let mut this = Self {
+            parent_hash: Decodable::decode(buf)?,
             ommers_hash: Decodable::decode(buf)?,
             beneficiary: Decodable::decode(buf)?,
             transactions_root: Decodable::decode(buf)?,

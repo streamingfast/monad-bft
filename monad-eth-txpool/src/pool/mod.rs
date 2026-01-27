@@ -358,7 +358,13 @@ where
             None
         };
 
+        let parent_hash = extending_blocks
+            .last()
+            .and_then(|b| b.header.0.hash.map(|h| h.0))
+            .unwrap_or([0_u8; 32]);
+
         let header = ProposedEthHeader {
+            parent_hash,
             transactions_root: *alloy_consensus::proofs::calculate_transaction_root(
                 &body.transactions,
             ),
