@@ -164,7 +164,7 @@ where
         // delay k. Since block_policy looks up seqnum - execution_delay, passing the last commit
         // seqnum will result in a lookup at N-k. As a fix, we add 1 so the seqnum is on the edge of
         // the range at N-k+1.
-        let block_seq_num = block_policy.get_last_commit() + SeqNum(1);
+        let _block_seq_num = block_policy.get_last_commit() + SeqNum(1);
 
         let addresses = txs.iter().map(ValidEthTransaction::signer).collect_vec();
 
@@ -360,7 +360,7 @@ where
 
         let parent_hash = extending_blocks
             .last()
-            .and_then(|b| b.header.0.hash.map(|h| h.0))
+            .and_then(|b| b.header().0.hash.map(|h| h.0))
             .unwrap_or([0_u8; 32]);
 
         let header = ProposedEthHeader {
