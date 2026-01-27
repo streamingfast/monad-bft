@@ -110,6 +110,9 @@ jobs:
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-flags: |
+            --allow-insecure-entitlement security.insecure
 
       - name: Get execution commit hash
         run: echo "GIT_COMMIT_HASH=$(git -C monad-cxx/monad-execution rev-parse --short HEAD)" >> $GITHUB_ENV
@@ -124,5 +127,6 @@ jobs:
           target: runner
           build-args: |
             GIT_COMMIT_HASH=${{ env.GIT_COMMIT_HASH }}
+          allow: security.insecure
           cache-from: type=gha,scope=monad-execution
           cache-to: type=gha,scope=monad-execution,mode=max
