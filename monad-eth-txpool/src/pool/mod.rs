@@ -360,7 +360,8 @@ where
 
         let parent_hash = extending_blocks
             .last()
-            .and_then(|b| b.block.finalized_execution_header().hash.map(|h| h.0))
+            .and_then(|b| b.block.get_execution_results().last())
+            .map(|h| h.0.parent_hash.0)
             .unwrap_or([0_u8; 32]);
 
         let header = ProposedEthHeader {
