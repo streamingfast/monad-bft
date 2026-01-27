@@ -169,7 +169,7 @@ where
         let addresses = txs.iter().map(ValidEthTransaction::signer).collect_vec();
 
         let account_balances = match block_policy.compute_account_base_balances(
-            block_seq_num,
+            last_commit.seq_num,
             state_backend,
             chain_config,
             None,
