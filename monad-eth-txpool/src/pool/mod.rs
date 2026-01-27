@@ -192,9 +192,7 @@ where
             if account_balances
                 .get(tx.signer_ref())
                 .is_none_or(|account_balance_state| {
-                    tx.apply_max_value(account_balance_state.balance)
-                        .and_then(|balance| tx.apply_max_gas_cost(balance))
-                        .is_none()
+                    tx.apply_max_value(account_balance_state.balance).is_none()
                 })
             {
                 event_tracker.drop(tx.hash(), EthTxPoolDropReason::InsufficientBalance);
