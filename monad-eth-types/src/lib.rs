@@ -312,6 +312,7 @@ mod test {
         // new encoding with requests_hash == None can be decoded as old header
 
         let new_header = ProposedEthHeader {
+            parent_hash: [0_u8; 32],
             ommers_hash: *EMPTY_OMMER_ROOT_HASH,
             beneficiary: Address::new([0xff_u8; 20]),
             transactions_root: *EMPTY_TRANSACTIONS,

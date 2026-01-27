@@ -2174,6 +2174,7 @@ mod test {
                 &self.val_epoch_map,
                 &self.election,
                 |seq_num, timestamp_ns, round_signature: RoundSignature<_>| ProposedEthHeader {
+                    parent_hash: [0_u8; 32],
                     transactions_root: *EMPTY_TRANSACTIONS,
                     ommers_hash: *EMPTY_OMMER_ROOT_HASH,
                     withdrawals_root: *EMPTY_WITHDRAWALS,
@@ -2206,6 +2207,7 @@ mod test {
                 &self.val_epoch_map,
                 &self.election,
                 |seq_num, timestamp_ns, round_signature| ProposedEthHeader {
+                    parent_hash: [0_u8; 32],
                     transactions_root: *EMPTY_TRANSACTIONS,
                     ommers_hash: *EMPTY_OMMER_ROOT_HASH,
                     withdrawals_root: *EMPTY_WITHDRAWALS,
@@ -2221,7 +2223,7 @@ mod test {
                     blob_gas_used: 0,
                     excess_blob_gas: 0,
                     parent_beacon_block_root: [0_u8; 32],
-                    requests_hash: Some([0_u8; 32]),
+                    requests_hash: Some([0_u8; 32],
                 },
                 delayed_execution_results,
             )
@@ -2239,6 +2241,7 @@ mod test {
                 &self.val_epoch_map,
                 &self.election,
                 |seq_num, timestamp_ns, round_signature| ProposedEthHeader {
+                    parent_hash: [0_u8; 32],
                     transactions_root: *EMPTY_TRANSACTIONS,
                     ommers_hash: *EMPTY_OMMER_ROOT_HASH,
                     withdrawals_root: *EMPTY_WITHDRAWALS,
@@ -2254,7 +2257,7 @@ mod test {
                     blob_gas_used: 0,
                     excess_blob_gas: 0,
                     parent_beacon_block_root: [0_u8; 32],
-                    requests_hash: Some([0_u8; 32]),
+                    requests_hash: Some([0_u8; 32],
                 },
                 delayed_execution_results,
             )
