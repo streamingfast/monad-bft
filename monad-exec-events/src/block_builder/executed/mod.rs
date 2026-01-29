@@ -521,11 +521,7 @@ impl ExecutedBlockBuilder {
                 input_bytes,
                 return_bytes,
             } => {
-                // System calls (block prologue) have no txn_index, skip them for now
-                let txn_index = match txn_index {
-                    Some(idx) => idx,
-                    None => return None,
-                };
+                let txn_index = txn_index?;
 
                 let state = self.state.as_mut()?;
 

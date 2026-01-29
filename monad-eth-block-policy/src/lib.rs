@@ -75,26 +75,22 @@ pub fn compute_txn_max_value(txn: &TxEnvelope, base_fee: u64) -> U256 {
 }
 
 pub fn compute_txn_max_gas_cost(txn: &TxEnvelope, base_fee: u64) -> U256 {
-    // // pre eip-1559 transactions do not have priority fee
-    // // full gas price is charged
-    // if txn.is_legacy() || txn.is_eip2930() {
-    //     let gas_limit = U256::from(txn.gas_limit());
-    //     let max_fee = U256::from(txn.max_fee_per_gas());
-    //     return gas_limit.checked_mul(max_fee).expect("no overflow");
-    // }
+    // pre eip-1559 transactions do not have priority fee
+    // full gas price is charged
+    if txn.is_legacy() || txn.is_eip2930() {
+        let gas_limit = U256::from(txn.gas_limit());
+        let max_fee = U256::from(txn.max_fee_per_gas());
+        return gas_limit.checked_mul(max_fee).expect("no overflow");
+    }
 
-    // // post eip-1559 transactions
-    // // gas price is min(max_fee, base_fee + priority_fee)
-    // let gas_limit = U256::from(txn.gas_limit());
-    // let max_fee = U256::from(txn.max_fee_per_gas());
-    // let priority_fee = U256::from(txn.max_priority_fee_per_gas().unwrap_or(0));
-    // let base_fee = U256::from(base_fee);
-    // let gas_bid = max_fee.min(base_fee.saturating_add(priority_fee));
-    // gas_limit.checked_mul(gas_bid).expect("no overflow")
-
+    // post eip-1559 transactions
+    // gas price is min(max_fee, base_fee + priority_fee)
     let gas_limit = U256::from(txn.gas_limit());
     let max_fee = U256::from(txn.max_fee_per_gas());
-    gas_limit.checked_mul(max_fee).expect("no overflow")
+    let priority_fee = U256::from(txn.max_priority_fee_per_gas().unwrap_or(0));
+    let base_fee = U256::from(base_fee);
+    let gas_bid = max_fee.min(base_fee.saturating_add(priority_fee));
+    gas_limit.checked_mul(gas_bid).expect("no overflow")
 }
 
 struct BlockLookupIndex {
