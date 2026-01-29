@@ -229,6 +229,16 @@ impl ValidEthTransaction {
         self.max_value
     }
 
+    // TO REMOVE - Calculate upfront cost per Yellow Paper §71 matching C++ validate_transaction.cpp
+    // Formula: tx.value + (gas_limit × max_fee_per_gas)
+    // This is different from max_value which incorrectly uses min(max_fee, base_fee + priority) for EIP-1559
+    pub fn upfront_cost(&self) -> Balance {
+        let gas_limit = Balance::from(self.tx.gas_limit());
+        let max_fee_per_gas = Balance::from(self.tx.max_fee_per_gas());
+        let max_gas_cost = gas_limit.saturating_mul(max_fee_per_gas);
+        self.tx.value().saturating_add(max_gas_cost)
+    }
+
     pub const fn raw(&self) -> &Recovered<TxEnvelope> {
         &self.tx
     }
