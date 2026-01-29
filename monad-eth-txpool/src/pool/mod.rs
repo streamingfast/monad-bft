@@ -365,7 +365,7 @@ where
                 b.header()
                     .delayed_execution_results
                     .last()
-                    .and_then(|h| h.0.hash.map(|hash| hash.0))
+                    .map(|h| h.0.hash_slow().0)
             })
             .unwrap_or([0_u8; 32]);
 
