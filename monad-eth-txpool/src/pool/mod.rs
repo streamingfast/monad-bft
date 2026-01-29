@@ -189,11 +189,12 @@ where
         let last_commit_base_fee = last_commit.execution_inputs.base_fee_per_gas;
 
         for tx in txs {
+            // TO REMOVE - Fix balance check to match Yellow Paper
+            // Correct formula: balance >= tx.value + (gas_limit × max_fee_per_gas)
             if account_balances
                 .get(tx.signer_ref())
                 .is_none_or(|account_balance_state| {
-                    account_balance_state.balance
-                        < last_commit_base_fee.saturating_mul(tx.gas_limit())
+                    account_balance_state.balance < tx.max_value()
                 })
             {
                 event_tracker.drop(tx.hash(), EthTxPoolDropReason::InsufficientBalance);

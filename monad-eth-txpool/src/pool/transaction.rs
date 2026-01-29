@@ -224,6 +224,11 @@ impl ValidEthTransaction {
         self.tx.length() as u64
     }
 
+    // TO REMOVE - Accessor for max_value to fix txpool balance check
+    pub const fn max_value(&self) -> Balance {
+        self.max_value
+    }
+
     pub const fn raw(&self) -> &Recovered<TxEnvelope> {
         &self.tx
     }
