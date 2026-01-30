@@ -199,8 +199,8 @@ where
                 warn!(
                     tx_hash = ?tx.hash(),
                     signer = ?tx.signer(),
-                    account_balance = ?account_balance,
-                    upfront_cost = ?upfront,
+                    account_balance = ?account_balance.map(|b| b.to_string()),
+                    upfront_cost = %upfront,
                     "INSUFFICIENT_BALANCE_DROP"
                 );
                 event_tracker.drop(tx.hash(), EthTxPoolDropReason::InsufficientBalance);

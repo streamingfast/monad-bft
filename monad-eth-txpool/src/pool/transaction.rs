@@ -241,12 +241,12 @@ impl ValidEthTransaction {
         tracing::warn!(
             tx_hash = ?self.tx.tx_hash(),
             signer = ?self.tx.signer(),
-            value = ?self.tx.value(),
-            gas_limit = gas_limit,
-            max_fee_per_gas = max_fee_per_gas,
-            max_gas_cost = ?max_gas_cost,
-            upfront_cost = ?upfront,
-            max_value_field = ?self.max_value,
+            value = %self.tx.value(),
+            gas_limit = %gas_limit,
+            max_fee_per_gas = %max_fee_per_gas,
+            max_gas_cost = %max_gas_cost,
+            upfront_cost = %upfront,
+            max_value_field = %self.max_value,
             "UPFRONT_COST_CALCULATION"
         );
 
