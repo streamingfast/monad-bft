@@ -41,7 +41,7 @@ use monad_system_calls::{SystemTransactionGenerator, SYSTEM_SENDER_ETH_ADDRESS};
 use monad_types::{Epoch, NodeId, Round, SeqNum};
 use monad_validator::signature_collection::SignatureCollection;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 pub use self::transaction::max_eip2718_encoded_length;
 use self::{pending::PendingTxMap, tracked::TrackedTxMap, transaction::ValidEthTransaction};
