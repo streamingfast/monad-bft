@@ -189,22 +189,33 @@ where
         let last_commit_base_fee = last_commit.execution_inputs.base_fee_per_gas;
 
         for tx in txs {
-            // TO REMOVE - Fix balance check to match Yellow Paper and C++ validate_transaction.cpp:198
-            // Correct formula: balance >= tx.value + (gas_limit × max_fee_per_gas)
-            // Monad's max_value field is WRONG for EIP-1559 txs (uses min(max_fee, base+priority) instead of max_fee)
+            // Balance check per Yellow Paper §71: balance >= tx.value + (gas_limit × max_fee_per_gas)
             let upfront = tx.upfront_cost();
             let account_balance = account_balances.get(tx.signer_ref()).map(|a| a.balance);
 
-            if account_balance.is_none_or(|balance| balance < upfront) {
-                warn!(
-                    tx_hash = ?tx.hash(),
-                    signer = ?tx.signer(),
-                    account_balance = ?account_balance.map(|b| b.to_string()),
-                    upfront_cost = %upfront,
-                    "INSUFFICIENT_BALANCE_DROP"
-                );
-                event_tracker.drop(tx.hash(), EthTxPoolDropReason::InsufficientBalance);
-                continue;
+            // Skip balance check if account has zero balance in lagged state - this might mean
+            // the account doesn't exist yet due to state lag. The execution layer will perform
+            // the authoritative balance validation.
+            if let Some(balance) = account_balance {
+                if balance.is_zero() {
+                    // Account might not exist in lagged state - allow through for execution validation
+                    trace!(
+                        tx_hash = ?tx.hash(),
+                        signer = ?tx.signer(),
+                        "Account has zero balance in lagged state - skipping txpool balance check"
+                    );
+                } else if balance < upfront {
+                    // Account exists with insufficient balance - reject
+                    warn!(
+                        tx_hash = ?tx.hash(),
+                        signer = ?tx.signer(),
+                        account_balance = %balance,
+                        upfront_cost = %upfront,
+                        "Account has insufficient balance"
+                    );
+                    event_tracker.drop(tx.hash(), EthTxPoolDropReason::InsufficientBalance);
+                    continue;
+                }
             }
 
             let Some(tx) = self
