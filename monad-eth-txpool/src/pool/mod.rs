@@ -192,12 +192,17 @@ where
             // TO REMOVE - Fix balance check to match Yellow Paper and C++ validate_transaction.cpp:198
             // Correct formula: balance >= tx.value + (gas_limit × max_fee_per_gas)
             // Monad's max_value field is WRONG for EIP-1559 txs (uses min(max_fee, base+priority) instead of max_fee)
-            if account_balances
-                .get(tx.signer_ref())
-                .is_none_or(|account_balance_state| {
-                    account_balance_state.balance < tx.upfront_cost()
-                })
-            {
+            let upfront = tx.upfront_cost();
+            let account_balance = account_balances.get(tx.signer_ref()).map(|a| a.balance);
+
+            if account_balance.is_none_or(|balance| balance < upfront) {
+                warn!(
+                    tx_hash = ?tx.hash(),
+                    signer = ?tx.signer(),
+                    account_balance = ?account_balance,
+                    upfront_cost = ?upfront,
+                    "INSUFFICIENT_BALANCE_DROP"
+                );
                 event_tracker.drop(tx.hash(), EthTxPoolDropReason::InsufficientBalance);
                 continue;
             }
