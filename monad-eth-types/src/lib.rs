@@ -52,6 +52,8 @@ pub struct EthAccount {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ProposedEthHeader {
     #[serde_as(as = "serde_with::hex::Hex")]
+    pub parent_hash: [u8; 32],
+    #[serde_as(as = "serde_with::hex::Hex")]
     pub ommers_hash: [u8; 32],
     pub beneficiary: Address,
     #[serde_as(as = "serde_with::hex::Hex")]
@@ -89,6 +91,7 @@ pub struct ProposedEthHeader {
 impl ProposedEthHeader {
     fn header_payload_length(&self) -> usize {
         let mut length = 0;
+        length += self.parent_hash.length();
         length += self.ommers_hash.length();
         length += self.beneficiary.length();
         length += self.transactions_root.length();
@@ -127,6 +130,7 @@ impl Encodable for ProposedEthHeader {
             payload_length: self.header_payload_length(),
         };
         list_header.encode(out);
+        self.parent_hash.encode(out);
         self.ommers_hash.encode(out);
         self.beneficiary.encode(out);
         self.transactions_root.encode(out);
@@ -157,6 +161,7 @@ impl Decodable for ProposedEthHeader {
         }
         let starting_len = buf.len();
         let mut this = Self {
+            parent_hash: Decodable::decode(buf)?,
             ommers_hash: Decodable::decode(buf)?,
             beneficiary: Decodable::decode(buf)?,
             transactions_root: Decodable::decode(buf)?,
@@ -320,6 +325,7 @@ mod test {
         // new encoding with requests_hash == None can be decoded as old header
 
         let new_header = ProposedEthHeader {
+            parent_hash: [0_u8; 32],
             ommers_hash: *EMPTY_OMMER_ROOT_HASH,
             beneficiary: Address::new([0xff_u8; 20]),
             transactions_root: *EMPTY_TRANSACTIONS,
@@ -364,6 +370,7 @@ mod test {
     #[test]
     fn test_proposed_eth_header_toml_roundtrip_u64_max() {
         let header = ProposedEthHeader {
+            parent_hash: [0_u8; 32],
             ommers_hash: *EMPTY_OMMER_ROOT_HASH,
             beneficiary: Address::new([0xff_u8; 20]),
             transactions_root: *EMPTY_TRANSACTIONS,
