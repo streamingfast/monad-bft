@@ -435,7 +435,7 @@ impl ExecutedBlockBuilder {
                 // Skip if no txn_index (e.g., system call frames)
                 let txn_idx = match txn_index {
                     Some(idx) => idx,
-                    None => return Some(()),
+                    None => return None,
                 };
 
                 let txn_ref = state
