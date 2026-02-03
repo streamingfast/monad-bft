@@ -432,9 +432,15 @@ impl ExecutedBlockBuilder {
             } => {
                 let state = self.state.as_mut()?;
 
+                // Skip if no txn_index (e.g., system call frames)
+                let txn_idx = match txn_index {
+                    Some(idx) => idx,
+                    None => return Some(()),
+                };
+
                 let txn_ref = state
                     .txns
-                    .get_mut(TryInto::<usize>::try_into(txn_index).unwrap())
+                    .get_mut(TryInto::<usize>::try_into(txn_idx).unwrap())
                     .expect("ExecutedBlockBuilder TxnCallFrame txn_index within bounds")
                     .as_mut()
                     .expect(
