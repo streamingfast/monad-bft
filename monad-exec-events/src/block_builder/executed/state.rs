@@ -18,7 +18,7 @@ use crate::{
         monad_c_address, monad_c_bytes32, monad_c_eth_txn_header, monad_c_eth_txn_receipt,
         monad_exec_block_start,
     },
-    ExecutedTxnAccessListEntry, ExecutedTxnCallFrame, ExecutedTxnLog,
+    ExecutedSystemCall, ExecutedTxnAccessListEntry, ExecutedTxnCallFrame, ExecutedTxnLog,
     ExecutedTxnSignedAuthorization,
 };
 
@@ -26,6 +26,7 @@ use crate::{
 pub(super) struct BlockReassemblyState {
     pub start: monad_exec_block_start,
     pub txns: Box<[Option<TxnReassemblyState>]>,
+    pub system_calls: Vec<ExecutedSystemCall>,
 }
 
 #[derive(Debug)]

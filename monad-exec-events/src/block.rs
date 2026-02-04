@@ -30,6 +30,7 @@ pub struct ExecutedBlock {
     pub start: monad_exec_block_start,
     pub end: monad_exec_block_end,
     pub txns: Box<[ExecutedTxn]>,
+    pub system_calls: Box<[ExecutedSystemCall]>,
 }
 
 #[cfg(feature = "alloy")]
@@ -404,4 +405,14 @@ pub struct ExecutedTxnSignedAuthorization {
     pub y_parity: bool,
     pub r: monad_c_uint256_ne,
     pub s: monad_c_uint256_ne,
+}
+
+/// System call (block-level call frame) reconstructed from execution events.
+/// System calls have no transaction index and execute at block prologue.
+#[allow(missing_docs)]
+#[derive(Clone, Debug)]
+pub struct ExecutedSystemCall {
+    pub call_frame: monad_exec_txn_call_frame,
+    pub input: Box<[u8]>,
+    pub r#return: Box<[u8]>,
 }
