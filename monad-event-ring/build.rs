@@ -42,6 +42,9 @@ fn main() {
         client_dst.display()
     );
     println!("cargo:rustc-link-lib=static=monad_event");
+
+    // Only link hugetlbfs on Linux
+    #[cfg(target_os = "linux")]
     println!("cargo:rustc-link-lib=hugetlbfs");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
