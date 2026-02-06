@@ -74,13 +74,25 @@ where
     ) -> Result<Self, String> {
         let mmap_prot = libc::PROT_READ;
 
+        #[cfg(target_os = "linux")]
         let supports_hugetlb = monad_check_path_supports_map_hugetlb(&path)
             .expect("failed to determine if event ring file supports MAP_HUGETLB");
+        #[cfg(not(target_os = "linux"))]
+        let supports_hugetlb = false;
 
-        let mmap_extra_flags = if supports_hugetlb {
-            libc::MAP_POPULATE | libc::MAP_HUGETLB
-        } else {
-            libc::MAP_POPULATE
+        let mmap_extra_flags = {
+            #[cfg(target_os = "linux")]
+            {
+                if supports_hugetlb {
+                    libc::MAP_POPULATE | libc::MAP_HUGETLB
+                } else {
+                    libc::MAP_POPULATE
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                0 // No special flags on non-Linux platforms
+            }
         };
 
         let ring_file = File::open(&path).map_err(|e| e.to_string())?;
