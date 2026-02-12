@@ -1284,6 +1284,7 @@ mod test {
         fn wrapped_state(
             &mut self,
         ) -> BlockSyncWrapper<
+            '_,
             SignatureType,
             SignatureCollectionType,
             ExecutionProtocolType,
