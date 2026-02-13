@@ -95,6 +95,16 @@ pub fn compute_txn_max_gas_cost(txn: &TxEnvelope, base_fee: u64) -> U256 {
     gas_limit.checked_mul(gas_bid).expect("no overflow")
 }
 
+/// Calculate upfront cost per Yellow Paper §71: tx.value + (gas_limit × max_fee_per_gas)
+/// This is the correct formula for balance validation - uses max_fee_per_gas, not the
+/// min(max_fee, base_fee + priority) used for actual gas cost calculation.
+pub fn compute_txn_upfront_cost(txn: &TxEnvelope) -> U256 {
+    let gas_limit = U256::from(txn.gas_limit());
+    let max_fee_per_gas = U256::from(txn.max_fee_per_gas());
+    let max_gas_cost = gas_limit.checked_mul(max_fee_per_gas).expect("no overflow");
+    txn.value().checked_add(max_gas_cost).expect("no overflow")
+}
+
 struct BlockLookupIndex {
     block_id: BlockId,
     seq_num: SeqNum,

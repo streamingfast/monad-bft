@@ -27,7 +27,7 @@ use futures::{Stream, StreamExt};
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
-use monad_dataplane::DataplaneBuilder;
+use monad_dataplane::{DataplaneBuilder, TcpSocketId, UdpSocketId};
 use monad_executor::{Executor, ExecutorMetricsChain};
 use monad_executor_glue::{Message, RouterCommand};
 use monad_node_config::{FullNodeConfig, FullNodeIdentityConfig};
@@ -46,7 +46,7 @@ use monad_raptorcast::{
         SecondaryRaptorCastModeConfig,
     },
     util::Group,
-    RaptorCast, RaptorCastEvent, AUTHENTICATED_RAPTORCAST_SOCKET, RAPTORCAST_SOCKET,
+    RaptorCast, RaptorCastEvent,
 };
 use monad_types::{Epoch, NodeId};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -99,25 +99,26 @@ where
         let pdd = PeerDiscoveryDriver::new(peer_discovery_builder);
         let shared_pdd = Arc::new(Mutex::new(pdd));
 
-        let dp = dataplane_builder.build();
+        let mut dp = dataplane_builder.build();
         assert!(dp.block_until_ready(Duration::from_secs(1)));
 
-        let (tcp_socket, mut udp_dataplane, control) = dp.split();
-        let authenticated_socket = udp_dataplane.take_socket(AUTHENTICATED_RAPTORCAST_SOCKET);
-        let non_authenticated_socket = udp_dataplane
-            .take_socket(RAPTORCAST_SOCKET)
+        let tcp_socket = dp.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+        let authenticated_socket = dp.udp_sockets.take(UdpSocketId::AuthenticatedRaptorcast);
+        let non_authenticated_socket = dp
+            .udp_sockets
+            .take(UdpSocketId::Raptorcast)
             .expect("raptorcast socket");
-
-        let (tcp_reader, tcp_writer) = tcp_socket.split();
+        let control = dp.control;
 
         // Create channels between primary and secondary raptorcast instances.
         // Fundamentally this is needed because, while both can send, only the
         // primary can receive data from the network.
         let (send_net_messages, recv_net_messages) =
             unbounded_channel::<FullNodesGroupMessage<ST>>();
-        let (send_group_infos, recv_group_infos) = unbounded_channel::<Group<ST>>();
+        let (send_group_infos, recv_group_infos) =
+            unbounded_channel::<Group<CertificateSignaturePubKey<ST>>>();
         let (send_outbound_to_primary, recv_outbound_from_secondary) =
-            unbounded_channel::<SecondaryOutboundMessage<ST>>();
+            unbounded_channel::<SecondaryOutboundMessage<CertificateSignaturePubKey<ST>>>();
 
         // Determine initial secondary raptorcast role
         let is_current_epoch_validator = epoch_validators
@@ -146,8 +147,7 @@ where
         let mut rc_primary = RaptorCast::new(
             cfg.clone(),
             secondary_mode,
-            tcp_reader,
-            tcp_writer,
+            tcp_socket,
             authenticated_socket,
             non_authenticated_socket,
             control,
@@ -181,11 +181,9 @@ where
         );
 
         // create new channels
-        let (send_net_messages, recv_net_messages) =
-            unbounded_channel::<FullNodesGroupMessage<ST>>();
-        let (send_group_infos, recv_group_infos) = unbounded_channel::<Group<ST>>();
-        let (send_outbound_to_primary, recv_outbound_from_secondary) =
-            unbounded_channel::<SecondaryOutboundMessage<ST>>();
+        let (send_net_messages, recv_net_messages) = unbounded_channel();
+        let (send_group_infos, recv_group_infos) = unbounded_channel();
+        let (send_outbound_to_primary, recv_outbound_from_secondary) = unbounded_channel();
 
         let is_dynamic = matches!(new_role, SecondaryRaptorCastModeConfig::Client);
         // we first need to update is_dynamic_full_node before binding the channels
@@ -213,56 +211,67 @@ where
         mode: SecondaryRaptorCastModeConfig,
         shared_pdd: Arc<Mutex<PeerDiscoveryDriver<PD>>>,
         recv_net_messages: UnboundedReceiver<FullNodesGroupMessage<ST>>,
-        send_group_infos: UnboundedSender<Group<ST>>,
-        channel_to_primary_outbound: UnboundedSender<SecondaryOutboundMessage<ST>>,
+        send_group_infos: UnboundedSender<Group<CertificateSignaturePubKey<ST>>>,
+        channel_to_primary_outbound: UnboundedSender<
+            SecondaryOutboundMessage<CertificateSignaturePubKey<ST>>,
+        >,
         current_epoch: Epoch,
     ) -> Option<RaptorCastSecondary<ST, M, OM, SE, PD>> {
-        let secondary_instance: RaptorCastConfigSecondary<ST> = match mode {
-            SecondaryRaptorCastModeConfig::None => {
-                debug!("Configured with Secondary RaptorCast instance: None");
-                RaptorCastConfigSecondary::default()
-            }
-            SecondaryRaptorCastModeConfig::Client => {
-                debug!("Configured with Secondary RaptorCast instance: Client");
-                RaptorCastConfigSecondary {
-                    raptor10_redundancy: cfg.secondary_instance.raptor10_fullnode_redundancy_factor,
-                    mode: SecondaryRaptorCastMode::Client(RaptorCastConfigSecondaryClient {
-                        max_num_group: cfg.secondary_instance.max_num_group,
-                        max_group_size: cfg.secondary_instance.max_group_size,
-                        invite_future_dist_min: cfg.secondary_instance.invite_future_dist_min,
-                        invite_future_dist_max: cfg.secondary_instance.invite_future_dist_max,
-                        invite_accept_heartbeat: Duration::from_millis(
-                            cfg.secondary_instance.invite_accept_heartbeat_ms,
-                        ),
-                    }),
+        let secondary_instance: RaptorCastConfigSecondary<CertificateSignaturePubKey<ST>> =
+            match mode {
+                SecondaryRaptorCastModeConfig::None => {
+                    debug!("Configured with Secondary RaptorCast instance: None");
+                    RaptorCastConfigSecondary::default()
                 }
-            }
-            SecondaryRaptorCastModeConfig::Publisher => {
-                debug!("Configured with Secondary RaptorCast instance: Publisher");
-                let full_nodes_prioritized: Vec<NodeId<CertificateSignaturePubKey<ST>>> = cfg
-                    .secondary_instance
-                    .full_nodes_prioritized
-                    .identities
-                    .iter()
-                    .map(|id| NodeId::new(id.secp256k1_pubkey))
-                    .collect();
-
-                RaptorCastConfigSecondary {
-                    raptor10_redundancy: cfg.secondary_instance.raptor10_fullnode_redundancy_factor,
-                    mode: SecondaryRaptorCastMode::Publisher(RaptorCastConfigSecondaryPublisher {
-                        full_nodes_prioritized,
-                        group_scheduling: GroupSchedulingConfig {
+                SecondaryRaptorCastModeConfig::Client => {
+                    debug!("Configured with Secondary RaptorCast instance: Client");
+                    RaptorCastConfigSecondary {
+                        raptor10_redundancy: cfg
+                            .secondary_instance
+                            .raptor10_fullnode_redundancy_factor,
+                        mode: SecondaryRaptorCastMode::Client(RaptorCastConfigSecondaryClient {
+                            max_num_group: cfg.secondary_instance.max_num_group,
                             max_group_size: cfg.secondary_instance.max_group_size,
-                            round_span: cfg.secondary_instance.round_span,
-                            invite_lookahead: cfg.secondary_instance.invite_lookahead,
-                            max_invite_wait: cfg.secondary_instance.max_invite_wait,
-                            deadline_round_dist: cfg.secondary_instance.deadline_round_dist,
-                            init_empty_round_span: cfg.secondary_instance.init_empty_round_span,
-                        },
-                    }),
+                            invite_future_dist_min: cfg.secondary_instance.invite_future_dist_min,
+                            invite_future_dist_max: cfg.secondary_instance.invite_future_dist_max,
+                            invite_accept_heartbeat: Duration::from_millis(
+                                cfg.secondary_instance.invite_accept_heartbeat_ms,
+                            ),
+                        }),
+                    }
                 }
-            }
-        };
+                SecondaryRaptorCastModeConfig::Publisher => {
+                    debug!("Configured with Secondary RaptorCast instance: Publisher");
+                    let full_nodes_prioritized: Vec<NodeId<CertificateSignaturePubKey<ST>>> = cfg
+                        .secondary_instance
+                        .full_nodes_prioritized
+                        .identities
+                        .iter()
+                        .map(|id| NodeId::new(id.secp256k1_pubkey))
+                        .collect();
+
+                    RaptorCastConfigSecondary {
+                        raptor10_redundancy: cfg
+                            .secondary_instance
+                            .raptor10_fullnode_redundancy_factor,
+                        mode: SecondaryRaptorCastMode::Publisher(
+                            RaptorCastConfigSecondaryPublisher {
+                                full_nodes_prioritized,
+                                group_scheduling: GroupSchedulingConfig {
+                                    max_group_size: cfg.secondary_instance.max_group_size,
+                                    round_span: cfg.secondary_instance.round_span,
+                                    invite_lookahead: cfg.secondary_instance.invite_lookahead,
+                                    max_invite_wait: cfg.secondary_instance.max_invite_wait,
+                                    deadline_round_dist: cfg.secondary_instance.deadline_round_dist,
+                                    init_empty_round_span: cfg
+                                        .secondary_instance
+                                        .init_empty_round_span,
+                                },
+                            },
+                        ),
+                    }
+                }
+            };
 
         match secondary_instance.mode {
             SecondaryRaptorCastMode::None => None,

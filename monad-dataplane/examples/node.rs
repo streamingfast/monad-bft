@@ -26,10 +26,8 @@ use futures::{executor, Stream};
 use futures_util::FutureExt;
 use monad_dataplane::{
     udp::DEFAULT_SEGMENT_SIZE, BroadcastMsg, Dataplane, DataplaneBuilder, RecvUdpMsg, TcpMsg,
-    UdpSocketHandle,
+    TcpSocketHandle, TcpSocketId, UdpSocketHandle, UdpSocketId,
 };
-
-const LEGACY_SOCKET: &str = "legacy";
 use rand::Rng;
 
 const NODE_ONE_ADDR: &str = "127.0.0.1:60000";
@@ -92,7 +90,7 @@ fn main() {
             })
         }
 
-        tx.dataplane.tcp_write(
+        tx.tcp_socket.write(
             tx.target,
             TcpMsg {
                 msg: Bytes::from(&b"Hello world"[..]),
@@ -111,23 +109,28 @@ fn main() {
 
 struct Node {
     udp_socket: UdpSocketHandle,
+    tcp_socket: TcpSocketHandle,
     dataplane: Dataplane,
     target: SocketAddr,
 }
 
 impl Node {
     pub fn new(addr: &SocketAddr, target_addr: &str) -> Self {
-        let mut dataplane = DataplaneBuilder::new(addr, 1_000)
-            .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
-                socket_addr: *addr,
-                label: LEGACY_SOCKET.to_string(),
-            }])
+        let mut dataplane = DataplaneBuilder::new(1_000)
+            .with_udp_sockets([(UdpSocketId::Raptorcast, *addr)])
+            .with_tcp_sockets([(TcpSocketId::Raptorcast, *addr)])
             .build();
         let udp_socket = dataplane
-            .take_udp_socket_handle(LEGACY_SOCKET)
-            .expect("legacy socket");
+            .udp_sockets
+            .take(UdpSocketId::Raptorcast)
+            .expect("udp socket");
+        let tcp_socket = dataplane
+            .tcp_sockets
+            .take(TcpSocketId::Raptorcast)
+            .expect("tcp socket");
         Self {
             udp_socket,
+            tcp_socket,
             dataplane,
             target: target_addr.parse().unwrap(),
         }

@@ -62,8 +62,8 @@ use crate::{
         eth::call::monad_createAccessList,
     },
     jsonrpc::{
-        JsonRpcError, JsonRpcResultExt, Request, RequestParams, RequestWrapper, Response,
-        ResponseWrapper,
+        serialize_with_size_limit, JsonRpcError, JsonRpcResultExt, Request, RequestParams,
+        RequestWrapper, Response, ResponseWrapper,
     },
     timing::RequestId,
     vpool::{monad_txpool_statusByAddress, monad_txpool_statusByHash},
@@ -157,22 +157,14 @@ pub async fn rpc_handler(
         }
     };
 
-    let response_raw_value = match serde_json::value::to_raw_value(&response) {
-        Err(e) => {
-            debug!("response serialization error: {e}");
-            return HttpResponse::Ok().json(Response::from_error(JsonRpcError::internal_error(
-                format!("serialization error: {}", e),
-            )));
-        }
-        Ok(response) => response,
-    };
-
-    if response_raw_value.get().as_bytes().len() > app_state.max_response_size as usize {
-        info!("response exceed size limit: {body:?}");
-        return HttpResponse::Ok().json(Response::from_error(JsonRpcError::custom(
-            "response exceed size limit".to_string(),
-        )));
-    }
+    let response_raw_value =
+        match serialize_with_size_limit(&response, app_state.max_response_size as usize) {
+            Ok(raw) => raw,
+            Err(e) => {
+                debug!("response error: {}", e.message);
+                return HttpResponse::Ok().json(Response::from_error(e));
+            }
+        };
 
     // log the request and response based on the response content
     match &response {
@@ -489,6 +481,7 @@ async fn eth_getLogs(
         let params = serde_json::from_str(params.get()).invalid_params()?;
         monad_eth_getLogs(
             chain_state,
+            app_state.max_response_size,
             app_state.logs_max_block_range,
             params,
             app_state.use_eth_get_logs_index,

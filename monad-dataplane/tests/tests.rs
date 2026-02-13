@@ -16,17 +16,17 @@
 use std::{
     collections::VecDeque,
     io::Write,
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     sync::{mpsc, Once},
     thread::{self, sleep},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures::{channel::oneshot, executor, FutureExt};
 use monad_dataplane::{
-    tcp::tx::{MSG_WAIT_TIMEOUT, QUEUED_MESSAGE_LIMIT},
+    tcp::tx::{MSG_WAIT_TIMEOUT, QUEUED_MESSAGE_BYTE_LIMIT, QUEUED_MESSAGE_LIMIT},
     udp::DEFAULT_SEGMENT_SIZE,
-    BroadcastMsg, DataplaneBuilder, RecvUdpMsg, TcpMsg, UnicastMsg,
+    BroadcastMsg, DataplaneBuilder, RecvUdpMsg, TcpMsg, TcpSocketId, UdpSocketId, UnicastMsg,
 };
 use monad_types::UdpPriority;
 use ntest::timeout;
@@ -35,9 +35,6 @@ use rstest::*;
 use tracing_subscriber::fmt::format::FmtSpan;
 
 const UP_BANDWIDTH_MBPS: u64 = 1_000;
-
-const LEGACY_SOCKET: &str = "legacy";
-const DIRECT_SOCKET: &str = "direct";
 
 static ONCE_SETUP: Once = Once::new();
 
@@ -58,25 +55,19 @@ fn udp_broadcast() {
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let num_msgs = 10;
 
-    let mut rx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS)
-        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
-            socket_addr: bind_addr,
-            label: LEGACY_SOCKET.to_string(),
-        }])
+    let mut rx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_udp_sockets([(UdpSocketId::Raptorcast, bind_addr)])
         .build();
-    let mut tx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS)
-        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
-            socket_addr: bind_addr,
-            label: LEGACY_SOCKET.to_string(),
-        }])
+    let mut tx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_udp_sockets([(UdpSocketId::Raptorcast, bind_addr)])
         .build();
 
     let payload: Vec<u8> = (0..DEFAULT_SEGMENT_SIZE)
         .map(|_| rand::thread_rng().gen_range(0..255))
         .collect();
 
-    let mut rx_socket = rx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
-    let tx_socket = tx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
+    let mut rx_socket = rx.udp_sockets.take(UdpSocketId::Raptorcast).unwrap();
+    let tx_socket = tx.udp_sockets.take(UdpSocketId::Raptorcast).unwrap();
 
     let rx_addr = rx_socket.local_addr();
     let tx_addr = tx_socket.local_addr();
@@ -103,25 +94,19 @@ fn udp_unicast() {
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let num_msgs = 10;
 
-    let mut rx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS)
-        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
-            socket_addr: bind_addr,
-            label: LEGACY_SOCKET.to_string(),
-        }])
+    let mut rx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_udp_sockets([(UdpSocketId::Raptorcast, bind_addr)])
         .build();
-    let mut tx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS)
-        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
-            socket_addr: bind_addr,
-            label: LEGACY_SOCKET.to_string(),
-        }])
+    let mut tx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_udp_sockets([(UdpSocketId::Raptorcast, bind_addr)])
         .build();
 
     let payload: Vec<u8> = (0..DEFAULT_SEGMENT_SIZE)
         .map(|_| rand::thread_rng().gen_range(0..255))
         .collect();
 
-    let mut rx_socket = rx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
-    let tx_socket = tx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
+    let mut rx_socket = rx.udp_sockets.take(UdpSocketId::Raptorcast).unwrap();
+    let tx_socket = tx.udp_sockets.take(UdpSocketId::Raptorcast).unwrap();
 
     let rx_addr = rx_socket.local_addr();
     let tx_addr = tx_socket.local_addr();
@@ -147,28 +132,16 @@ fn udp_direct_socket() {
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let num_msgs = 10;
 
-    let mut rx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS)
-        .extend_udp_sockets(vec![
-            monad_dataplane::UdpSocketConfig {
-                socket_addr: bind_addr,
-                label: LEGACY_SOCKET.to_string(),
-            },
-            monad_dataplane::UdpSocketConfig {
-                socket_addr: bind_addr,
-                label: DIRECT_SOCKET.to_string(),
-            },
+    let mut rx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_udp_sockets([
+            (UdpSocketId::Raptorcast, bind_addr),
+            (UdpSocketId::AuthenticatedRaptorcast, bind_addr),
         ])
         .build();
-    let mut tx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS)
-        .extend_udp_sockets(vec![
-            monad_dataplane::UdpSocketConfig {
-                socket_addr: bind_addr,
-                label: LEGACY_SOCKET.to_string(),
-            },
-            monad_dataplane::UdpSocketConfig {
-                socket_addr: bind_addr,
-                label: DIRECT_SOCKET.to_string(),
-            },
+    let mut tx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_udp_sockets([
+            (UdpSocketId::Raptorcast, bind_addr),
+            (UdpSocketId::AuthenticatedRaptorcast, bind_addr),
         ])
         .build();
 
@@ -176,10 +149,16 @@ fn udp_direct_socket() {
         .map(|_| rand::thread_rng().gen_range(0..255))
         .collect();
 
-    let mut rx_legacy_socket = rx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
-    let mut rx_direct_socket = rx.take_udp_socket_handle(DIRECT_SOCKET).unwrap();
-    let tx_legacy_socket = tx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
-    let tx_direct_socket = tx.take_udp_socket_handle(DIRECT_SOCKET).unwrap();
+    let mut rx_legacy_socket = rx.udp_sockets.take(UdpSocketId::Raptorcast).unwrap();
+    let mut rx_direct_socket = rx
+        .udp_sockets
+        .take(UdpSocketId::AuthenticatedRaptorcast)
+        .unwrap();
+    let tx_legacy_socket = tx.udp_sockets.take(UdpSocketId::Raptorcast).unwrap();
+    let tx_direct_socket = tx
+        .udp_sockets
+        .take(UdpSocketId::AuthenticatedRaptorcast)
+        .unwrap();
 
     let rx_legacy_addr = rx_legacy_socket.local_addr();
     let rx_direct_addr = rx_direct_socket.local_addr();
@@ -218,18 +197,25 @@ fn tcp_very_slow() {
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let num_msgs = 2;
 
-    let mut rx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
-    let rx_addr = rx.tcp_local_addr();
-    let tx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
+    let mut rx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+    let mut tx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+
+    let mut rx_socket = rx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    let rx_addr = rx_socket.local_addr();
 
     let payload: Vec<u8> = (0..DEFAULT_SEGMENT_SIZE)
         .map(|_| rand::thread_rng().gen_range(0..255))
         .collect();
 
+    let tcp_socket = tx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
     for _ in 0..num_msgs {
         let (sender, receiver) = oneshot::channel::<()>();
 
-        tx.tcp_write(
+        tcp_socket.write(
             rx_addr,
             TcpMsg {
                 msg: payload.clone().into(),
@@ -243,7 +229,7 @@ fn tcp_very_slow() {
     }
 
     for _ in 0..num_msgs {
-        let recv_msg = executor::block_on(rx.tcp_read());
+        let recv_msg = executor::block_on(rx_socket.recv());
 
         assert_eq!(recv_msg.payload, payload);
     }
@@ -258,18 +244,25 @@ fn tcp_slow() {
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let num_msgs = 10;
 
-    let mut rx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
-    let rx_addr = rx.tcp_local_addr();
-    let tx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
+    let mut rx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+    let mut tx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+
+    let mut rx_socket = rx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    let rx_addr = rx_socket.local_addr();
 
     let payload: Vec<u8> = (0..DEFAULT_SEGMENT_SIZE)
         .map(|_| rand::thread_rng().gen_range(0..255))
         .collect();
 
+    let tcp_socket = tx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
     for _ in 0..num_msgs {
         let (sender, receiver) = oneshot::channel::<()>();
 
-        tx.tcp_write(
+        tcp_socket.write(
             rx_addr,
             TcpMsg {
                 msg: payload.clone().into(),
@@ -281,7 +274,7 @@ fn tcp_slow() {
     }
 
     for _ in 0..num_msgs {
-        let recv_msg = executor::block_on(rx.tcp_read());
+        let recv_msg = executor::block_on(rx_socket.recv());
 
         assert_eq!(recv_msg.payload, payload);
     }
@@ -293,11 +286,18 @@ fn tcp_rapid() {
     once_setup();
 
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let num_msgs = 1024;
+    let num_msgs = 512;
 
-    let mut rx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
-    let rx_addr = rx.tcp_local_addr();
-    let tx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
+    let mut rx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+    let mut tx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+    tx.add_trusted("127.0.0.1".parse().unwrap());
+
+    let mut rx_socket = rx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    let rx_addr = rx_socket.local_addr();
 
     let payload: Vec<u8> = (0..DEFAULT_SEGMENT_SIZE)
         .map(|_| rand::thread_rng().gen_range(0..255))
@@ -305,10 +305,11 @@ fn tcp_rapid() {
 
     let mut completions = VecDeque::with_capacity(QUEUED_MESSAGE_LIMIT);
 
+    let tcp_socket = tx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
     for _ in 0..num_msgs {
         let (sender, receiver) = oneshot::channel::<()>();
 
-        tx.tcp_write(
+        tcp_socket.write(
             rx_addr,
             TcpMsg {
                 msg: payload.clone().into(),
@@ -328,7 +329,7 @@ fn tcp_rapid() {
     }
 
     for _ in 0..num_msgs {
-        let recv_msg = executor::block_on(rx.tcp_read());
+        let recv_msg = executor::block_on(rx_socket.recv());
 
         assert_eq!(recv_msg.payload, payload);
     }
@@ -347,7 +348,9 @@ fn tcp_connect_fail() {
         .local_addr()
         .unwrap();
 
-    let tx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
+    let mut tx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
 
     let payload: Vec<u8> = (0..DEFAULT_SEGMENT_SIZE)
         .map(|_| rand::thread_rng().gen_range(0..255))
@@ -355,7 +358,8 @@ fn tcp_connect_fail() {
 
     let (sender, receiver) = oneshot::channel::<()>();
 
-    tx.tcp_write(
+    let tcp_socket = tx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    tcp_socket.write(
         rx_addr,
         TcpMsg {
             msg: payload.into(),
@@ -374,9 +378,15 @@ fn tcp_exceed_queue_limits() {
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let num_msgs = 100 * QUEUED_MESSAGE_LIMIT;
 
-    let mut rx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
-    let rx_addr = rx.tcp_local_addr();
-    let tx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
+    let mut rx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+    let mut tx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+
+    let mut rx_socket = rx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    let rx_addr = rx_socket.local_addr();
 
     let payload: Vec<u8> = (0..DEFAULT_SEGMENT_SIZE)
         .map(|_| rand::thread_rng().gen_range(0..255))
@@ -384,10 +394,11 @@ fn tcp_exceed_queue_limits() {
 
     let mut completions = Vec::with_capacity(num_msgs);
 
+    let tcp_socket = tx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
     for _ in 0..num_msgs {
         let (sender, receiver) = oneshot::channel::<()>();
 
-        tx.tcp_write(
+        tcp_socket.write(
             rx_addr,
             TcpMsg {
                 msg: payload.clone().into(),
@@ -400,7 +411,7 @@ fn tcp_exceed_queue_limits() {
 
     // At least QUEUED_MESSAGE_LIMIT messages should be delivered successfully.
     for _ in 0..QUEUED_MESSAGE_LIMIT {
-        let recv_msg = executor::block_on(rx.tcp_read());
+        let recv_msg = executor::block_on(rx_socket.recv());
 
         assert_eq!(recv_msg.payload, payload);
     }
@@ -420,6 +431,133 @@ fn tcp_exceed_queue_limits() {
     assert_ne!(failures, 0);
 }
 
+#[test]
+#[timeout(2000)]
+fn tcp_exceed_queue_byte_limit() {
+    once_setup();
+
+    let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+    // Use 2MB messages so the byte limit is reached quickly (4MB / 2MB = 2 messages).
+    // Keep num_msgs below QUEUED_MESSAGE_LIMIT so message-count drops cannot occur.
+    let message_size = 2 * 1024 * 1024;
+    let num_msgs = 128;
+
+    assert!(num_msgs < QUEUED_MESSAGE_LIMIT);
+    assert!((QUEUED_MESSAGE_BYTE_LIMIT / message_size) < num_msgs);
+    assert!(message_size < QUEUED_MESSAGE_BYTE_LIMIT);
+    assert!(num_msgs * message_size > QUEUED_MESSAGE_BYTE_LIMIT);
+
+    let listener = TcpListener::bind(bind_addr).unwrap();
+    let rx_addr = listener.local_addr().unwrap();
+    let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+    let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+    let accept_handle = thread::spawn(move || {
+        // hold the accepted connection open but never read from it.
+        let (_stream, _addr) = listener.accept().unwrap();
+        accepted_tx.send(()).unwrap();
+        let _ = shutdown_rx.recv_timeout(Duration::from_millis(1500));
+    });
+
+    let mut tx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+    tx.add_trusted("127.0.0.1".parse().unwrap());
+
+    let tcp_socket = tx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+
+    let payload: Vec<u8> = vec![0u8; message_size];
+
+    let mut completions = Vec::with_capacity(num_msgs);
+
+    for _ in 0..num_msgs {
+        let (sender, receiver) = oneshot::channel::<()>();
+
+        tcp_socket.write(
+            rx_addr,
+            TcpMsg {
+                msg: payload.clone().into(),
+                completion: Some(sender),
+            },
+        );
+
+        completions.push(receiver);
+    }
+
+    accepted_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("tx should establish a TCP connection to listener");
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let saw_failure = loop {
+        let saw_failure = completions
+            .iter_mut()
+            .any(|receiver| receiver.try_recv().is_err());
+        if saw_failure || Instant::now() >= deadline {
+            break saw_failure;
+        }
+        sleep(Duration::from_millis(5));
+    };
+
+    let _ = shutdown_tx.send(());
+    accept_handle.join().unwrap();
+
+    assert!(saw_failure, "expected failures due to byte limit");
+}
+
+#[test]
+#[timeout(1000)]
+fn tcp_outgoing_connection_limit() {
+    once_setup();
+
+    let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+    let mut rx1 = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+    let mut rx2 = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+    let mut tx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .with_tcp_connections_limit(1, 1)
+        .build();
+
+    let mut rx1_socket = rx1.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    let rx1_addr = rx1_socket.local_addr();
+    let mut rx2_socket = rx2.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    let rx2_addr = rx2_socket.local_addr();
+    let tcp_socket = tx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+
+    let payload1: Vec<u8> = "first message".into();
+    let (sender1, receiver1) = oneshot::channel::<()>();
+    tcp_socket.write(
+        rx1_addr,
+        TcpMsg {
+            msg: payload1.clone().into(),
+            completion: Some(sender1),
+        },
+    );
+
+    let recv_msg = executor::block_on(rx1_socket.recv());
+    assert_eq!(recv_msg.payload, payload1);
+    assert!(executor::block_on(receiver1).is_ok());
+
+    let payload2: Vec<u8> = "second message".into();
+    let (sender2, receiver2) = oneshot::channel::<()>();
+    tcp_socket.write(
+        rx2_addr,
+        TcpMsg {
+            msg: payload2.into(),
+            completion: Some(sender2),
+        },
+    );
+
+    assert!(executor::block_on(receiver2).is_err());
+    sleep(Duration::from_millis(5));
+    assert!(rx2_socket.recv().now_or_never().is_none());
+}
+
 const MINIMUM_SEGMENT_SIZE: u16 = 256;
 
 #[test]
@@ -429,13 +567,20 @@ fn tcp_reject_oversized_message() {
 
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    let mut rx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
-    let rx_addr = rx.tcp_local_addr();
-    let tx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
+    let mut rx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+    let mut tx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+
+    let mut rx_socket = rx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    let rx_addr = rx_socket.local_addr();
 
     let oversized_payload = vec![0u8; 3 * 1024 * 1024 + 1];
 
-    tx.tcp_write(
+    let tcp_socket = tx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    tcp_socket.write(
         rx_addr,
         TcpMsg {
             msg: oversized_payload.into(),
@@ -445,7 +590,7 @@ fn tcp_reject_oversized_message() {
 
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_millis(100) {
-        if rx.tcp_read().now_or_never().is_some() {
+        if rx_socket.recv().now_or_never().is_some() {
             panic!("expected no message but received one");
         }
     }
@@ -458,15 +603,22 @@ fn tcp_accept_max_size_message() {
 
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    let mut rx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
-    let rx_addr = rx.tcp_local_addr();
-    let tx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
+    let mut rx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+    let mut tx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+
+    let mut rx_socket = rx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    let rx_addr = rx_socket.local_addr();
 
     let max_size_payload = vec![0u8; 3 * 1024 * 1024];
 
     let (sender, receiver) = oneshot::channel::<()>();
 
-    tx.tcp_write(
+    let tcp_socket = tx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    tcp_socket.write(
         rx_addr,
         TcpMsg {
             msg: max_size_payload.clone().into(),
@@ -476,7 +628,7 @@ fn tcp_accept_max_size_message() {
 
     assert!(executor::block_on(receiver).is_ok());
 
-    let recv_msg = executor::block_on(rx.tcp_read());
+    let recv_msg = executor::block_on(rx_socket.recv());
     assert_eq!(recv_msg.payload, max_size_payload);
 }
 
@@ -487,8 +639,12 @@ fn tcp_rx_reject_oversized_header() {
 
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    let mut rx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
-    let rx_addr = rx.tcp_local_addr();
+    let mut rx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+
+    let mut rx_tcp_socket = rx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    let rx_addr = rx_tcp_socket.local_addr();
 
     let mut tcp_stream = TcpStream::connect(rx_addr).unwrap();
 
@@ -502,10 +658,9 @@ fn tcp_rx_reject_oversized_header() {
         .write_all(&oversized_length.to_le_bytes())
         .unwrap();
     tcp_stream.flush().unwrap();
-
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_millis(100) {
-        if rx.tcp_read().now_or_never().is_some() {
+        if rx_tcp_socket.recv().now_or_never().is_some() {
             panic!("Expected no message but received one");
         }
         sleep(Duration::from_millis(10));
@@ -519,18 +674,12 @@ fn broadcast_all_strides() {
 
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    let mut rx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS)
+    let mut rx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
         .with_udp_buffer_size(400 << 10)
-        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
-            socket_addr: bind_addr,
-            label: LEGACY_SOCKET.to_string(),
-        }])
+        .with_udp_sockets([(UdpSocketId::Raptorcast, bind_addr)])
         .build();
-    let mut tx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS)
-        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
-            socket_addr: bind_addr,
-            label: LEGACY_SOCKET.to_string(),
-        }])
+    let mut tx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_udp_sockets([(UdpSocketId::Raptorcast, bind_addr)])
         .build();
 
     let total_length: usize = 100000;
@@ -539,8 +688,8 @@ fn broadcast_all_strides() {
         .map(|_| rand::thread_rng().gen_range(0..255))
         .collect();
 
-    let mut rx_socket = rx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
-    let tx_socket = tx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
+    let mut rx_socket = rx.udp_sockets.take(UdpSocketId::Raptorcast).unwrap();
+    let tx_socket = tx.udp_sockets.take(UdpSocketId::Raptorcast).unwrap();
 
     let rx_addr = rx_socket.local_addr();
     let tx_addr = tx_socket.local_addr();
@@ -575,18 +724,12 @@ fn unicast_all_strides() {
 
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    let mut rx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS)
+    let mut rx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
         .with_udp_buffer_size(400 << 10)
-        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
-            socket_addr: bind_addr,
-            label: LEGACY_SOCKET.to_string(),
-        }])
+        .with_udp_sockets([(UdpSocketId::Raptorcast, bind_addr)])
         .build();
-    let mut tx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS)
-        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
-            socket_addr: bind_addr,
-            label: LEGACY_SOCKET.to_string(),
-        }])
+    let mut tx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_udp_sockets([(UdpSocketId::Raptorcast, bind_addr)])
         .build();
 
     let total_length: usize = 100000;
@@ -595,8 +738,8 @@ fn unicast_all_strides() {
         .map(|_| rand::thread_rng().gen_range(0..255))
         .collect();
 
-    let mut rx_socket = rx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
-    let tx_socket = tx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
+    let mut rx_socket = rx.udp_sockets.take(UdpSocketId::Raptorcast).unwrap();
+    let tx_socket = tx.udp_sockets.take(UdpSocketId::Raptorcast).unwrap();
 
     let rx_addr = rx_socket.local_addr();
     let tx_addr = tx_socket.local_addr();
@@ -635,17 +778,28 @@ async fn test_tcp_limits_are_applied(
 
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    let mut rx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS)
+    let mut rx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
         .with_tcp_connections_limit(tcp_connection_limit, tcp_per_ip_connection_limit)
         .build();
-    let rx_addr = rx.tcp_local_addr();
 
-    let tx1 = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
-    let tx2 = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
+    let mut tx1 = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+    let mut tx2 = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+
+    let rx_addr = rx
+        .tcp_sockets
+        .get(TcpSocketId::Raptorcast)
+        .unwrap()
+        .local_addr();
 
     let payload1: Vec<u8> = "first message".into();
 
-    tx1.tcp_write(
+    let tx1_socket = tx1.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    tx1_socket.write(
         rx_addr,
         TcpMsg {
             msg: payload1.clone().into(),
@@ -653,11 +807,13 @@ async fn test_tcp_limits_are_applied(
         },
     );
 
-    let recv_msg = rx.tcp_read().await;
+    let mut rx_tcp_socket = rx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    let recv_msg = rx_tcp_socket.recv().await;
     assert_eq!(recv_msg.payload, payload1);
 
     let payload2: Vec<u8> = "second message".into();
-    tx2.tcp_write(
+    let tx2_socket = tx2.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    tx2_socket.write(
         rx_addr,
         TcpMsg {
             msg: payload2.clone().into(),
@@ -666,7 +822,7 @@ async fn test_tcp_limits_are_applied(
     );
 
     let result = async {
-        monoio::time::timeout(Duration::from_millis(50), rx.tcp_read())
+        monoio::time::timeout(Duration::from_millis(50), rx_tcp_socket.recv())
             .await
             .ok()
     }
@@ -682,17 +838,25 @@ async fn test_tcp_rps_limits() {
 
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    let mut rx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS)
+    let mut rx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
         .with_tcp_rps_burst(10, 2)
         .build();
-    let rx_addr = rx.tcp_local_addr();
+    let rx_addr = rx
+        .tcp_sockets
+        .get(TcpSocketId::Raptorcast)
+        .unwrap()
+        .local_addr();
 
-    let tx1 = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
+    let mut tx1 = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
 
     let num_messages = 2;
+    let tx1_socket = tx1.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
     for i in 0..num_messages {
         let payload = format!("message {}", i).into_bytes();
-        tx1.tcp_write(
+        tx1_socket.write(
             rx_addr,
             TcpMsg {
                 msg: payload.into(),
@@ -701,14 +865,15 @@ async fn test_tcp_rps_limits() {
         );
     }
 
+    let mut rx_tcp_socket = rx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
     for i in 0..2 {
-        let recv_msg = rx.tcp_read().await;
+        let recv_msg = rx_tcp_socket.recv().await;
         let expected = format!("message {}", i).into_bytes();
         assert_eq!(recv_msg.payload, expected);
     }
 
     let result = async {
-        monoio::time::timeout(Duration::from_millis(50), rx.tcp_read())
+        monoio::time::timeout(Duration::from_millis(50), rx_tcp_socket.recv())
             .await
             .ok()
     }
@@ -728,18 +893,28 @@ async fn test_tcp_limits_ignored_for_trusted(
 
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    let mut rx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS)
+    let mut rx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
         .with_tcp_connections_limit(tcp_connection_limit, tcp_per_ip_connection_limit)
         .build();
-    let rx_addr = rx.tcp_local_addr();
+    let rx_addr = rx
+        .tcp_sockets
+        .get(TcpSocketId::Raptorcast)
+        .unwrap()
+        .local_addr();
     rx.add_trusted("127.0.0.1".parse().unwrap());
 
-    let tx1 = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
-    let tx2 = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
+    let mut tx1 = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+    let mut tx2 = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
 
     let payload1: Vec<u8> = "first message".into();
 
-    tx1.tcp_write(
+    let tx1_socket = tx1.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    tx1_socket.write(
         rx_addr,
         TcpMsg {
             msg: payload1.clone().into(),
@@ -747,11 +922,13 @@ async fn test_tcp_limits_ignored_for_trusted(
         },
     );
 
-    let recv_msg = rx.tcp_read().await;
+    let mut rx_tcp_socket = rx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    let recv_msg = rx_tcp_socket.recv().await;
     assert_eq!(recv_msg.payload, payload1);
 
     let payload2: Vec<u8> = "second message".into();
-    tx2.tcp_write(
+    let tx2_socket = tx2.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    tx2_socket.write(
         rx_addr,
         TcpMsg {
             msg: payload2.clone().into(),
@@ -759,7 +936,7 @@ async fn test_tcp_limits_ignored_for_trusted(
         },
     );
 
-    let recv_msg = rx.tcp_read().await;
+    let recv_msg = rx_tcp_socket.recv().await;
     assert_eq!(recv_msg.payload, payload2);
 }
 
@@ -769,26 +946,35 @@ async fn test_tcp_banned() {
 
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    let mut rx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
-    let rx_addr = rx.tcp_local_addr();
-    let tx1 = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS).build();
+    let mut rx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
+    let rx_addr = rx
+        .tcp_sockets
+        .get(TcpSocketId::Raptorcast)
+        .unwrap()
+        .local_addr();
+    let mut tx1 = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
+        .build();
 
     let payload1: Vec<u8> = "first message".into();
-    tx1.tcp_write(
+    let tx1_socket = tx1.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    tx1_socket.write(
         rx_addr,
         TcpMsg {
             msg: payload1.clone().into(),
             completion: None,
         },
     );
-    let recv_msg = rx.tcp_read().await;
+    let mut rx_tcp_socket = rx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    let recv_msg = rx_tcp_socket.recv().await;
     assert_eq!(recv_msg.payload, payload1);
 
-    // once banned all further message will be dropped for next 5 minutes
     rx.ban("127.0.0.1".parse().unwrap());
 
     let payload2: Vec<u8> = "second message".into();
-    tx1.tcp_write(
+    tx1_socket.write(
         rx_addr,
         TcpMsg {
             msg: payload2.clone().into(),
@@ -796,7 +982,7 @@ async fn test_tcp_banned() {
         },
     );
     let result = async {
-        monoio::time::timeout(Duration::from_millis(50), rx.tcp_read())
+        monoio::time::timeout(Duration::from_millis(50), rx_tcp_socket.recv())
             .await
             .ok()
     }
@@ -817,18 +1003,15 @@ fn udp_large_stride() {
         .unwrap();
     let rx_addr = rx_socket.local_addr().unwrap();
 
-    let mut tx = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS)
-        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
-            socket_addr: bind_addr,
-            label: LEGACY_SOCKET.to_string(),
-        }])
+    let mut tx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_udp_sockets([(UdpSocketId::Raptorcast, bind_addr)])
         .build();
 
     let payload: Vec<u8> = (0..65536)
         .map(|_| rand::thread_rng().gen_range(0..255))
         .collect();
 
-    let tx_socket = tx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
+    let tx_socket = tx.udp_sockets.take(UdpSocketId::Raptorcast).unwrap();
 
     tx_socket.write_broadcast(BroadcastMsg {
         targets: vec![rx_addr],
@@ -862,17 +1045,11 @@ fn udp_priority_delivery() {
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
     let low_bandwidth_mbps = 10;
-    let mut rx = DataplaneBuilder::new(&bind_addr, low_bandwidth_mbps)
-        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
-            socket_addr: bind_addr,
-            label: LEGACY_SOCKET.to_string(),
-        }])
+    let mut rx = DataplaneBuilder::new(low_bandwidth_mbps)
+        .with_udp_sockets([(UdpSocketId::Raptorcast, bind_addr)])
         .build();
-    let mut tx = DataplaneBuilder::new(&bind_addr, low_bandwidth_mbps)
-        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
-            socket_addr: bind_addr,
-            label: LEGACY_SOCKET.to_string(),
-        }])
+    let mut tx = DataplaneBuilder::new(low_bandwidth_mbps)
+        .with_udp_sockets([(UdpSocketId::Raptorcast, bind_addr)])
         .build();
 
     let message_size = 1024 * 1024; // 1MB
@@ -882,7 +1059,7 @@ fn udp_priority_delivery() {
     let expected_total_msgs = 2 * message_size.div_ceil(DEFAULT_SEGMENT_SIZE as usize);
     let (msg_tx, msg_rx) = mpsc::channel();
 
-    let mut rx_socket = rx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
+    let mut rx_socket = rx.udp_sockets.take(UdpSocketId::Raptorcast).unwrap();
     let rx_addr = rx_socket.local_addr();
     let rx_handle = thread::spawn(move || {
         let mut messages = Vec::new();
@@ -896,9 +1073,8 @@ fn udp_priority_delivery() {
         }
     });
 
-    let tx_socket = tx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
+    let tx_socket = tx.udp_sockets.take(UdpSocketId::Raptorcast).unwrap();
     let tx_addr = tx_socket.local_addr();
-
     tx_socket.write_unicast_with_priority(
         UnicastMsg {
             msgs: vec![(rx_addr, high_priority_data.into())],
@@ -962,17 +1138,11 @@ fn udp_priority_with_regular_then_high_traffic() {
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let low_bandwidth_mbps = 10;
 
-    let mut rx = DataplaneBuilder::new(&bind_addr, low_bandwidth_mbps)
-        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
-            socket_addr: bind_addr,
-            label: LEGACY_SOCKET.to_string(),
-        }])
+    let mut rx = DataplaneBuilder::new(low_bandwidth_mbps)
+        .with_udp_sockets([(UdpSocketId::Raptorcast, bind_addr)])
         .build();
-    let mut tx = DataplaneBuilder::new(&bind_addr, low_bandwidth_mbps)
-        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
-            socket_addr: bind_addr,
-            label: LEGACY_SOCKET.to_string(),
-        }])
+    let mut tx = DataplaneBuilder::new(low_bandwidth_mbps)
+        .with_udp_sockets([(UdpSocketId::Raptorcast, bind_addr)])
         .build();
 
     let message_size = 1024 * 1024; // 1MB
@@ -983,7 +1153,7 @@ fn udp_priority_with_regular_then_high_traffic() {
     let expected_total_msgs = 2 * num_msgs_per_mb;
 
     let (msg_tx, msg_rx) = mpsc::channel();
-    let mut rx_socket = rx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
+    let mut rx_socket = rx.udp_sockets.take(UdpSocketId::Raptorcast).unwrap();
     let rx_addr = rx_socket.local_addr();
     let rx_handle = thread::spawn(move || {
         let mut messages = Vec::new();
@@ -997,9 +1167,8 @@ fn udp_priority_with_regular_then_high_traffic() {
         }
     });
 
-    let tx_socket = tx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
+    let tx_socket = tx.udp_sockets.take(UdpSocketId::Raptorcast).unwrap();
     let tx_addr = tx_socket.local_addr();
-
     tx_socket.write_unicast_with_priority(
         UnicastMsg {
             msgs: vec![(rx_addr, regular_priority_data.into())],
@@ -1059,4 +1228,72 @@ fn udp_priority_with_regular_then_high_traffic() {
         "should process only small amount of regular traffic before high traffic. Got {} regular messages before high priority",
         regular_before_high
     );
+}
+
+#[test]
+#[timeout(3000)]
+fn tcp_multi_socket() {
+    once_setup();
+
+    let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let num_msgs = 5;
+
+    let mut rx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([
+            (TcpSocketId::Raptorcast, bind_addr),
+            (TcpSocketId::AuthenticatedRaptorcast, bind_addr),
+        ])
+        .build();
+    let mut tx = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .with_tcp_sockets([
+            (TcpSocketId::Raptorcast, bind_addr),
+            (TcpSocketId::AuthenticatedRaptorcast, bind_addr),
+        ])
+        .build();
+
+    let mut rx_tcp_socket = rx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    let mut rx_tcp_socket_2 = rx
+        .tcp_sockets
+        .take(TcpSocketId::AuthenticatedRaptorcast)
+        .unwrap();
+    let rx_addr = rx_tcp_socket.local_addr();
+    let rx_addr_2 = rx_tcp_socket_2.local_addr();
+
+    let payload1: Vec<u8> = (0..DEFAULT_SEGMENT_SIZE)
+        .map(|_| rand::thread_rng().gen_range(0..255))
+        .collect();
+    let payload2: Vec<u8> = (0..DEFAULT_SEGMENT_SIZE)
+        .map(|_| rand::thread_rng().gen_range(0..255))
+        .collect();
+
+    let tcp_socket = tx.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
+    let tcp_socket_2 = tx
+        .tcp_sockets
+        .take(TcpSocketId::AuthenticatedRaptorcast)
+        .unwrap();
+
+    for _ in 0..num_msgs {
+        tcp_socket.write(
+            rx_addr,
+            TcpMsg {
+                msg: payload1.clone().into(),
+                completion: None,
+            },
+        );
+        tcp_socket_2.write(
+            rx_addr_2,
+            TcpMsg {
+                msg: payload2.clone().into(),
+                completion: None,
+            },
+        );
+    }
+
+    for _ in 0..num_msgs {
+        let recv_msg = executor::block_on(rx_tcp_socket.recv());
+        assert_eq!(recv_msg.payload, payload1);
+
+        let recv_msg_2 = executor::block_on(rx_tcp_socket_2.recv());
+        assert_eq!(recv_msg_2.payload, payload2);
+    }
 }

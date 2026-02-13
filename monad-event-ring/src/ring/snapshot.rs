@@ -42,16 +42,33 @@ where
     pub fn new_from_zstd_bytes(zstd_bytes: &[u8], name: impl AsRef<str>) -> Result<Self, String> {
         let error_name_cstr = CString::new(name.as_ref()).unwrap();
 
-        let snapshot_fd: libc::c_int =
-            unsafe { libc::memfd_create(error_name_cstr.as_ptr(), libc::MFD_CLOEXEC) };
+        let snapshot_fd: libc::c_int = {
+            #[cfg(target_os = "linux")]
+            {
+                unsafe { libc::memfd_create(error_name_cstr.as_ptr(), libc::MFD_CLOEXEC) }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                // On macOS, use shm_open instead of memfd_create
+                let name_with_slash = format!("/{}", name.as_ref());
+                let name_cstr = CString::new(name_with_slash).unwrap();
+                unsafe {
+                    libc::shm_open(
+                        name_cstr.as_ptr(),
+                        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+                        0o600,
+                    )
+                }
+            }
+        };
         assert_ne!(snapshot_fd, -1);
 
         let snapshot_off: libc::off_t = 0;
 
         let mut decompressed = Vec::new();
 
-        zstd::stream::copy_decode(zstd_bytes, &mut decompressed)
-            .expect(format!("could not decompress `{}`", name.as_ref()).as_str());
+        let () = zstd::stream::copy_decode(zstd_bytes, &mut decompressed)
+            .map_err(|_| format!("could not decompress `{}`", name.as_ref()))?;
 
         let n_write = unsafe {
             libc::write(

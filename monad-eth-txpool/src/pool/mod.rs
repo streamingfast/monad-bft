@@ -34,8 +34,8 @@ use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
 use monad_eth_block_policy::{
-    compute_txn_max_gas_cost, timestamp_ns_to_secs, EthBlockPolicy, EthBlockPolicyBlockValidator,
-    EthValidatedBlock,
+    compute_txn_max_gas_cost, compute_txn_upfront_cost, timestamp_ns_to_secs, EthBlockPolicy,
+    EthBlockPolicyBlockValidator, EthValidatedBlock,
 };
 use monad_eth_txpool_types::{EthTxPoolDropReason, EthTxPoolInternalDropReason, EthTxPoolSnapshot};
 use monad_eth_types::{EthBlockBody, EthExecutionProtocol, ExtractEthAddress, ProposedEthHeader};
@@ -46,14 +46,15 @@ use monad_validator::signature_collection::SignatureCollection;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use tracing::{debug, error, info, warn};
 
-pub use self::transaction::{max_eip2718_encoded_length, PoolTransactionKind};
-use self::{
-    sequencer::ProposalSequencer,
-    tracked::{TrackedTxLimitsConfig, TrackedTxMap},
-    transaction::ValidEthTransaction,
+pub use self::{
+    config::EthTxPoolConfig,
+    tracked::TrackedTxLimitsConfig,
+    transaction::{max_eip2718_encoded_length, PoolTxKind},
 };
+use self::{sequencer::ProposalSequencer, tracked::TrackedTxMap, transaction::PoolTx};
 use crate::EthTxPoolEventTracker;
 
+mod config;
 mod sequencer;
 mod tracked;
 mod transaction;
@@ -74,8 +75,6 @@ where
     chain_id: u64,
     chain_revision: CRT,
     execution_revision: MonadExecutionRevision,
-
-    do_local_insert: bool,
 }
 
 impl<ST, SCT, SBT, CCT, CRT> EthTxPool<ST, SCT, SBT, CCT, CRT>
@@ -88,34 +87,23 @@ where
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
 {
     pub fn new(
-        max_addresses: Option<usize>,
-        max_txs: Option<usize>,
-        max_eip2718_bytes: Option<u64>,
-        soft_evict_addresses_watermark: Option<usize>,
-        soft_tx_expiry: Duration,
-        hard_tx_expiry: Duration,
+        config: EthTxPoolConfig,
         chain_id: u64,
         chain_revision: CRT,
         execution_revision: MonadExecutionRevision,
-        do_local_insert: bool,
     ) -> Self {
+        let EthTxPoolConfig {
+            limits: config_limits,
+        } = config;
+
         Self {
-            tracked: TrackedTxMap::new(TrackedTxLimitsConfig::new(
-                max_addresses,
-                max_txs,
-                max_eip2718_bytes,
-                soft_evict_addresses_watermark,
-                soft_tx_expiry,
-                hard_tx_expiry,
-            )),
+            tracked: TrackedTxMap::new(config_limits),
 
             last_commit: None,
 
             chain_id,
             chain_revision,
             execution_revision,
-
-            do_local_insert,
         }
     }
 
@@ -137,17 +125,9 @@ where
         block_policy: &EthBlockPolicy<ST, SCT, CCT, CRT>,
         state_backend: &SBT,
         chain_config: &CCT,
-        txs: Vec<(Recovered<TxEnvelope>, PoolTransactionKind)>,
-        mut on_insert: impl FnMut(&ValidEthTransaction),
+        txs: Vec<(Recovered<TxEnvelope>, PoolTxKind)>,
+        mut on_insert: impl FnMut(&PoolTx),
     ) {
-        if !self.do_local_insert {
-            event_tracker.drop_all(
-                txs.into_iter().map(|(tx, _)| tx),
-                EthTxPoolDropReason::PoolNotReady,
-            );
-            return;
-        }
-
         let Some(last_commit) = self.last_commit.as_ref() else {
             event_tracker.drop_all(
                 txs.into_iter().map(|(tx, _)| tx),
@@ -161,7 +141,7 @@ where
 
         let (txs, invalid_txs): (Vec<_>, Vec<_>) =
             txs.into_par_iter().partition_map(|(tx, kind)| {
-                Either::from(ValidEthTransaction::validate(
+                Either::from(PoolTx::validate(
                     last_commit,
                     self.chain_id,
                     chain_params,
@@ -182,7 +162,7 @@ where
         // the range at N-k+1.
         let block_seq_num = block_policy.get_last_commit() + SeqNum(1);
 
-        let account_balance_addresses = txs.iter().map(ValidEthTransaction::signer).collect_vec();
+        let account_balance_addresses = txs.iter().map(PoolTx::signer).collect_vec();
 
         let account_balances = match block_policy.compute_account_base_balances(
             block_seq_num,
@@ -198,7 +178,7 @@ where
                     "failed to insert transactions at account_balance lookups"
                 );
                 event_tracker.drop_all(
-                    txs.into_iter().map(ValidEthTransaction::into_raw),
+                    txs.into_iter().map(PoolTx::into_raw),
                     EthTxPoolDropReason::Internal(EthTxPoolInternalDropReason::StateBackendError),
                 );
                 return;
@@ -210,15 +190,19 @@ where
         let txs = txs
             .into_iter()
             .filter(|tx| {
-                if account_balances
-                    .get(tx.signer_ref())
-                    .is_none_or(|account_balance_state| {
-                        account_balance_state.balance
-                            < compute_txn_max_gas_cost(tx.raw(), last_commit_base_fee)
-                    })
-                {
-                    event_tracker.drop(tx.hash(), EthTxPoolDropReason::InsufficientBalance);
-                    return false;
+                // Balance check per Yellow Paper §71: balance >= tx.value + (gas_limit × max_fee_per_gas)
+                let upfront = compute_txn_upfront_cost(tx.raw());
+                let account_balance = account_balances.get(tx.signer_ref()).map(|a| a.balance);
+
+                // Skip balance check if account has zero balance in lagged state - this might mean
+                // the account doesn't exist yet due to state lag. The execution layer will perform
+                // the authoritative balance validation.
+                if let Some(balance) = account_balance {
+                    if !balance.is_zero() && balance < upfront {
+                        // Account exists with insufficient balance - reject
+                        event_tracker.drop(tx.hash(), EthTxPoolDropReason::InsufficientBalance);
+                        return false;
+                    }
                 }
 
                 true
@@ -240,9 +224,7 @@ where
                     "failed to insert transactions at account_nonce lookups"
                 );
                 event_tracker.drop_all(
-                    txs.into_values()
-                        .flatten()
-                        .map(ValidEthTransaction::into_raw),
+                    txs.into_values().flatten().map(PoolTx::into_raw),
                     EthTxPoolDropReason::Internal(EthTxPoolInternalDropReason::StateBackendError),
                 );
                 return;
@@ -252,7 +234,7 @@ where
         for (address, txs) in txs {
             let Some(account_nonce) = account_nonces.remove(&address) else {
                 event_tracker.drop_all(
-                    txs.into_iter().map(ValidEthTransaction::into_raw),
+                    txs.into_iter().map(PoolTx::into_raw),
                     EthTxPoolDropReason::Internal(EthTxPoolInternalDropReason::StateBackendError),
                 );
                 continue;
@@ -382,7 +364,18 @@ where
             None
         };
 
+        let parent_hash = extending_blocks
+            .last()
+            .and_then(|b| {
+                b.header()
+                    .delayed_execution_results
+                    .last()
+                    .map(|h| h.0.hash_slow().0)
+            })
+            .unwrap_or([0_u8; 32]);
+
         let header = ProposedEthHeader {
+            parent_hash,
             transactions_root: *alloy_consensus::proofs::calculate_transaction_root(
                 &body.transactions,
             ),
@@ -542,18 +535,14 @@ where
 
     pub fn generate_snapshot(&self) -> EthTxPoolSnapshot {
         EthTxPoolSnapshot {
-            txs: self
-                .tracked
-                .iter_txs()
-                .map(ValidEthTransaction::hash)
-                .collect(),
+            txs: self.tracked.iter_txs().map(PoolTx::hash).collect(),
         }
     }
 
     pub fn generate_sender_snapshot(&self) -> Vec<Address> {
         self.tracked
             .iter_txs()
-            .map(ValidEthTransaction::signer)
+            .map(PoolTx::signer)
             .unique()
             .collect()
     }
@@ -738,16 +727,19 @@ where
 {
     pub fn default_testing() -> Self {
         Self::new(
-            None,
-            None,
-            None,
-            None,
-            Duration::from_secs(60),
-            Duration::from_secs(60),
+            EthTxPoolConfig {
+                limits: TrackedTxLimitsConfig::new(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Duration::from_secs(60),
+                    Duration::from_secs(60),
+                ),
+            },
             MockChainConfig::DEFAULT.chain_id(),
             MockChainRevision::DEFAULT,
             MonadExecutionRevision::LATEST,
-            true,
         )
     }
 }

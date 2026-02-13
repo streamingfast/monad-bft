@@ -16,32 +16,36 @@
 use alloy_rlp::{encode_list, Decodable, Encodable, Header, RlpDecodable, RlpEncodable};
 use bytes::BufMut;
 use monad_crypto::certificate_signature::{
-    CertificateSignaturePubKey, CertificateSignatureRecoverable,
+    CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey,
 };
 use monad_peer_discovery::MonadNameRecord;
-use monad_types::{NodeId, Round};
+use monad_types::{LimitedVec, NodeId, Round};
 
 #[derive(RlpEncodable, RlpDecodable, Debug, Eq, PartialEq, Clone)]
-pub struct PrepareGroup<ST: CertificateSignatureRecoverable> {
-    pub validator_id: NodeId<CertificateSignaturePubKey<ST>>,
+pub struct PrepareGroup<PT: PubKey> {
+    pub validator_id: NodeId<PT>,
     pub max_group_size: usize,
     pub start_round: Round,
     pub end_round: Round,
 }
 
 #[derive(Debug, Clone, RlpEncodable, RlpDecodable, Eq, PartialEq)]
-pub struct PrepareGroupResponse<ST: CertificateSignatureRecoverable> {
-    pub req: PrepareGroup<ST>,
-    pub node_id: NodeId<CertificateSignaturePubKey<ST>>,
+pub struct PrepareGroupResponse<PT: PubKey> {
+    pub req: PrepareGroup<PT>,
+    pub node_id: NodeId<PT>,
     pub accept: bool,
 }
+
+/// Maximum number of peers/name records allowed in a ConfirmGroup message.
+/// This is to set an upper bound on RLP deserialization memory usage.
+const MAX_PEERS_IN_CONFIRM_GROUP: usize = 500;
 
 #[derive(Debug, Clone, RlpEncodable, RlpDecodable, Eq, PartialEq)]
 #[rlp(trailing)]
 pub struct ConfirmGroup<ST: CertificateSignatureRecoverable> {
-    pub prepare: PrepareGroup<ST>,
-    pub peers: Vec<NodeId<CertificateSignaturePubKey<ST>>>,
-    pub name_records: Vec<MonadNameRecord<ST>>,
+    pub prepare: PrepareGroup<CertificateSignaturePubKey<ST>>,
+    pub peers: LimitedVec<NodeId<CertificateSignaturePubKey<ST>>, MAX_PEERS_IN_CONFIRM_GROUP>,
+    pub name_records: LimitedVec<MonadNameRecord<ST>, MAX_PEERS_IN_CONFIRM_GROUP>,
 }
 
 const GROUP_MSG_VERSION: u8 = 1;
@@ -52,8 +56,8 @@ const MESSAGE_TYPE_CONF_GRP: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FullNodesGroupMessage<ST: CertificateSignatureRecoverable> {
-    PrepareGroup(PrepareGroup<ST>), // MESSAGE_TYPE_PREP_REQ
-    PrepareGroupResponse(PrepareGroupResponse<ST>), // MESSAGE_TYPE_PREP_RES
+    PrepareGroup(PrepareGroup<CertificateSignaturePubKey<ST>>), // MESSAGE_TYPE_PREP_REQ
+    PrepareGroupResponse(PrepareGroupResponse<CertificateSignaturePubKey<ST>>), // MESSAGE_TYPE_PREP_RES
     ConfirmGroup(ConfirmGroup<ST>), // MESSAGE_TYPE_CONF_GRP
 }
 
@@ -125,7 +129,7 @@ mod tests {
         .to_string()
     }
 
-    fn make_prep_group(seed: u32) -> PrepareGroup<ST> {
+    fn make_prep_group(seed: u32) -> PrepareGroup<CertificateSignaturePubKey<ST>> {
         PrepareGroup {
             validator_id: nid(seed as u64),
             max_group_size: 1 + seed as usize,
@@ -190,8 +194,8 @@ mod tests {
     fn serialize_roundtrip_group_conf() {
         let org_msg = ConfirmGroup {
             prepare: make_prep_group(7),
-            peers: [nid(8), nid(9), nid(10)].to_vec(),
-            name_records: make_name_records(11, 3),
+            peers: [nid(8), nid(9), nid(10)].to_vec().into(),
+            name_records: make_name_records(11, 3).into(),
         };
         let org_enum = FullNodesGroupMessage::ConfirmGroup(org_msg);
 

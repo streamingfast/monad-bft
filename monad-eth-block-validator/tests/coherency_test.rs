@@ -39,7 +39,10 @@ use monad_crypto::{certificate_signature::CertificateKeyPair, NopKeyPair, NopSig
 use monad_eth_block_policy::{EthBlockPolicy, EthValidatedBlock};
 use monad_eth_block_validator::EthBlockValidator;
 use monad_eth_testutil::{recover_tx, secret_to_eth_address, S1, S2};
-use monad_eth_txpool::{EthTxPool, EthTxPoolEventTracker, EthTxPoolMetrics, PoolTransactionKind};
+use monad_eth_txpool::{
+    EthTxPool, EthTxPoolConfig, EthTxPoolEventTracker, EthTxPoolMetrics, PoolTxKind,
+    TrackedTxLimitsConfig,
+};
 use monad_eth_types::{EthBlockBody, EthExecutionProtocol, EthHeader, ProposedEthHeader};
 use monad_state_backend::NopStateBackend;
 use monad_testutil::signing::MockSignatures;
@@ -424,16 +427,19 @@ fn test_invalid_delegation_non_emptying_insufficient() {
 
 fn create_test_txpool(chain_config: &MonadChainConfig) -> TestTxPool {
     TestTxPool::new(
-        None,                               // max_addresses
-        None,                               // max_txs
-        None,                               // max_eip2718_bytes
-        None,                               // soft_evict_addresses_watermark
-        std::time::Duration::from_secs(60), // soft_tx_expiry
-        std::time::Duration::from_secs(60), // hard_tx_expiry
+        EthTxPoolConfig {
+            limits: TrackedTxLimitsConfig::new(
+                None,
+                None,
+                None,
+                None,
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(60),
+            ),
+        },
         chain_config.chain_id(),
         chain_config.get_chain_revision(GENESIS_ROUND),
         chain_config.get_execution_chain_revision(0), // genesis timestamp
-        true,                                         // do_local_insert
     )
 }
 
@@ -478,7 +484,7 @@ fn check_txpool_coherency(
             chain_config,
             block_txs
                 .into_iter()
-                .map(|tx| (tx, PoolTransactionKind::Forwarded))
+                .map(|tx| (tx, PoolTxKind::Forwarded))
                 .collect(),
             |_tx| {},
         );
@@ -887,7 +893,7 @@ fn sufficient_single_emptying_transaction_inputs() -> (
 ) {
     let signer = S1;
 
-    let max_fee_per_gas = (1 * ONE_ETHER) / 50_000;
+    let max_fee_per_gas = ONE_ETHER / 50_000;
 
     let tx1 = make_test_tx(signer, 50_000, max_fee_per_gas, 3 * ONE_ETHER, 0);
     let sender = tx1.signer();
@@ -972,7 +978,7 @@ fn sufficient_emptying_transaction_inputs() -> (
     let tx1 = make_test_tx(signer, 50_000, max_fee_per_gas, 2 * ONE_ETHER, 0);
     let sender = tx1.signer();
 
-    let max_fee_per_gas = (1 * ONE_ETHER) / 50_000;
+    let max_fee_per_gas = ONE_ETHER / 50_000;
     let tx2 = make_test_tx(signer, 50_000, max_fee_per_gas, ONE_ETHER, 1);
 
     let txs = BTreeMap::from([
@@ -1055,7 +1061,7 @@ fn emptying_transaction_different_blocks_sufficient_inputs() -> (
     let tx1 = make_test_tx(signer, 50_000, max_fee_per_gas, 2 * ONE_ETHER, 0);
     let sender = tx1.signer();
 
-    let max_fee_per_gas = (1 * ONE_ETHER) / 50_000;
+    let max_fee_per_gas = ONE_ETHER / 50_000;
     let tx2 = make_test_tx(signer, 50_000, max_fee_per_gas, ONE_ETHER, 1);
 
     let txs = BTreeMap::from([
@@ -1242,7 +1248,7 @@ fn delegation_non_emptying_same_block_sufficient_inputs() -> (
         make_eip7702_tx_with_value(S2, 0, 100_000_000_000, 0, 50_000, 0, vec![signed_auth], 0);
     let bundler = tx1.signer();
 
-    let max_fee_per_gas = (1 * ONE_ETHER) / 50_000;
+    let max_fee_per_gas = ONE_ETHER / 50_000;
     let tx2 = make_test_tx(signer, 50_000, max_fee_per_gas, 0, 1);
     let sender = tx2.signer();
 
@@ -1393,7 +1399,7 @@ fn delegation_non_emptying_different_blocks_sufficient_inputs() -> (
     let bundler = tx1.signer();
     let sender = signer;
 
-    let max_fee_per_gas = (1 * ONE_ETHER) / 50_000;
+    let max_fee_per_gas = ONE_ETHER / 50_000;
     let tx2 = make_test_tx(signer, 50_000, max_fee_per_gas, 0, 1);
 
     let txs = BTreeMap::from([
@@ -1586,7 +1592,7 @@ fn sufficient_balance_emptying_txn_with_value_and_delegation_same_block_inputs()
 ) {
     let signer = S1;
 
-    let max_fee_per_gas = (1 * ONE_ETHER) / 50_000;
+    let max_fee_per_gas = ONE_ETHER / 50_000;
     let tx1 = make_test_tx(signer, 50_000, max_fee_per_gas, 3 * ONE_ETHER, 0);
     let sender = tx1.signer();
 
@@ -1962,7 +1968,7 @@ fn emptying_and_delegation_preceding_blocks_sufficient_inputs() -> (
         make_eip7702_tx_with_value(S2, 0, 100_000_000_000, 0, 50_000, 0, vec![signed_auth], 0);
     let bundler = tx2.signer();
 
-    let max_fee_per_gas = (1 * ONE_ETHER) / 50_000;
+    let max_fee_per_gas = ONE_ETHER / 50_000;
     let tx3 = make_test_tx(signer, 50_000, max_fee_per_gas, 0, 2);
 
     let txs = BTreeMap::from([
@@ -2034,7 +2040,7 @@ fn multiple_non_emptying_same_block_sufficient_inputs() -> (
     let max_fee_per_gas = (5 * ONE_ETHER) / 50_000;
     let tx2 = make_test_tx(signer, 50_000, max_fee_per_gas, 0, 2);
 
-    let max_fee_per_gas = (1 * ONE_ETHER) / 50_000;
+    let max_fee_per_gas = ONE_ETHER / 50_000;
     let tx3 = make_test_tx(signer, 50_000, max_fee_per_gas, 0, 3);
 
     let txs = BTreeMap::from([
@@ -2072,7 +2078,7 @@ fn multiple_non_emptying_different_blocks_insufficient_inputs() -> (
     let max_fee_per_gas = (2 * ONE_ETHER) / 50_000;
     let tx3 = make_test_tx(signer, 50_000, max_fee_per_gas, 0, 3);
 
-    let max_fee_per_gas = (1 * ONE_ETHER) / 50_000;
+    let max_fee_per_gas = ONE_ETHER / 50_000;
     let tx4 = make_test_tx(signer, 50_000, max_fee_per_gas, 0, 4);
 
     let txs = BTreeMap::from([
@@ -2106,7 +2112,7 @@ fn multiple_non_emptying_different_blocks_sufficient_inputs() -> (
     let max_fee_per_gas = (3 * ONE_ETHER) / 50_000;
     let tx2 = make_test_tx(signer, 50_000, max_fee_per_gas, 0, 2);
 
-    let max_fee_per_gas = (1 * ONE_ETHER) / 50_000;
+    let max_fee_per_gas = ONE_ETHER / 50_000;
     let tx3 = make_test_tx(signer, 50_000, max_fee_per_gas, 0, 3);
 
     let tx4 = make_test_tx(signer, 50_000, max_fee_per_gas, 0, 4);
@@ -2221,7 +2227,7 @@ fn invalid_delegation_non_emptying_sufficient_inputs() -> (
     let bundler = tx0.signer();
 
     let max_fee_per_gas = (5 * ONE_ETHER) / 50_000;
-    let tx1 = make_test_tx(signer, 50_000, max_fee_per_gas, 1 * ONE_ETHER, 1);
+    let tx1 = make_test_tx(signer, 50_000, max_fee_per_gas, ONE_ETHER, 1);
     let sender = tx1.signer();
     let tx2 = make_test_tx(signer, 50_000, max_fee_per_gas, 0, 2);
 

@@ -19,7 +19,7 @@ use alloy_primitives::Address;
 use indexmap::IndexMap;
 use tracing::{error, info};
 
-use crate::pool::transaction::ValidEthTransaction;
+use crate::pool::transaction::PoolTx;
 
 // To produce 5k tx blocks, we need the tracked tx map to hold at least 15k addresses so that, after
 // pruning the txpool of up to 5k unique addresses in the last committed block update and up to 5k
@@ -32,15 +32,15 @@ const DEFAULT_MAX_TXS: usize = 64 * 1024;
 const DEFAULT_MAX_EIP2718_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
-pub(crate) struct TrackedTxLimitsConfig {
-    max_addresses: usize,
-    max_txs: usize,
-    max_eip2718_bytes: u64,
+pub struct TrackedTxLimitsConfig {
+    pub max_addresses: usize,
+    pub max_txs: usize,
+    pub max_eip2718_bytes: u64,
 
-    soft_evict_addresses_watermark: usize,
+    pub soft_evict_addresses_watermark: usize,
 
-    soft_tx_expiry: Duration,
-    hard_tx_expiry: Duration,
+    pub soft_tx_expiry: Duration,
+    pub hard_tx_expiry: Duration,
 }
 
 impl TrackedTxLimitsConfig {
@@ -54,13 +54,15 @@ impl TrackedTxLimitsConfig {
         soft_tx_expiry: Duration,
         hard_tx_expiry: Duration,
     ) -> Self {
+        let max_addresses = max_addresses.unwrap_or(DEFAULT_MAX_ADDRESSES);
+
         Self {
-            max_addresses: max_addresses.unwrap_or(DEFAULT_MAX_ADDRESSES),
+            max_addresses,
             max_txs: max_txs.unwrap_or(DEFAULT_MAX_TXS),
             max_eip2718_bytes: max_eip2718_bytes.unwrap_or(DEFAULT_MAX_EIP2718_BYTES),
 
             soft_evict_addresses_watermark: soft_evict_addresses_watermark
-                .unwrap_or(DEFAULT_MAX_ADDRESSES - 512),
+                .unwrap_or_else(|| max_addresses.saturating_sub(512)),
 
             soft_tx_expiry,
             hard_tx_expiry,
@@ -110,12 +112,12 @@ impl TrackedTxLimits {
             || self.eip2718_bytes > self.config.max_eip2718_bytes
     }
 
-    pub fn add_tx(&mut self, tx: &ValidEthTransaction) {
+    pub fn add_tx(&mut self, tx: &PoolTx) {
         self.txs += 1;
         self.eip2718_bytes += tx.raw().eip2718_encoded_length() as u64;
     }
 
-    pub fn remove_tx(&mut self, tx: &ValidEthTransaction) {
+    pub fn remove_tx(&mut self, tx: &PoolTx) {
         self.txs = self.txs.checked_sub(1).unwrap_or_else(|| {
             error!("txpool txs limit underflowed, detected during remove_tx");
             0
@@ -130,7 +132,7 @@ impl TrackedTxLimits {
             });
     }
 
-    pub fn remove_txs<'a>(&mut self, txs: impl Iterator<Item = &'a ValidEthTransaction>) {
+    pub fn remove_txs<'a>(&mut self, txs: impl Iterator<Item = &'a PoolTx>) {
         for tx in txs {
             self.remove_tx(tx)
         }

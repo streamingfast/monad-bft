@@ -849,6 +849,7 @@ where
     pub certkey: SignatureCollectionKeyPairType<SCT>,
     pub beneficiary: [u8; 20],
     pub block_sync_override_peers: Vec<NodeId<SCT::NodeIdPubKey>>,
+    pub maybe_blocksync_rng_seed: Option<u64>,
     pub whitelisted_statesync_nodes: HashSet<NodeId<SCT::NodeIdPubKey>>,
     pub statesync_expand_to_group: bool,
 
@@ -928,7 +929,11 @@ where
                 self.locked_epoch_validators.clone(),
             ),
             certificate_cache: CertificateCache::default(),
-            block_sync: BlockSync::new(self.block_sync_override_peers, nodeid),
+            block_sync: BlockSync::new(
+                self.block_sync_override_peers,
+                nodeid,
+                self.maybe_blocksync_rng_seed,
+            ),
 
             leader_election: self.leader_election,
             epoch_manager,
@@ -1018,8 +1023,7 @@ where
 
                 if consensus_cmds
                     .iter()
-                    .find(|cmd| matches!(cmd.command, ConsensusCommand::EnterRound(_, _)))
-                    .is_some()
+                    .any(|cmd| matches!(cmd.command, ConsensusCommand::EnterRound(_, _)))
                 {
                     self.metrics.node_state.self_stake_bps = self.get_self_stake_bps();
                 }

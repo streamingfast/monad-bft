@@ -145,6 +145,7 @@ impl ExecutedBlockBuilder {
                 self.state = Some(BlockReassemblyState {
                     start: block_header,
                     txns: txns.into_boxed_slice(),
+                    system_calls: Vec::new(),
                 });
 
                 None
@@ -160,11 +161,13 @@ impl ExecutedBlockBuilder {
                 let BlockReassemblyState {
                     start: header,
                     txns,
+                    system_calls,
                 } = self.state.take()?;
 
                 Some(Ok(ExecutedBlock {
                     start: header,
                     end: block_result,
+                    system_calls: system_calls.into_boxed_slice(),
                     txns: txns
                         .into_vec()
                         .into_iter()
@@ -432,36 +435,51 @@ impl ExecutedBlockBuilder {
             } => {
                 let state = self.state.as_mut()?;
 
-                let txn_ref = state
-                    .txns
-                    .get_mut(TryInto::<usize>::try_into(txn_index).unwrap())
-                    .expect("ExecutedBlockBuilder TxnCallFrame txn_index within bounds")
-                    .as_mut()
-                    .expect(
-                        "ExecutedBlockBuilder TxnCallFrame txn_index populated from preceding TxnStart",
-                    );
+                // If no txn_index, this is a system call (block-level call frame)
+                match txn_index {
+                    None => {
+                        // Collect as system call
+                        use crate::ExecutedSystemCall;
+                        state.system_calls.push(ExecutedSystemCall {
+                            call_frame: txn_call_frame,
+                            input: input_bytes,
+                            r#return: return_bytes,
+                        });
+                        return None;
+                    }
+                    Some(txn_idx) => {
+                        let txn_ref = state
+                            .txns
+                            .get_mut(TryInto::<usize>::try_into(txn_idx).unwrap())
+                            .expect("ExecutedBlockBuilder TxnCallFrame txn_index within bounds")
+                            .as_mut()
+                            .expect(
+                                "ExecutedBlockBuilder TxnCallFrame txn_index populated from preceding TxnStart",
+                            );
 
-                let txn_output = txn_ref.output.as_mut().expect(
-                    "ExecutedBlockBuilder TxnCallFrame output populated from preceding TxnEvmOutput",
-                );
+                        let txn_output = txn_ref.output.as_mut().expect(
+                            "ExecutedBlockBuilder TxnCallFrame output populated from preceding TxnEvmOutput",
+                        );
 
-                let txn_call_frames = txn_output
-                    .call_frames
-                    .as_mut()
-                    .expect("ExecutedBlockBuilder TxnReassemblyState call_frames set to Some");
+                        let txn_call_frames = txn_output
+                            .call_frames
+                            .as_mut()
+                            .expect("ExecutedBlockBuilder TxnReassemblyState call_frames set to Some");
 
-                let existing_txn_call_frame = txn_call_frames
-                    .get_mut(txn_call_frame.index as usize)
-                    .expect("ExecutedBlockBuilder TxnCallFrame index within bounds")
-                    .replace(ExecutedTxnCallFrame {
-                        call_frame: txn_call_frame,
-                        input: input_bytes,
-                        r#return: return_bytes,
-                    });
+                        let existing_txn_call_frame = txn_call_frames
+                            .get_mut(txn_call_frame.index as usize)
+                            .expect("ExecutedBlockBuilder TxnCallFrame index within bounds")
+                            .replace(ExecutedTxnCallFrame {
+                                call_frame: txn_call_frame,
+                                input: input_bytes,
+                                r#return: return_bytes,
+                            });
 
-                assert!(existing_txn_call_frame.is_none());
+                        assert!(existing_txn_call_frame.is_none());
 
-                None
+                        None
+                    }
+                }
             }
             ExecEvent::TxnEnd => None,
             ExecEvent::EvmError(monad_exec_evm_error) => {
