@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - feature/add-sys-calls
+      - feature/add-sys-calls-v0.12.7
 
 env:
   REGISTRY: ghcr.io
