@@ -118,8 +118,6 @@ impl ProposedEthHeader {
         self.parent_hash.length() + self.header_payload_length()
     }
 
-    /// Encode for IPC to monad-execution (C++). Includes parent_hash as first field.
-    /// This is NOT used for network wire encoding — use the standard Encodable impl for that.
     fn encode_with_parent_hash(&self, out: &mut dyn alloy_rlp::BufMut) {
         let list_header = alloy_rlp::Header {
             list: true,
