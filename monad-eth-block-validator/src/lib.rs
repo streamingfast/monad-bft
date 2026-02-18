@@ -207,6 +207,7 @@ where
         }
 
         let ProposedEthHeader {
+            parent_hash: _,
             ommers_hash,
             beneficiary: _,
             transactions_root,
