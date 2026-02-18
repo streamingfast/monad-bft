@@ -23,7 +23,7 @@ use alloy_rlp::{
     Decodable, Encodable, RlpDecodable, RlpDecodableWrapper, RlpEncodable, RlpEncodableWrapper,
 };
 use monad_crypto::NopPubKey;
-use monad_types::{Balance, ExecutionProtocol, FinalizedHeader, Nonce, SeqNum};
+use monad_types::{Balance, ExecutionProtocol, FinalizedHeader, IpcEncodable, Nonce, SeqNum};
 use serde_with::{serde_as, DisplayFromStr};
 
 pub mod serde;
@@ -91,7 +91,6 @@ pub struct ProposedEthHeader {
 impl ProposedEthHeader {
     fn header_payload_length(&self) -> usize {
         let mut length = 0;
-        length += self.parent_hash.length();
         length += self.ommers_hash.length();
         length += self.beneficiary.length();
         length += self.transactions_root.length();
@@ -114,6 +113,40 @@ impl ProposedEthHeader {
 
         length
     }
+
+    fn ipc_payload_length(&self) -> usize {
+        self.parent_hash.length() + self.header_payload_length()
+    }
+
+    /// Encode for IPC to monad-execution (C++). Includes parent_hash as first field.
+    /// This is NOT used for network wire encoding — use the standard Encodable impl for that.
+    fn encode_with_parent_hash(&self, out: &mut dyn alloy_rlp::BufMut) {
+        let list_header = alloy_rlp::Header {
+            list: true,
+            payload_length: self.ipc_payload_length(),
+        };
+        list_header.encode(out);
+        self.parent_hash.encode(out);
+        self.ommers_hash.encode(out);
+        self.beneficiary.encode(out);
+        self.transactions_root.encode(out);
+        self.difficulty.encode(out);
+        self.number.encode(out);
+        self.gas_limit.encode(out);
+        self.timestamp.encode(out);
+        self.extra_data.encode(out);
+        self.mix_hash.encode(out);
+        self.nonce.encode(out);
+        self.base_fee_per_gas.encode(out);
+        self.withdrawals_root.encode(out);
+        self.blob_gas_used.encode(out);
+        self.excess_blob_gas.encode(out);
+        self.parent_beacon_block_root.encode(out);
+
+        if let Some(requests_hash) = &self.requests_hash {
+            requests_hash.encode(out);
+        }
+    }
 }
 
 impl Encodable for ProposedEthHeader {
@@ -130,7 +163,6 @@ impl Encodable for ProposedEthHeader {
             payload_length: self.header_payload_length(),
         };
         list_header.encode(out);
-        self.parent_hash.encode(out);
         self.ommers_hash.encode(out);
         self.beneficiary.encode(out);
         self.transactions_root.encode(out);
@@ -161,7 +193,7 @@ impl Decodable for ProposedEthHeader {
         }
         let starting_len = buf.len();
         let mut this = Self {
-            parent_hash: Decodable::decode(buf)?,
+            parent_hash: [0u8; 32],
             ommers_hash: Decodable::decode(buf)?,
             beneficiary: Decodable::decode(buf)?,
             transactions_root: Decodable::decode(buf)?,
@@ -193,6 +225,14 @@ impl Decodable for ProposedEthHeader {
         }
 
         Ok(this)
+    }
+}
+
+impl IpcEncodable for ProposedEthHeader {
+    fn encode_ipc(&self, parent_hash: [u8; 32], out: &mut dyn alloy_rlp::BufMut) {
+        let mut header_with_parent = self.clone();
+        header_with_parent.parent_hash = parent_hash;
+        header_with_parent.encode_with_parent_hash(out);
     }
 }
 

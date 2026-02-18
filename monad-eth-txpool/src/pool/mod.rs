@@ -272,7 +272,7 @@ where
         block_policy: &EthBlockPolicy<ST, SCT, CCT, CRT>,
         state_backend: &SBT,
         chain_config: &CCT,
-    ) -> Result<ProposedExecutionInputs<EthExecutionProtocol>, BlockPolicyError> {
+    ) -> Result<(ProposedExecutionInputs<EthExecutionProtocol>, [u8; 32]), BlockPolicyError> {
         info!(
             ?proposed_seq_num,
             ?tx_limit,
@@ -364,7 +364,7 @@ where
             None
         };
 
-        let parent_hash = extending_blocks
+        let parent_hash: [u8; 32] = extending_blocks
             .last()
             .and_then(|b| {
                 b.header()
@@ -375,7 +375,7 @@ where
             .unwrap_or([0_u8; 32]);
 
         let header = ProposedEthHeader {
-            parent_hash,
+            parent_hash: [0u8; 32],
             transactions_root: *alloy_consensus::proofs::calculate_transaction_root(
                 &body.transactions,
             ),
@@ -405,7 +405,7 @@ where
 
         self.update_aggregate_metrics(event_tracker);
 
-        Ok(ProposedExecutionInputs { header, body })
+        Ok((ProposedExecutionInputs { header, body }, parent_hash))
     }
 
     pub fn enter_round(

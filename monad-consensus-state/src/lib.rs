@@ -2247,6 +2247,7 @@ mod test {
                 &self.val_epoch_map,
                 &self.election,
                 |seq_num, timestamp_ns, round_signature: RoundSignature<_>| ProposedEthHeader {
+                    parent_hash: [0_u8; 32],
                     transactions_root: *EMPTY_TRANSACTIONS,
                     ommers_hash: *EMPTY_OMMER_ROOT_HASH,
                     withdrawals_root: *EMPTY_WITHDRAWALS,
@@ -2279,6 +2280,7 @@ mod test {
                 &self.val_epoch_map,
                 &self.election,
                 |seq_num, timestamp_ns, round_signature| ProposedEthHeader {
+                    parent_hash: [0_u8; 32],
                     transactions_root: *EMPTY_TRANSACTIONS,
                     ommers_hash: *EMPTY_OMMER_ROOT_HASH,
                     withdrawals_root: *EMPTY_WITHDRAWALS,
@@ -2312,6 +2314,7 @@ mod test {
                 &self.val_epoch_map,
                 &self.election,
                 |seq_num, timestamp_ns, round_signature| ProposedEthHeader {
+                    parent_hash: [0_u8; 32],
                     transactions_root: *EMPTY_TRANSACTIONS,
                     ommers_hash: *EMPTY_OMMER_ROOT_HASH,
                     withdrawals_root: *EMPTY_WITHDRAWALS,

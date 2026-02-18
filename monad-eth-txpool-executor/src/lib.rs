@@ -391,7 +391,7 @@ where
                         &self.state_backend,
                         &self.chain_config,
                     ) {
-                        Ok(proposed_execution_inputs) => {
+                        Ok((proposed_execution_inputs, parent_hash)) => {
                             let elapsed = create_proposal_start.elapsed();
 
                             self.metrics.create_proposal.fetch_add(1, Ordering::SeqCst);
@@ -412,6 +412,7 @@ where
                                     base_fee_moment: base_fee_moment_field,
                                     delayed_execution_results,
                                     proposed_execution_inputs,
+                                    parent_hash,
                                     last_round_tc,
                                     fresh_proposal_certificate,
                                 })

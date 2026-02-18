@@ -265,6 +265,7 @@ where
                             header: MockExecutionProposedHeader::default(),
                             body: MockExecutionBody::default(),
                         },
+                        parent_hash: [0u8; 32],
                         last_round_tc,
                         fresh_proposal_certificate,
                     });
@@ -358,7 +359,7 @@ where
                             None => (monad_tfm::base_fee::PRE_TFM_BASE_FEE, None, None, None),
                         };
 
-                    let proposed_execution_inputs = pool
+                    let (proposed_execution_inputs, parent_hash) = pool
                         .create_proposal(
                             &mut event_tracker,
                             epoch,
@@ -397,6 +398,7 @@ where
                         base_fee_moment: base_fee_moment_field,
                         delayed_execution_results,
                         proposed_execution_inputs,
+                        parent_hash,
                         last_round_tc,
                         fresh_proposal_certificate,
                     });
