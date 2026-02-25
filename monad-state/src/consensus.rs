@@ -351,6 +351,7 @@ where
                 base_fee_moment,
                 delayed_execution_results,
                 proposed_execution_inputs,
+                parent_hash: _,
                 last_round_tc,
                 fresh_proposal_certificate,
             } => {

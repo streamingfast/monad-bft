@@ -46,8 +46,8 @@ use monad_crypto::certificate_signature::{
 };
 use monad_state_backend::StateBackend;
 use monad_types::{
-    deserialize_pubkey, serialize_pubkey, Epoch, ExecutionProtocol, NodeId, Round, RouterTarget,
-    SeqNum, Stake, UdpPriority,
+    deserialize_pubkey, serialize_pubkey, Epoch, ExecutionProtocol, IpcEncodable, NodeId, Round,
+    RouterTarget, SeqNum, Stake, UdpPriority,
 };
 use monad_validator::signature_collection::SignatureCollection;
 use serde::{Deserialize, Serialize};
@@ -1107,6 +1107,7 @@ where
         base_fee_moment: Option<u64>,
         delayed_execution_results: Vec<EPT::FinalizedHeader>,
         proposed_execution_inputs: ProposedExecutionInputs<EPT>,
+        parent_hash: [u8; 32],
         last_round_tc: Option<TimeoutCertificate<ST, SCT, EPT>>,
         fresh_proposal_certificate: Option<FreshProposalCertificate<SCT>>,
     },
@@ -1122,11 +1123,42 @@ where
     ForwardTxs(#[serde_as(as = "Vec<serde_with::hex::Hex>")] Vec<Bytes>),
 }
 
+struct IpcProposedExecutionInputs<'a, EPT: ExecutionProtocol> {
+    inputs: &'a ProposedExecutionInputs<EPT>,
+    parent_hash: [u8; 32],
+}
+
+impl<EPT: ExecutionProtocol> Encodable for IpcProposedExecutionInputs<'_, EPT>
+where
+    EPT::ProposedHeader: IpcEncodable,
+{
+    fn length(&self) -> usize {
+        let mut header_buf = BytesMut::new();
+        self.inputs.header.encode_ipc(self.parent_hash, &mut header_buf);
+        let mut body_buf = BytesMut::new();
+        self.inputs.body.encode(&mut body_buf);
+        let payload_len = header_buf.len() + body_buf.len();
+        payload_len + alloy_rlp::length_of_length(payload_len)
+    }
+
+    fn encode(&self, out: &mut dyn BufMut) {
+        let mut header_buf = BytesMut::new();
+        self.inputs.header.encode_ipc(self.parent_hash, &mut header_buf);
+        let mut body_buf = BytesMut::new();
+        self.inputs.body.encode(&mut body_buf);
+        let payload_len = header_buf.len() + body_buf.len();
+        alloy_rlp::Header { list: true, payload_length: payload_len }.encode(out);
+        out.put_slice(&header_buf);
+        out.put_slice(&body_buf);
+    }
+}
+
 impl<ST, SCT, EPT> Encodable for MempoolEvent<ST, SCT, EPT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
+    EPT::ProposedHeader: IpcEncodable,
 {
     fn encode(&self, out: &mut dyn BufMut) {
         match self {
@@ -1142,6 +1174,7 @@ where
                 base_fee_moment,
                 delayed_execution_results,
                 proposed_execution_inputs,
+                parent_hash,
                 last_round_tc,
                 fresh_proposal_certificate,
             } => {
@@ -1190,6 +1223,10 @@ where
                     }
                 };
 
+                let ipc_inputs = IpcProposedExecutionInputs {
+                    inputs: proposed_execution_inputs,
+                    parent_hash: *parent_hash,
+                };
                 let enc: [&dyn Encodable; 14] = [
                     &1u8,
                     epoch,
@@ -1202,7 +1239,7 @@ where
                     &base_fee_trend_buf,
                     &base_fee_moment_buf,
                     delayed_execution_results,
-                    proposed_execution_inputs,
+                    &ipc_inputs,
                     &tc_buf,
                     &fc_buf,
                 ];
@@ -1302,6 +1339,7 @@ where
                     base_fee_moment,
                     delayed_execution_results,
                     proposed_execution_inputs,
+                    parent_hash: [0u8; 32],
                     last_round_tc: tc,
                     fresh_proposal_certificate: fc,
                 })
@@ -1342,6 +1380,7 @@ where
                 base_fee_moment,
                 delayed_execution_results,
                 proposed_execution_inputs,
+                parent_hash: _,
                 last_round_tc,
                 fresh_proposal_certificate,
             } => f

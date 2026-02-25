@@ -498,8 +498,11 @@ where
                 .filter(|(peer, _)| peer != &self_node_id)
                 .collect_vec();
             debug!("blocksync: pick_peer among {} validator", members.len());
-            assert!(!members.is_empty(), "no nodes to blocksync from");
-            Some(Self::choose_weighted(members, rng))
+            if members.is_empty() {
+                None
+            } else {
+                Some(Self::choose_weighted(members, rng))
+            }
         }
     }
 

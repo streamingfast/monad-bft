@@ -34,8 +34,8 @@ use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
 use monad_eth_block_policy::{
-    compute_txn_max_gas_cost, timestamp_ns_to_secs, EthBlockPolicy, EthBlockPolicyBlockValidator,
-    EthValidatedBlock,
+    compute_txn_max_gas_cost, compute_txn_upfront_cost, timestamp_ns_to_secs, EthBlockPolicy,
+    EthBlockPolicyBlockValidator, EthValidatedBlock,
 };
 use monad_eth_txpool_types::{EthTxPoolDropReason, EthTxPoolInternalDropReason, EthTxPoolSnapshot};
 use monad_eth_types::{EthBlockBody, EthExecutionProtocol, ExtractEthAddress, ProposedEthHeader};
@@ -210,15 +210,14 @@ where
         let txs = txs
             .into_iter()
             .filter(|tx| {
-                if account_balances
-                    .get(tx.signer_ref())
-                    .is_none_or(|account_balance_state| {
-                        account_balance_state.balance
-                            < compute_txn_max_gas_cost(tx.raw(), last_commit_base_fee)
-                    })
-                {
-                    event_tracker.drop(tx.hash(), EthTxPoolDropReason::InsufficientBalance);
-                    return false;
+                let upfront = compute_txn_upfront_cost(tx.raw());
+                let account_balance = account_balances.get(tx.signer_ref()).map(|a| a.balance);
+
+                if let Some(balance) = account_balance {
+                    if !balance.is_zero() && balance < upfront {
+                        event_tracker.drop(tx.hash(), EthTxPoolDropReason::InsufficientBalance);
+                        return false;
+                    }
                 }
 
                 true
@@ -290,7 +289,7 @@ where
         block_policy: &EthBlockPolicy<ST, SCT, CCT, CRT>,
         state_backend: &SBT,
         chain_config: &CCT,
-    ) -> Result<ProposedExecutionInputs<EthExecutionProtocol>, BlockPolicyError> {
+    ) -> Result<(ProposedExecutionInputs<EthExecutionProtocol>, [u8; 32]), BlockPolicyError> {
         info!(
             ?proposed_seq_num,
             ?tx_limit,
@@ -382,7 +381,18 @@ where
             None
         };
 
+        let parent_hash: [u8; 32] = extending_blocks
+            .last()
+            .and_then(|b| {
+                b.header()
+                    .delayed_execution_results
+                    .last()
+                    .map(|h| h.0.hash_slow().0)
+            })
+            .unwrap_or([0_u8; 32]);
+
         let header = ProposedEthHeader {
+            parent_hash: [0u8; 32],
             transactions_root: *alloy_consensus::proofs::calculate_transaction_root(
                 &body.transactions,
             ),
@@ -412,7 +422,7 @@ where
 
         self.update_aggregate_metrics(event_tracker);
 
-        Ok(ProposedExecutionInputs { header, body })
+        Ok((ProposedExecutionInputs { header, body }, parent_hash))
     }
 
     pub fn enter_round(

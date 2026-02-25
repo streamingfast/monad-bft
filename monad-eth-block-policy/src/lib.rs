@@ -95,6 +95,14 @@ pub fn compute_txn_max_gas_cost(txn: &TxEnvelope, base_fee: u64) -> U256 {
     gas_limit.checked_mul(gas_bid).expect("no overflow")
 }
 
+// Compute transaction upfront cost for balance validation
+pub fn compute_txn_upfront_cost(txn: &TxEnvelope) -> U256 {
+    let gas_limit = U256::from(txn.gas_limit());
+    let max_fee_per_gas = U256::from(txn.max_fee_per_gas());
+    let max_gas_cost = gas_limit.checked_mul(max_fee_per_gas).expect("no overflow");
+    txn.value().checked_add(max_gas_cost).expect("no overflow")
+}
+
 struct BlockLookupIndex {
     block_id: BlockId,
     seq_num: SeqNum,

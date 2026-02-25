@@ -1,0 +1,107 @@
+name: Build and Push monad-node and monad-rpc Images
+
+on:
+  push:
+    branches:
+      - master
+      - feature/add-sys-calls
+      - feature/add-sys-calls-v0.12.7
+
+env:
+  REGISTRY: ghcr.io
+  ORG_NAME: streamingfast
+
+jobs:
+  build-node:
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+          df -h
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Get short commit hash
+        run: echo "GIT_SHORT_HASH=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Build and push monad-node image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/devnet/Dockerfile
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.ORG_NAME }}/monad-node:${{ env.GIT_SHORT_HASH }}
+          target: runner
+          build-args: |
+            GIT_TAG_VERSION=${{ env.GIT_SHORT_HASH }}
+          cache-from: type=gha,scope=monad-node
+          cache-to: type=gha,scope=monad-node,mode=max
+
+  build-rpc:
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+          df -h
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Get short commit hash
+        run: echo "GIT_SHORT_HASH=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Build and push monad-rpc image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/rpc/Dockerfile
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.ORG_NAME }}/monad-rpc:${{ env.GIT_SHORT_HASH }}
+          target: runner
+          build-args: |
+            GIT_TAG_VERSION=${{ env.GIT_SHORT_HASH }}
+          cache-from: type=gha,scope=monad-rpc
+          cache-to: type=gha,scope=monad-rpc,mode=max

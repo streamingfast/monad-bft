@@ -732,6 +732,10 @@ where
     }
 }
 
+pub trait IpcEncodable {
+    fn encode_ipc(&self, parent_hash: [u8; 32], out: &mut dyn alloy_rlp::BufMut);
+}
+
 pub trait ExecutionProtocol:
     Debug + Clone + PartialEq + Eq + Send + Sync + Unpin + Encodable + Decodable + Serialize + 'static
 {
@@ -748,7 +752,8 @@ pub trait ExecutionProtocol:
         + Serialize
         + for<'de> Deserialize<'de>
         // TODO delete Default once null blocks are gone
-        + Default;
+        + Default
+        + IpcEncodable;
     type Body: Debug
         + Clone
         + PartialEq

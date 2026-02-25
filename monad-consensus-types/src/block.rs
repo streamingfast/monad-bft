@@ -29,8 +29,8 @@ use monad_crypto::{
 };
 use monad_state_backend::{InMemoryState, StateBackend, StateBackendError};
 use monad_types::{
-    Balance, BlockId, Epoch, ExecutionProtocol, FinalizedHeader, NodeId, Round, SeqNum,
-    GENESIS_SEQ_NUM,
+    Balance, BlockId, Epoch, ExecutionProtocol, FinalizedHeader, IpcEncodable, NodeId, Round,
+    SeqNum, GENESIS_SEQ_NUM,
 };
 use monad_validator::signature_collection::SignatureCollection;
 use serde::{Deserialize, Serialize};
@@ -641,6 +641,12 @@ impl ExecutionProtocol for MockExecutionProtocol {
     Debug, Clone, PartialEq, Eq, RlpEncodable, RlpDecodable, Serialize, Deserialize, Default,
 )]
 pub struct MockExecutionProposedHeader {}
+
+impl IpcEncodable for MockExecutionProposedHeader {
+    fn encode_ipc(&self, _parent_hash: [u8; 32], out: &mut dyn alloy_rlp::BufMut) {
+        self.encode(out);
+    }
+}
 
 #[derive(
     Debug, Clone, PartialEq, Eq, RlpEncodable, RlpDecodable, Serialize, Deserialize, Default,
