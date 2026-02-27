@@ -18,7 +18,6 @@ use monad_event_ring::{
     EventDecoder, EventDescriptorInfo,
 };
 
-use alloy_primitives::hex;
 use self::bytes::{ref_from_bytes, ref_from_bytes_with_trailing};
 
 macro_rules! tracer_log {
@@ -327,7 +326,7 @@ impl EventDecoder for ExecEventDecoder {
                 ExecEventRef::BlockPerfEvmExit
             }
             ffi::MONAD_EXEC_BLOCK_END => {
-                let e = ref_from_bytes(bytes).expect("BlockEnd event valid");
+                let e: &monad_exec_block_end = ref_from_bytes(bytes).expect("BlockEnd event valid");
                 tracer_log!(
                     "event[seqno={}] block_end gas_used={}",
                     info.seqno,
@@ -412,7 +411,7 @@ impl EventDecoder for ExecEventDecoder {
                     .flow_info
                     .txn_idx
                     .expect("TxnAuthListEntry event has txn_idx in flow_info");
-                let txn_auth_list_entry = ref_from_bytes(bytes).expect("TxnAuthListEntry event valid");
+                let txn_auth_list_entry: &monad_exec_txn_auth_list_entry = ref_from_bytes(bytes).expect("TxnAuthListEntry event valid");
                 tracer_log!(
                     "event[seqno={}] txn_auth_list_entry txn={} idx={} valid={}",
                     info.seqno,
@@ -515,7 +514,7 @@ impl EventDecoder for ExecEventDecoder {
                 ExecEventRef::TxnEnd
             }
             ffi::MONAD_EXEC_ACCOUNT_ACCESS_LIST_HEADER => {
-                let e = ref_from_bytes(bytes).expect("AccountAccessListHeader event valid");
+                let e: &monad_exec_account_access_list_header = ref_from_bytes(bytes).expect("AccountAccessListHeader event valid");
                 tracer_log!(
                     "event[seqno={}] account_access_list_header txn={} count={} ctx={}",
                     info.seqno,
@@ -526,7 +525,7 @@ impl EventDecoder for ExecEventDecoder {
                 ExecEventRef::AccountAccessListHeader(e)
             }
             ffi::MONAD_EXEC_ACCOUNT_ACCESS => {
-                let e = ref_from_bytes(bytes).expect("AccountAccess event valid");
+                let e: &monad_exec_account_access = ref_from_bytes(bytes).expect("AccountAccess event valid");
                 tracer_log!(
                     "event[seqno={}] account_access txn={} idx={} addr={} balance_mod={} nonce_mod={} ctx={} prebal={} modbal={}",
                     info.seqno,
@@ -542,7 +541,7 @@ impl EventDecoder for ExecEventDecoder {
                 ExecEventRef::AccountAccess(e)
             }
             ffi::MONAD_EXEC_STORAGE_ACCESS => {
-                let e = ref_from_bytes(bytes).expect("StorageAccess event valid");
+                let e: &monad_exec_storage_access = ref_from_bytes(bytes).expect("StorageAccess event valid");
                 tracer_log!(
                     "event[seqno={}] storage_access txn={} acct_idx={} addr={} modified={} transient={} slot_idx={}",
                     info.seqno,

@@ -11,6 +11,7 @@ alloy-consensus = { workspace = true, optional = true }
 alloy-eips = { workspace = true, optional = true }
 alloy-primitives = { workspace = true, optional = true }
 alloy-rpc-types = { workspace = true, optional = true }
+hex = { workspace = true }
 itertools = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
