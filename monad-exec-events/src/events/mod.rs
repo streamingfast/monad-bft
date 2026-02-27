@@ -18,6 +18,7 @@ use monad_event_ring::{
     EventDecoder, EventDescriptorInfo,
 };
 
+use alloy_primitives::hex;
 use self::bytes::{ref_from_bytes, ref_from_bytes_with_trailing};
 
 macro_rules! tracer_log {
@@ -301,7 +302,7 @@ impl EventDecoder for ExecEventDecoder {
                 ExecEventRef::RecordError(ref_from_bytes(bytes).expect("RecordError event valid"))
             }
             ffi::MONAD_EXEC_BLOCK_START => {
-                let e = ref_from_bytes(bytes).expect("BlockStart event valid");
+                let e: &monad_exec_block_start = ref_from_bytes(bytes).expect("BlockStart event valid");
                 tracer_log!(
                     "event[seqno={}] block_start num={} round={} epoch={} txn_count={} timestamp={} gas_limit={}",
                     info.seqno,
@@ -489,13 +490,14 @@ impl EventDecoder for ExecEventDecoder {
                     .expect("TxnCallFrame event valid");
 
                 tracer_log!(
-                    "event[seqno={}] tx_call_frame txn={} idx={} depth={} opcode={:#04x} gas={} status={} caller={} target={} value={}",
+                    "event[seqno={}] tx_call_frame txn={} idx={} depth={} opcode={:#04x} gas={} gas_used={} status={} caller={} target={} value={}",
                     info.seqno,
                     txn_str(info.flow_info.txn_idx),
                     txn_call_frame.index,
                     txn_call_frame.depth,
                     txn_call_frame.opcode,
                     txn_call_frame.gas,
+                    txn_call_frame.gas_used,
                     txn_call_frame.evmc_status,
                     hex::encode(txn_call_frame.caller.bytes),
                     hex::encode(txn_call_frame.call_target.bytes),
