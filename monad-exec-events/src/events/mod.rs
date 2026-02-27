@@ -19,6 +19,19 @@ use monad_event_ring::{
 };
 
 use self::bytes::{ref_from_bytes, ref_from_bytes_with_trailing};
+
+macro_rules! tracer_log {
+    ($fmt:literal $(, $arg:expr)*) => {
+        if std::env::var_os("MONAD_TRACER_LOG").is_some_and(|v| v == "1") {
+            eprintln!(concat!("[tracer] ", $fmt) $(, $arg)*);
+        }
+    };
+}
+
+fn txn_str(txn_idx: Option<usize>) -> String {
+    txn_idx.map_or_else(|| "block".to_string(), |i| i.to_string())
+}
+
 use crate::ffi::{
     self, g_monad_exec_event_schema_hash, monad_exec_account_access,
     monad_exec_account_access_list_header, monad_exec_block_end, monad_exec_block_finalized,
@@ -288,7 +301,18 @@ impl EventDecoder for ExecEventDecoder {
                 ExecEventRef::RecordError(ref_from_bytes(bytes).expect("RecordError event valid"))
             }
             ffi::MONAD_EXEC_BLOCK_START => {
-                ExecEventRef::BlockStart(ref_from_bytes(bytes).expect("BlockStart event valid"))
+                let e = ref_from_bytes(bytes).expect("BlockStart event valid");
+                tracer_log!(
+                    "event[seqno={}] block_start num={} round={} epoch={} txn_count={} timestamp={} gas_limit={}",
+                    info.seqno,
+                    e.block_tag.block_number,
+                    e.round,
+                    e.epoch,
+                    e.eth_block_input.txn_count,
+                    e.eth_block_input.timestamp,
+                    e.eth_block_input.gas_limit
+                );
+                ExecEventRef::BlockStart(e)
             }
             ffi::MONAD_EXEC_BLOCK_REJECT => {
                 ExecEventRef::BlockReject(ref_from_bytes(bytes).expect("BlockReject event valid"))
@@ -302,7 +326,13 @@ impl EventDecoder for ExecEventDecoder {
                 ExecEventRef::BlockPerfEvmExit
             }
             ffi::MONAD_EXEC_BLOCK_END => {
-                ExecEventRef::BlockEnd(ref_from_bytes(bytes).expect("BlockEnd event valid"))
+                let e = ref_from_bytes(bytes).expect("BlockEnd event valid");
+                tracer_log!(
+                    "event[seqno={}] block_end gas_used={}",
+                    info.seqno,
+                    e.exec_output.gas_used
+                );
+                ExecEventRef::BlockEnd(e)
             }
             ffi::MONAD_EXEC_BLOCK_QC => {
                 ExecEventRef::BlockQC(ref_from_bytes(bytes).expect("BlockQC event valid"))
@@ -331,15 +361,22 @@ impl EventDecoder for ExecEventDecoder {
                     )
                     .expect("TxnHeaderStart event valid");
 
-                ExecEventRef::TxnHeaderStart {
-                    txn_index: info
-                        .flow_info
-                        .txn_idx
-                        .expect("TxnHeaderStart event has txn_idx in flow_info"),
-                    txn_header_start,
-                    data_bytes,
-                    blob_bytes,
-                }
+                let txn_index = info
+                    .flow_info
+                    .txn_idx
+                    .expect("TxnHeaderStart event has txn_idx in flow_info");
+                tracer_log!(
+                    "event[seqno={}] txn_header_start txn={} from={} to={} value={} gas={} gasprice={} nonce={}",
+                    info.seqno,
+                    txn_index,
+                    hex::encode(txn_header_start.sender.bytes),
+                    if txn_header_start.txn_header.is_contract_creation { "contract_create".to_string() } else { hex::encode(txn_header_start.txn_header.to.bytes) },
+                    txn_header_start.txn_header.value.limbs[0],
+                    txn_header_start.txn_header.gas_limit,
+                    txn_header_start.txn_header.max_fee_per_gas.limbs[0],
+                    txn_header_start.txn_header.nonce
+                );
+                ExecEventRef::TxnHeaderStart { txn_index, txn_header_start, data_bytes, blob_bytes }
             }
             ffi::MONAD_EXEC_TXN_ACCESS_LIST_ENTRY => {
                 let (txn_access_list_entry, [storage_key_bytes]) =
@@ -356,24 +393,37 @@ impl EventDecoder for ExecEventDecoder {
                     )
                     .expect("TxnAccessListEntry event valid");
 
-                ExecEventRef::TxnAccessListEntry {
-                    txn_index: info
-                        .flow_info
-                        .txn_idx
-                        .expect("TxnAccessListEntry event has txn_idx in flow_info"),
-                    txn_access_list_entry,
-                    storage_key_bytes,
-                }
-            }
-            ffi::MONAD_EXEC_TXN_AUTH_LIST_ENTRY => ExecEventRef::TxnAuthListEntry {
-                txn_index: info
+                let txn_index = info
                     .flow_info
                     .txn_idx
-                    .expect("TxnAuthListEntry event has txn_idx in flow_info"),
-                txn_auth_list_entry: ref_from_bytes(bytes).expect("TxnAuthListEntry event valid"),
-            },
+                    .expect("TxnAccessListEntry event has txn_idx in flow_info");
+                tracer_log!(
+                    "event[seqno={}] txn_access_list_entry txn={} idx={} keys={}",
+                    info.seqno,
+                    txn_index,
+                    txn_access_list_entry.index,
+                    txn_access_list_entry.entry.storage_key_count
+                );
+                ExecEventRef::TxnAccessListEntry { txn_index, txn_access_list_entry, storage_key_bytes }
+            }
+            ffi::MONAD_EXEC_TXN_AUTH_LIST_ENTRY => {
+                let txn_index = info
+                    .flow_info
+                    .txn_idx
+                    .expect("TxnAuthListEntry event has txn_idx in flow_info");
+                let txn_auth_list_entry = ref_from_bytes(bytes).expect("TxnAuthListEntry event valid");
+                tracer_log!(
+                    "event[seqno={}] txn_auth_list_entry txn={} idx={} valid={}",
+                    info.seqno,
+                    txn_index,
+                    txn_auth_list_entry.index,
+                    txn_auth_list_entry.is_valid_authority as u8
+                );
+                ExecEventRef::TxnAuthListEntry { txn_index, txn_auth_list_entry }
+            }
             ffi::MONAD_EXEC_TXN_HEADER_END => {
                 assert_eq!(bytes.len(), 0, "TxnHeaderEnd payload is empty");
+                tracer_log!("txn_header_end");
                 ExecEventRef::TxnHeaderEnd
             }
             ffi::MONAD_EXEC_TXN_REJECT => ExecEventRef::TxnReject {
@@ -410,15 +460,20 @@ impl EventDecoder for ExecEventDecoder {
                     })
                     .expect("TxnLog event valid");
 
-                ExecEventRef::TxnLog {
-                    txn_index: info
-                        .flow_info
-                        .txn_idx
-                        .expect("TxnLog event has txn_idx in flow_info"),
-                    txn_log,
-                    topic_bytes,
-                    data_bytes,
-                }
+                let txn_index = info
+                    .flow_info
+                    .txn_idx
+                    .expect("TxnLog event has txn_idx in flow_info");
+                tracer_log!(
+                    "event[seqno={}] txn_log txn={} idx={} addr={} topics={} data_len={}",
+                    info.seqno,
+                    txn_index,
+                    txn_log.index,
+                    hex::encode(txn_log.address.bytes),
+                    txn_log.topic_count,
+                    txn_log.data_length
+                );
+                ExecEventRef::TxnLog { txn_index, txn_log, topic_bytes, data_bytes }
             }
             ffi::MONAD_EXEC_TXN_CALL_FRAME => {
                 let (txn_call_frame, [input_bytes, return_bytes]) =
@@ -433,6 +488,19 @@ impl EventDecoder for ExecEventDecoder {
                     )
                     .expect("TxnCallFrame event valid");
 
+                tracer_log!(
+                    "event[seqno={}] tx_call_frame txn={} idx={} depth={} opcode={:#04x} gas={} status={} caller={} target={} value={}",
+                    info.seqno,
+                    txn_str(info.flow_info.txn_idx),
+                    txn_call_frame.index,
+                    txn_call_frame.depth,
+                    txn_call_frame.opcode,
+                    txn_call_frame.gas,
+                    txn_call_frame.evmc_status,
+                    hex::encode(txn_call_frame.caller.bytes),
+                    hex::encode(txn_call_frame.call_target.bytes),
+                    txn_call_frame.value.limbs[0]
+                );
                 ExecEventRef::TxnCallFrame {
                     txn_index: info.flow_info.txn_idx,
                     txn_call_frame,
@@ -444,15 +512,47 @@ impl EventDecoder for ExecEventDecoder {
                 assert_eq!(bytes.len(), 0, "TxnEnd payload is empty");
                 ExecEventRef::TxnEnd
             }
-            ffi::MONAD_EXEC_ACCOUNT_ACCESS_LIST_HEADER => ExecEventRef::AccountAccessListHeader(
-                ref_from_bytes(bytes).expect("AccountAccessListHeader event valid"),
-            ),
-            ffi::MONAD_EXEC_ACCOUNT_ACCESS => ExecEventRef::AccountAccess(
-                ref_from_bytes(bytes).expect("AccountAccess event valid"),
-            ),
-            ffi::MONAD_EXEC_STORAGE_ACCESS => ExecEventRef::StorageAccess(
-                ref_from_bytes(bytes).expect("StorageAccess event valid"),
-            ),
+            ffi::MONAD_EXEC_ACCOUNT_ACCESS_LIST_HEADER => {
+                let e = ref_from_bytes(bytes).expect("AccountAccessListHeader event valid");
+                tracer_log!(
+                    "event[seqno={}] account_access_list_header txn={} count={} ctx={}",
+                    info.seqno,
+                    txn_str(info.flow_info.txn_idx),
+                    e.entry_count,
+                    e.access_context as u32
+                );
+                ExecEventRef::AccountAccessListHeader(e)
+            }
+            ffi::MONAD_EXEC_ACCOUNT_ACCESS => {
+                let e = ref_from_bytes(bytes).expect("AccountAccess event valid");
+                tracer_log!(
+                    "event[seqno={}] account_access txn={} idx={} addr={} balance_mod={} nonce_mod={} ctx={} prebal={} modbal={}",
+                    info.seqno,
+                    txn_str(info.flow_info.txn_idx),
+                    e.index,
+                    hex::encode(e.address.bytes),
+                    e.is_balance_modified as u8,
+                    e.is_nonce_modified as u8,
+                    e.access_context as u32,
+                    e.prestate.balance.limbs[0],
+                    e.modified_balance.limbs[0]
+                );
+                ExecEventRef::AccountAccess(e)
+            }
+            ffi::MONAD_EXEC_STORAGE_ACCESS => {
+                let e = ref_from_bytes(bytes).expect("StorageAccess event valid");
+                tracer_log!(
+                    "event[seqno={}] storage_access txn={} acct_idx={} addr={} modified={} transient={} slot_idx={}",
+                    info.seqno,
+                    txn_str(info.flow_info.txn_idx),
+                    info.flow_info.account_idx,
+                    hex::encode(e.address.bytes),
+                    e.modified as u8,
+                    e.transient as u8,
+                    e.index
+                );
+                ExecEventRef::StorageAccess(e)
+            }
             ffi::MONAD_EXEC_EVM_ERROR => {
                 ExecEventRef::EvmError(ref_from_bytes(bytes).expect("EvmError event valid"))
             }
