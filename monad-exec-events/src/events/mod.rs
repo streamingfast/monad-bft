@@ -315,14 +315,18 @@ impl EventDecoder for ExecEventDecoder {
                 ExecEventRef::BlockStart(e)
             }
             ffi::MONAD_EXEC_BLOCK_REJECT => {
-                ExecEventRef::BlockReject(ref_from_bytes(bytes).expect("BlockReject event valid"))
+                let e: &monad_exec_block_reject = ref_from_bytes(bytes).expect("BlockReject event valid");
+                tracer_log!("event[seqno={}] block_reject code={}", info.seqno, *e);
+                ExecEventRef::BlockReject(e)
             }
             ffi::MONAD_EXEC_BLOCK_PERF_EVM_ENTER => {
                 assert_eq!(bytes.len(), 0, "BlockPerfEvmEnter payload is empty");
+                tracer_log!("event[seqno={}] block_perf_evm_enter", info.seqno);
                 ExecEventRef::BlockPerfEvmEnter
             }
             ffi::MONAD_EXEC_BLOCK_PERF_EVM_EXIT => {
                 assert_eq!(bytes.len(), 0, "BlockPerfEvmExit payload is empty");
+                tracer_log!("event[seqno={}] block_perf_evm_exit", info.seqno);
                 ExecEventRef::BlockPerfEvmExit
             }
             ffi::MONAD_EXEC_BLOCK_END => {
@@ -335,14 +339,20 @@ impl EventDecoder for ExecEventDecoder {
                 ExecEventRef::BlockEnd(e)
             }
             ffi::MONAD_EXEC_BLOCK_QC => {
-                ExecEventRef::BlockQC(ref_from_bytes(bytes).expect("BlockQC event valid"))
+                let e: &monad_exec_block_qc = ref_from_bytes(bytes).expect("BlockQC event valid");
+                tracer_log!("event[seqno={}] block_qc num={} round={} epoch={}", info.seqno, e.block_tag.block_number, e.round, e.epoch);
+                ExecEventRef::BlockQC(e)
             }
-            ffi::MONAD_EXEC_BLOCK_FINALIZED => ExecEventRef::BlockFinalized(
-                ref_from_bytes(bytes).expect("BlockFinalized event valid"),
-            ),
-            ffi::MONAD_EXEC_BLOCK_VERIFIED => ExecEventRef::BlockVerified(
-                ref_from_bytes(bytes).expect("BlockVerified event valid"),
-            ),
+            ffi::MONAD_EXEC_BLOCK_FINALIZED => {
+                let e: &monad_exec_block_finalized = ref_from_bytes(bytes).expect("BlockFinalized event valid");
+                tracer_log!("event[seqno={}] block_finalized num={}", info.seqno, e.block_number);
+                ExecEventRef::BlockFinalized(e)
+            }
+            ffi::MONAD_EXEC_BLOCK_VERIFIED => {
+                let e: &monad_exec_block_verified = ref_from_bytes(bytes).expect("BlockVerified event valid");
+                tracer_log!("event[seqno={}] block_verified num={}", info.seqno, e.block_number);
+                ExecEventRef::BlockVerified(e)
+            }
             ffi::MONAD_EXEC_TXN_HEADER_START => {
                 let (txn_header_start, [data_bytes, blob_bytes]) =
                     ref_from_bytes_with_trailing::<monad_exec_txn_header_start, 2>(
@@ -423,31 +433,38 @@ impl EventDecoder for ExecEventDecoder {
             }
             ffi::MONAD_EXEC_TXN_HEADER_END => {
                 assert_eq!(bytes.len(), 0, "TxnHeaderEnd payload is empty");
-                tracer_log!("txn_header_end");
+                tracer_log!("event[seqno={}] txn_header_end txn={}", info.seqno, txn_str(info.flow_info.txn_idx));
                 ExecEventRef::TxnHeaderEnd
             }
-            ffi::MONAD_EXEC_TXN_REJECT => ExecEventRef::TxnReject {
-                txn_index: info
-                    .flow_info
-                    .txn_idx
-                    .expect("TxnReject event has txn_idx in flow_info"),
-                reject: ref_from_bytes(bytes).expect("TxnReject event valid"),
-            },
+            ffi::MONAD_EXEC_TXN_REJECT => {
+                let txn_index = info.flow_info.txn_idx.expect("TxnReject event has txn_idx in flow_info");
+                let reject: &monad_exec_txn_reject = ref_from_bytes(bytes).expect("TxnReject event valid");
+                tracer_log!("event[seqno={}] txn_reject txn={} code={}", info.seqno, txn_index, *reject);
+                ExecEventRef::TxnReject { txn_index, reject }
+            }
             ffi::MONAD_EXEC_TXN_PERF_EVM_ENTER => {
                 assert_eq!(bytes.len(), 0, "TxnPerfEvmEnter payload is empty");
+                tracer_log!("event[seqno={}] txn_perf_evm_enter txn={}", info.seqno, txn_str(info.flow_info.txn_idx));
                 ExecEventRef::TxnPerfEvmEnter
             }
             ffi::MONAD_EXEC_TXN_PERF_EVM_EXIT => {
                 assert_eq!(bytes.len(), 0, "TxnPerfEvmExit payload is empty");
+                tracer_log!("event[seqno={}] txn_perf_evm_exit txn={}", info.seqno, txn_str(info.flow_info.txn_idx));
                 ExecEventRef::TxnPerfEvmExit
             }
-            ffi::MONAD_EXEC_TXN_EVM_OUTPUT => ExecEventRef::TxnEvmOutput {
-                txn_index: info
-                    .flow_info
-                    .txn_idx
-                    .expect("TxnEvmOutput event has txn_idx in flow_info"),
-                output: ref_from_bytes(bytes).expect("TxnEvmOutput event valid"),
-            },
+            ffi::MONAD_EXEC_TXN_EVM_OUTPUT => {
+                let txn_index = info.flow_info.txn_idx.expect("TxnEvmOutput event has txn_idx in flow_info");
+                let output: &monad_exec_txn_evm_output = ref_from_bytes(bytes).expect("TxnEvmOutput event valid");
+                tracer_log!(
+                    "event[seqno={}] txn_evm_output txn={} gas_used={} status={} call_frame_count={}",
+                    info.seqno,
+                    txn_index,
+                    output.receipt.gas_used,
+                    output.receipt.status as u8,
+                    output.call_frame_count
+                );
+                ExecEventRef::TxnEvmOutput { txn_index, output }
+            }
             ffi::MONAD_EXEC_TXN_LOG => {
                 let (txn_log, [topic_bytes, data_bytes]) =
                     ref_from_bytes_with_trailing::<monad_exec_txn_log, 2>(bytes, |txn_log| {
@@ -511,6 +528,7 @@ impl EventDecoder for ExecEventDecoder {
             }
             ffi::MONAD_EXEC_TXN_END => {
                 assert_eq!(bytes.len(), 0, "TxnEnd payload is empty");
+                tracer_log!("event[seqno={}] txn_end txn={}", info.seqno, txn_str(info.flow_info.txn_idx));
                 ExecEventRef::TxnEnd
             }
             ffi::MONAD_EXEC_ACCOUNT_ACCESS_LIST_HEADER => {
@@ -555,7 +573,9 @@ impl EventDecoder for ExecEventDecoder {
                 ExecEventRef::StorageAccess(e)
             }
             ffi::MONAD_EXEC_EVM_ERROR => {
-                ExecEventRef::EvmError(ref_from_bytes(bytes).expect("EvmError event valid"))
+                let e: &monad_exec_evm_error = ref_from_bytes(bytes).expect("EvmError event valid");
+                tracer_log!("event[seqno={}] evm_error domain={} status={}", info.seqno, e.domain_id, e.status_code);
+                ExecEventRef::EvmError(e)
             }
             event_type => panic!("ExecEventDecoder encountered unknown event_type {event_type}"),
         }
