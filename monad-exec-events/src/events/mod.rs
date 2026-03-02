@@ -303,14 +303,15 @@ impl EventDecoder for ExecEventDecoder {
             ffi::MONAD_EXEC_BLOCK_START => {
                 let e: &monad_exec_block_start = ref_from_bytes(bytes).expect("BlockStart event valid");
                 tracer_log!(
-                    "event[seqno={}] block_start num={} round={} epoch={} txn_count={} timestamp={} gas_limit={}",
+                    "event[seqno={}] block_start num={} round={} epoch={} txn_count={} timestamp={} gas_limit={} base_fee={}",
                     info.seqno,
                     e.block_tag.block_number,
                     e.round,
                     e.epoch,
                     e.eth_block_input.txn_count,
                     e.eth_block_input.timestamp,
-                    e.eth_block_input.gas_limit
+                    e.eth_block_input.gas_limit,
+                    e.eth_block_input.base_fee_per_gas.limbs[0]
                 );
                 ExecEventRef::BlockStart(e)
             }
@@ -332,9 +333,11 @@ impl EventDecoder for ExecEventDecoder {
             ffi::MONAD_EXEC_BLOCK_END => {
                 let e: &monad_exec_block_end = ref_from_bytes(bytes).expect("BlockEnd event valid");
                 tracer_log!(
-                    "event[seqno={}] block_end gas_used={}",
+                    "event[seqno={}] block_end gas_used={} state_root={} receipts_root={}",
                     info.seqno,
-                    e.exec_output.gas_used
+                    e.exec_output.gas_used,
+                    hex::encode(e.exec_output.state_root.bytes),
+                    hex::encode(e.exec_output.receipts_root.bytes)
                 );
                 ExecEventRef::BlockEnd(e)
             }
@@ -376,7 +379,7 @@ impl EventDecoder for ExecEventDecoder {
                     .txn_idx
                     .expect("TxnHeaderStart event has txn_idx in flow_info");
                 tracer_log!(
-                    "event[seqno={}] txn_header_start txn={} from={} to={} value={} gas={} gasprice={} nonce={}",
+                    "event[seqno={}] txn_header_start txn={} from={} to={} value={} gas={} max_fee={} priority_fee={} chain_id={} txn_type={:?} nonce={} contract_creation={} access_list_count={} auth_list_count={}",
                     info.seqno,
                     txn_index,
                     hex::encode(txn_header_start.sender.bytes),
@@ -384,7 +387,13 @@ impl EventDecoder for ExecEventDecoder {
                     txn_header_start.txn_header.value.limbs[0],
                     txn_header_start.txn_header.gas_limit,
                     txn_header_start.txn_header.max_fee_per_gas.limbs[0],
-                    txn_header_start.txn_header.nonce
+                    txn_header_start.txn_header.max_priority_fee_per_gas.limbs[0],
+                    txn_header_start.txn_header.chain_id.limbs[0],
+                    txn_header_start.txn_header.txn_type,
+                    txn_header_start.txn_header.nonce,
+                    txn_header_start.txn_header.is_contract_creation,
+                    txn_header_start.txn_header.access_list_count,
+                    txn_header_start.txn_header.auth_list_count
                 );
                 ExecEventRef::TxnHeaderStart { txn_index, txn_header_start, data_bytes, blob_bytes }
             }
@@ -506,7 +515,7 @@ impl EventDecoder for ExecEventDecoder {
                     .expect("TxnCallFrame event valid");
 
                 tracer_log!(
-                    "event[seqno={}] tx_call_frame txn={} idx={} depth={} opcode={:#04x} gas={} gas_used={} status={} caller={} target={} value={}",
+                    "event[seqno={}] tx_call_frame txn={} idx={} depth={} opcode={:#04x} gas={} gas_used={} status={} caller={} target={} value={} input_len={} return_len={}",
                     info.seqno,
                     txn_str(info.flow_info.txn_idx),
                     txn_call_frame.index,
@@ -517,7 +526,9 @@ impl EventDecoder for ExecEventDecoder {
                     txn_call_frame.evmc_status,
                     hex::encode(txn_call_frame.caller.bytes),
                     hex::encode(txn_call_frame.call_target.bytes),
-                    txn_call_frame.value.limbs[0]
+                    txn_call_frame.value.limbs[0],
+                    txn_call_frame.input_length,
+                    txn_call_frame.return_length
                 );
                 ExecEventRef::TxnCallFrame {
                     txn_index: info.flow_info.txn_idx,
@@ -545,7 +556,7 @@ impl EventDecoder for ExecEventDecoder {
             ffi::MONAD_EXEC_ACCOUNT_ACCESS => {
                 let e: &monad_exec_account_access = ref_from_bytes(bytes).expect("AccountAccess event valid");
                 tracer_log!(
-                    "event[seqno={}] account_access txn={} idx={} addr={} balance_mod={} nonce_mod={} ctx={} prebal={} modbal={}",
+                    "event[seqno={}] account_access txn={} idx={} addr={} balance_mod={} nonce_mod={} ctx={} pre_nonce={} pre_bal={} pre_codehash={} mod_bal={} mod_nonce={} storage_count={} transient_count={}",
                     info.seqno,
                     txn_str(info.flow_info.txn_idx),
                     e.index,
@@ -553,22 +564,30 @@ impl EventDecoder for ExecEventDecoder {
                     e.is_balance_modified as u8,
                     e.is_nonce_modified as u8,
                     e.access_context as u32,
+                    e.prestate.nonce,
                     e.prestate.balance.limbs[0],
-                    e.modified_balance.limbs[0]
+                    hex::encode(e.prestate.code_hash.bytes),
+                    e.modified_balance.limbs[0],
+                    e.modified_nonce,
+                    e.storage_key_count,
+                    e.transient_count
                 );
                 ExecEventRef::AccountAccess(e)
             }
             ffi::MONAD_EXEC_STORAGE_ACCESS => {
                 let e: &monad_exec_storage_access = ref_from_bytes(bytes).expect("StorageAccess event valid");
                 tracer_log!(
-                    "event[seqno={}] storage_access txn={} acct_idx={} addr={} modified={} transient={} slot_idx={}",
+                    "event[seqno={}] storage_access txn={} acct_idx={} addr={} modified={} transient={} slot_idx={} key={} start_val={} end_val={}",
                     info.seqno,
                     txn_str(info.flow_info.txn_idx),
                     info.flow_info.account_idx,
                     hex::encode(e.address.bytes),
                     e.modified as u8,
                     e.transient as u8,
-                    e.index
+                    e.index,
+                    hex::encode(e.key.bytes),
+                    hex::encode(e.start_value.bytes),
+                    hex::encode(e.end_value.bytes)
                 );
                 ExecEventRef::StorageAccess(e)
             }
