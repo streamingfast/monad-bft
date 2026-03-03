@@ -20,9 +20,15 @@ use monad_event_ring::{
 
 use self::bytes::{ref_from_bytes, ref_from_bytes_with_trailing};
 
+static MONAD_TRACER_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn monad_tracer_log_enabled() -> bool {
+    *MONAD_TRACER_LOG.get_or_init(|| std::env::var_os("MONAD_TRACER_LOG").is_some())
+}
+
 macro_rules! tracer_log {
     ($fmt:literal $(, $arg:expr)*) => {
-        if std::env::var_os("MONAD_TRACER_LOG").is_some_and(|v| v == "1") {
+        if monad_tracer_log_enabled() {
             eprintln!(concat!("[tracer] ", $fmt) $(, $arg)*);
         }
     };
