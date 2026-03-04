@@ -561,7 +561,6 @@ impl EventDecoder for ExecEventDecoder {
             }
             ffi::MONAD_EXEC_ACCOUNT_ACCESS => {
                 let e: &monad_exec_account_access = ref_from_bytes(bytes).expect("AccountAccess event valid");
-                // Encode u256 limbs (little-endian limb order, native-endian per limb) as big-endian hex
                 let pre_bal_hex = {
                     let mut b = [0u8; 32];
                     for (i, limb) in e.prestate.balance.limbs.iter().enumerate() {
