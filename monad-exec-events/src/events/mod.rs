@@ -561,6 +561,21 @@ impl EventDecoder for ExecEventDecoder {
             }
             ffi::MONAD_EXEC_ACCOUNT_ACCESS => {
                 let e: &monad_exec_account_access = ref_from_bytes(bytes).expect("AccountAccess event valid");
+                // Encode u256 limbs (little-endian limb order, native-endian per limb) as big-endian hex
+                let pre_bal_hex = {
+                    let mut b = [0u8; 32];
+                    for (i, limb) in e.prestate.balance.limbs.iter().enumerate() {
+                        b[24 - i * 8..32 - i * 8].copy_from_slice(&limb.to_be_bytes());
+                    }
+                    hex::encode(b)
+                };
+                let mod_bal_hex = {
+                    let mut b = [0u8; 32];
+                    for (i, limb) in e.modified_balance.limbs.iter().enumerate() {
+                        b[24 - i * 8..32 - i * 8].copy_from_slice(&limb.to_be_bytes());
+                    }
+                    hex::encode(b)
+                };
                 tracer_log!(
                     "event[seqno={}] account_access txn={} idx={} addr={} balance_mod={} nonce_mod={} ctx={} pre_nonce={} pre_bal={} pre_codehash={} mod_bal={} mod_nonce={} storage_count={} transient_count={}",
                     info.seqno,
@@ -571,9 +586,9 @@ impl EventDecoder for ExecEventDecoder {
                     e.is_nonce_modified as u8,
                     e.access_context as u32,
                     e.prestate.nonce,
-                    e.prestate.balance.limbs[0],
+                    pre_bal_hex,
                     hex::encode(e.prestate.code_hash.bytes),
-                    e.modified_balance.limbs[0],
+                    mod_bal_hex,
                     e.modified_nonce,
                     e.storage_key_count,
                     e.transient_count
