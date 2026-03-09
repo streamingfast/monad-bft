@@ -38,6 +38,14 @@ fn txn_str(txn_idx: Option<usize>) -> String {
     txn_idx.map_or_else(|| "block".to_string(), |i| i.to_string())
 }
 
+fn u256_hex(limbs: &[u64; 4]) -> String {
+    let mut b = [0u8; 32];
+    for (i, limb) in limbs.iter().enumerate() {
+        b[24 - i * 8..32 - i * 8].copy_from_slice(&limb.to_be_bytes());
+    }
+    hex::encode(b)
+}
+
 use crate::ffi::{
     self, g_monad_exec_event_schema_hash, monad_exec_account_access,
     monad_exec_account_access_list_header, monad_exec_block_end, monad_exec_block_finalized,
@@ -390,7 +398,7 @@ impl EventDecoder for ExecEventDecoder {
                     txn_index,
                     hex::encode(txn_header_start.sender.bytes),
                     if txn_header_start.txn_header.is_contract_creation { "contract_create".to_string() } else { hex::encode(txn_header_start.txn_header.to.bytes) },
-                    txn_header_start.txn_header.value.limbs[0],
+                    u256_hex(&txn_header_start.txn_header.value.limbs),
                     txn_header_start.txn_header.gas_limit,
                     txn_header_start.txn_header.max_fee_per_gas.limbs[0],
                     txn_header_start.txn_header.max_priority_fee_per_gas.limbs[0],
@@ -497,13 +505,15 @@ impl EventDecoder for ExecEventDecoder {
                     .txn_idx
                     .expect("TxnLog event has txn_idx in flow_info");
                 tracer_log!(
-                    "event[seqno={}] txn_log txn={} idx={} addr={} topics={} data_len={}",
+                    "event[seqno={}] txn_log txn={} idx={} addr={} topics={} data_len={} data={} topic_bytes={}",
                     info.seqno,
                     txn_index,
                     txn_log.index,
                     hex::encode(txn_log.address.bytes),
                     txn_log.topic_count,
-                    txn_log.data_length
+                    txn_log.data_length,
+                    hex::encode(data_bytes),
+                    hex::encode(topic_bytes)
                 );
                 ExecEventRef::TxnLog { txn_index, txn_log, topic_bytes, data_bytes }
             }
@@ -520,8 +530,9 @@ impl EventDecoder for ExecEventDecoder {
                     )
                     .expect("TxnCallFrame event valid");
 
+                let call_value_hex = u256_hex(&txn_call_frame.value.limbs);
                 tracer_log!(
-                    "event[seqno={}] tx_call_frame txn={} idx={} depth={} opcode={:#04x} gas={} gas_used={} status={} caller={} target={} value={} input_len={} return_len={}",
+                    "event[seqno={}] tx_call_frame txn={} idx={} depth={} opcode={:#04x} gas={} gas_used={} status={} caller={} target={} value={} input_len={} return_len={} return_data={}",
                     info.seqno,
                     txn_str(info.flow_info.txn_idx),
                     txn_call_frame.index,
@@ -532,9 +543,10 @@ impl EventDecoder for ExecEventDecoder {
                     txn_call_frame.evmc_status,
                     hex::encode(txn_call_frame.caller.bytes),
                     hex::encode(txn_call_frame.call_target.bytes),
-                    txn_call_frame.value.limbs[0],
+                    call_value_hex,
                     txn_call_frame.input_length,
-                    txn_call_frame.return_length
+                    txn_call_frame.return_length,
+                    hex::encode(return_bytes)
                 );
                 ExecEventRef::TxnCallFrame {
                     txn_index: info.flow_info.txn_idx,
@@ -561,20 +573,8 @@ impl EventDecoder for ExecEventDecoder {
             }
             ffi::MONAD_EXEC_ACCOUNT_ACCESS => {
                 let e: &monad_exec_account_access = ref_from_bytes(bytes).expect("AccountAccess event valid");
-                let pre_bal_hex = {
-                    let mut b = [0u8; 32];
-                    for (i, limb) in e.prestate.balance.limbs.iter().enumerate() {
-                        b[24 - i * 8..32 - i * 8].copy_from_slice(&limb.to_be_bytes());
-                    }
-                    hex::encode(b)
-                };
-                let mod_bal_hex = {
-                    let mut b = [0u8; 32];
-                    for (i, limb) in e.modified_balance.limbs.iter().enumerate() {
-                        b[24 - i * 8..32 - i * 8].copy_from_slice(&limb.to_be_bytes());
-                    }
-                    hex::encode(b)
-                };
+                let pre_bal_hex = u256_hex(&e.prestate.balance.limbs);
+                let mod_bal_hex = u256_hex(&e.modified_balance.limbs);
                 tracer_log!(
                     "event[seqno={}] account_access txn={} idx={} addr={} balance_mod={} nonce_mod={} ctx={} pre_nonce={} pre_bal={} pre_codehash={} mod_bal={} mod_nonce={} storage_count={} transient_count={}",
                     info.seqno,
@@ -613,7 +613,7 @@ impl EventDecoder for ExecEventDecoder {
             }
             ffi::MONAD_EXEC_EVM_ERROR => {
                 let e: &monad_exec_evm_error = ref_from_bytes(bytes).expect("EvmError event valid");
-                tracer_log!("event[seqno={}] evm_error domain={} status={}", info.seqno, e.domain_id, e.status_code);
+                tracer_log!("event[seqno={}] evm_error domain={} status={} txn={} call_frame_idx={}", info.seqno, e.domain_id, e.status_code, txn_str(info.flow_info.txn_idx), info.flow_info.account_idx);
                 ExecEventRef::EvmError(e)
             }
             event_type => panic!("ExecEventDecoder encountered unknown event_type {event_type}"),
