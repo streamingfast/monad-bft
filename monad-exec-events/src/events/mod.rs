@@ -532,7 +532,7 @@ impl EventDecoder for ExecEventDecoder {
 
                 let call_value_hex = u256_hex(&txn_call_frame.value.limbs);
                 tracer_log!(
-                    "event[seqno={}] tx_call_frame txn={} idx={} depth={} opcode={:#04x} gas={} gas_used={} status={} caller={} target={} value={} input_len={} return_len={} return_data={}",
+                    "event[seqno={}] tx_call_frame txn={} idx={} depth={} opcode={:#04x} gas={} gas_used={} status={} caller={} target={} value={} input_len={} input={} return_len={} return_data={}",
                     info.seqno,
                     txn_str(info.flow_info.txn_idx),
                     txn_call_frame.index,
@@ -545,6 +545,7 @@ impl EventDecoder for ExecEventDecoder {
                     hex::encode(txn_call_frame.call_target.bytes),
                     call_value_hex,
                     txn_call_frame.input_length,
+                    hex::encode(input_bytes),
                     txn_call_frame.return_length,
                     hex::encode(return_bytes)
                 );
