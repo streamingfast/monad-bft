@@ -50,6 +50,7 @@ use crate::ffi::{
     self, g_monad_exec_event_schema_hash, monad_exec_account_access,
     monad_exec_account_access_list_header, monad_exec_block_end, monad_exec_block_finalized,
     monad_exec_block_qc, monad_exec_block_reject, monad_exec_block_start,
+    monad_exec_block_system_call_end, monad_exec_block_system_call_start,
     monad_exec_block_verified, monad_exec_evm_error, monad_exec_storage_access,
     monad_exec_txn_access_list_entry, monad_exec_txn_auth_list_entry, monad_exec_txn_call_frame,
     monad_exec_txn_evm_output, monad_exec_txn_header_start, monad_exec_txn_log,
@@ -123,6 +124,14 @@ pub enum ExecEvent {
     AccountAccess(monad_exec_account_access),
     StorageAccess(monad_exec_storage_access),
     EvmError(monad_exec_evm_error),
+    BlockSystemCallStart {
+        system_call_start: monad_exec_block_system_call_start,
+        input_bytes: Box<[u8]>,
+    },
+    BlockSystemCallEnd {
+        system_call_end: monad_exec_block_system_call_end,
+        return_bytes: Box<[u8]>,
+    },
 }
 
 /// Ref rust enum for monad execution events.
@@ -186,6 +195,14 @@ pub enum ExecEventRef<'ring> {
     AccountAccess(&'ring monad_exec_account_access),
     StorageAccess(&'ring monad_exec_storage_access),
     EvmError(&'ring monad_exec_evm_error),
+    BlockSystemCallStart {
+        system_call_start: &'ring monad_exec_block_system_call_start,
+        input_bytes: &'ring [u8],
+    },
+    BlockSystemCallEnd {
+        system_call_end: &'ring monad_exec_block_system_call_end,
+        return_bytes: &'ring [u8],
+    },
 }
 
 impl<'ring> ExecEventRef<'ring> {
@@ -268,6 +285,18 @@ impl<'ring> ExecEventRef<'ring> {
             Self::AccountAccess(account_access) => ExecEvent::AccountAccess(*account_access),
             Self::StorageAccess(storage_access) => ExecEvent::StorageAccess(*storage_access),
             Self::EvmError(evm_error) => ExecEvent::EvmError(*evm_error),
+            Self::BlockSystemCallStart { system_call_start, input_bytes } => {
+                ExecEvent::BlockSystemCallStart {
+                    system_call_start: *system_call_start,
+                    input_bytes: input_bytes.to_vec().into_boxed_slice(),
+                }
+            }
+            Self::BlockSystemCallEnd { system_call_end, return_bytes } => {
+                ExecEvent::BlockSystemCallEnd {
+                    system_call_end: *system_call_end,
+                    return_bytes: return_bytes.to_vec().into_boxed_slice(),
+                }
+            }
         }
     }
 }
@@ -616,6 +645,40 @@ impl EventDecoder for ExecEventDecoder {
                 let e: &monad_exec_evm_error = ref_from_bytes(bytes).expect("EvmError event valid");
                 tracer_log!("event[seqno={}] evm_error domain={} status={} txn={} call_frame_idx={}", info.seqno, e.domain_id, e.status_code, txn_str(info.flow_info.txn_idx), info.flow_info.account_idx);
                 ExecEventRef::EvmError(e)
+            }
+            ffi::MONAD_EXEC_BLOCK_SYSTEM_CALL_START => {
+                let (system_call_start, [input_bytes]) =
+                    ref_from_bytes_with_trailing::<monad_exec_block_system_call_start, 1>(
+                        bytes,
+                        |e| [e.input_length.try_into().unwrap()],
+                    )
+                    .expect("BlockSystemCallStart event valid");
+                tracer_log!(
+                    "event[seqno={}] block_system_call_start caller={} target={} opcode={:#04x} gas={} input_len={}",
+                    info.seqno,
+                    hex::encode(system_call_start.caller.bytes),
+                    hex::encode(system_call_start.call_target.bytes),
+                    system_call_start.opcode,
+                    system_call_start.gas,
+                    system_call_start.input_length
+                );
+                ExecEventRef::BlockSystemCallStart { system_call_start, input_bytes }
+            }
+            ffi::MONAD_EXEC_BLOCK_SYSTEM_CALL_END => {
+                let (system_call_end, [return_bytes]) =
+                    ref_from_bytes_with_trailing::<monad_exec_block_system_call_end, 1>(
+                        bytes,
+                        |e| [e.return_length.try_into().unwrap()],
+                    )
+                    .expect("BlockSystemCallEnd event valid");
+                tracer_log!(
+                    "event[seqno={}] block_system_call_end gas_used={} status={} return_len={}",
+                    info.seqno,
+                    system_call_end.gas_used,
+                    system_call_end.evmc_status,
+                    system_call_end.return_length
+                );
+                ExecEventRef::BlockSystemCallEnd { system_call_end, return_bytes }
             }
             event_type => panic!("ExecEventDecoder encountered unknown event_type {event_type}"),
         }

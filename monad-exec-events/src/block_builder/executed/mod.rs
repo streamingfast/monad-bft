@@ -487,6 +487,7 @@ impl ExecutedBlockBuilder {
 
                 unimplemented!("EvmError {monad_exec_evm_error:#?}");
             }
+            ExecEvent::BlockSystemCallStart { .. } | ExecEvent::BlockSystemCallEnd { .. } => None,
         }
     }
 }
