@@ -376,11 +376,12 @@ impl EventDecoder for ExecEventDecoder {
             ffi::MONAD_EXEC_BLOCK_END => {
                 let e: &monad_exec_block_end = ref_from_bytes(bytes).expect("BlockEnd event valid");
                 tracer_log!(
-                    "event[seqno={}] block_end gas_used={} state_root={} receipts_root={}",
+                    "event[seqno={}] block_end gas_used={} state_root={} receipts_root={} eth_block_hash={}",
                     info.seqno,
                     e.exec_output.gas_used,
                     hex::encode(e.exec_output.state_root.bytes),
-                    hex::encode(e.exec_output.receipts_root.bytes)
+                    hex::encode(e.exec_output.receipts_root.bytes),
+                    hex::encode(e.eth_block_hash.bytes)
                 );
                 ExecEventRef::BlockEnd(e)
             }
