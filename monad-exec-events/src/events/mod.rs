@@ -673,11 +673,12 @@ impl EventDecoder for ExecEventDecoder {
                     )
                     .expect("BlockSystemCallEnd event valid");
                 tracer_log!(
-                    "event[seqno={}] block_system_call_end gas_used={} status={} return_len={}",
+                    "event[seqno={}] block_system_call_end gas_used={} status={} return_len={} num_account_accesses={}",
                     info.seqno,
                     system_call_end.gas_used,
                     system_call_end.evmc_status,
-                    system_call_end.return_length
+                    system_call_end.return_length,
+                    system_call_end.num_account_accesses
                 );
                 ExecEventRef::BlockSystemCallEnd { system_call_end, return_bytes }
             }
