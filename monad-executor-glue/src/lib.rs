@@ -1252,40 +1252,10 @@ where
                     }
                 };
 
-<<<<<<< HEAD
-                let base_fee_buf: Vec<&dyn Encodable> = match base_fee {
-                    None => {
-                        vec![&1u8]
-                    }
-                    Some(bf) => {
-                        vec![&2u8, bf]
-                    }
-                };
-
-                let base_fee_trend_buf: Vec<&dyn Encodable> = match base_fee_trend {
-                    None => {
-                        vec![&1u8]
-                    }
-                    Some(bft) => {
-                        vec![&2u8, bft]
-                    }
-                };
-
-                let base_fee_moment_buf: Vec<&dyn Encodable> = match base_fee_moment {
-                    None => {
-                        vec![&1u8]
-                    }
-                    Some(bfm) => {
-                        vec![&2u8, bfm]
-                    }
-                };
-
                 let ipc_inputs = IpcProposedExecutionInputs {
                     inputs: proposed_execution_inputs,
                     parent_hash: *parent_hash,
                 };
-=======
->>>>>>> v0.14.0
                 let enc: [&dyn Encodable; 14] = [
                     &1u8,
                     epoch,
