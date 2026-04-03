@@ -5373,6 +5373,7 @@ dependencies = [
  "alloy-rpc-types",
  "bindgen",
  "cc",
+ "hex",
  "itertools 0.10.5",
  "monad-event-ring",
  "serde",
