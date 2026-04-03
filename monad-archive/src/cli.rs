@@ -19,8 +19,7 @@ use aws_config::{
     meta::region::RegionProviderChain, retry::RetryConfig, timeout::TimeoutConfig, BehaviorVersion,
     Region, SdkConfig,
 };
-use aws_sdk_s3::config::{Credentials, SharedCredentialsProvider};
-use eyre::{bail, OptionExt};
+use eyre::OptionExt;
 use serde::{
     de::{self, DeserializeOwned},
     Deserialize, Serialize,
@@ -30,6 +29,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use crate::{archive_reader::redact_mongo_url, kvstore::mongo::MongoDbStorage, prelude::*};
 
 const DEFAULT_BUCKET_TIMEOUT: u64 = 10;
+const DEFAULT_OPERATION_TIMEOUT: u64 = 40;
 const DEFAULT_CONCURRENCY: usize = 50;
 const DEFAULT_TRIEDB_NODE_LRU_MAX_MEM: u64 = 50 << 20;
 const DEFAULT_MAX_BUFFERED_READ_REQUESTS: usize = 5000;
@@ -73,6 +73,10 @@ fn default_triedb_max_voted_block_cache_len() -> usize {
 
 pub fn get_default_bucket_timeout() -> u64 {
     DEFAULT_BUCKET_TIMEOUT
+}
+
+fn get_default_operation_timeout() -> u64 {
+    DEFAULT_OPERATION_TIMEOUT
 }
 
 pub fn set_source_and_sink_metrics(
@@ -156,12 +160,12 @@ pub async fn get_aws_config(region: Option<String>, timeout_secs: u64) -> SdkCon
         .region(region_provider)
         .timeout_config(
             TimeoutConfig::builder()
-                .operation_timeout(Duration::from_secs(timeout_secs))
+                .operation_timeout(Duration::from_secs(4 * timeout_secs))
                 .operation_attempt_timeout(Duration::from_secs(timeout_secs))
                 .read_timeout(Duration::from_secs(timeout_secs))
                 .build(),
         )
-        .retry_config(RetryConfig::adaptive())
+        .retry_config(RetryConfig::standard().with_max_attempts(3))
         .load()
         .await
 }
@@ -244,7 +248,7 @@ impl BlockDataReaderArgs {
         Ok(match self {
             Triedb(args) => TriedbReader::new(args).into(),
             Aws(args) => {
-                let config = args.config().await;
+                let config = args.config().await?;
                 let bucket = Bucket::new(args.bucket.clone(), &config, metrics.clone());
                 BlockDataArchive::new(bucket).into()
             }
@@ -274,7 +278,7 @@ impl ArchiveArgs {
     pub async fn build_block_data_archive(&self, metrics: &Metrics) -> Result<BlockDataArchive> {
         let store: KVStoreErased = match self {
             ArchiveArgs::Aws(args) => {
-                let config = args.config().await;
+                let config = args.config().await?;
                 Bucket::new(args.bucket.clone(), &config, metrics.clone()).into()
             }
             ArchiveArgs::MongoDb(args) => {
@@ -296,7 +300,7 @@ impl ArchiveArgs {
     ) -> Result<TxIndexArchiver> {
         let (blob, index): (KVStoreErased, KVStoreErased) = match self {
             ArchiveArgs::Aws(args) => {
-                let config = args.config().await;
+                let config = args.config().await?;
                 let bucket = Bucket::new(args.bucket.clone(), &config, metrics.clone());
                 let index = DynamoDBArchive::new(
                     bucket.clone(),
@@ -330,7 +334,7 @@ impl ArchiveArgs {
     pub async fn build_archive_reader(&self, metrics: &Metrics) -> Result<ArchiveReader> {
         let (blob, index): (KVStoreErased, KVStoreErased) = match self {
             ArchiveArgs::Aws(args) => {
-                let config = args.config().await;
+                let config = args.config().await?;
                 let bucket = Bucket::new(args.bucket.clone(), &config, metrics.clone());
                 let index = DynamoDBArchive::new(
                     bucket.clone(),
@@ -492,15 +496,21 @@ fn deserialize_variant<E: de::Error, T: DeserializeOwned>(
 #[derive(Clone, Serialize, Deserialize, Default, Eq, PartialEq, Hash)]
 pub struct AwsCliArgs {
     pub bucket: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_access_key: Option<String>,
     // TODO: remove me, concurrency should be handled elsewhere
     #[serde(default = "default_aws_concurrency")]
     pub concurrency: usize,
     // If these are not provided, uses timeout_secs for all
-    #[serde(default = "get_default_bucket_timeout")]
+    #[serde(default = "get_default_operation_timeout")]
     pub operation_timeout_secs: u64,
     #[serde(default = "get_default_bucket_timeout")]
     pub operation_attempt_timeout_secs: u64,
@@ -514,6 +524,7 @@ impl std::fmt::Debug for AwsCliArgs {
             .field("bucket", &self.bucket)
             .field("region", &self.region)
             .field("endpoint", &self.endpoint)
+            .field("profile", &self.profile)
             .field(
                 "access_key_id",
                 &self.access_key_id.as_ref().map(|_| "[REDACTED]"),
@@ -546,7 +557,7 @@ impl AwsCliArgs {
         let timeout_secs = get_u64(&kv, "timeout-secs", DEFAULT_BUCKET_TIMEOUT);
         info!("Using timeout_secs: {}", timeout_secs);
 
-        Ok(Self {
+        let args = Self {
             // prefer positional, fallback to kv
             bucket: positional
                 .first_mut()
@@ -555,6 +566,7 @@ impl AwsCliArgs {
                 .ok_or_eyre("storage args missing bucket")?,
             region: kv.remove("region"),
             endpoint: kv.remove("endpoint"),
+            profile: kv.remove("profile"),
             access_key_id: kv.remove("access-key-id"),
             secret_access_key: kv.remove("secret-access-key"),
             concurrency: kv
@@ -563,54 +575,26 @@ impl AwsCliArgs {
                 // TODO: remove me, concurrency should be handled elsewhere
                 .unwrap_or(DEFAULT_CONCURRENCY),
             // If these are not provided, uses timeout_secs for all
-            operation_timeout_secs: get_u64(&kv, "operation-timeout-secs", timeout_secs),
+            operation_timeout_secs: get_u64(&kv, "operation-timeout-secs", 4 * timeout_secs),
             operation_attempt_timeout_secs: get_u64(
                 &kv,
                 "operation-attempt-timeout-secs",
                 timeout_secs,
             ),
             read_timeout_secs: get_u64(&kv, "read-timeout-secs", timeout_secs),
-        })
-    }
+        };
 
-    pub(crate) async fn config(&self) -> SdkConfig {
-        let region = self
-            .region
-            .clone()
-            .unwrap_or_else(|| "us-east-2".to_string());
-
-        info!("Bucket {} running in region: {}", self.bucket, region);
-
-        let mut config = aws_config::defaults(BehaviorVersion::latest())
-            .region(Region::new(region))
-            .timeout_config(
-                TimeoutConfig::builder()
-                    .operation_timeout(Duration::from_secs(self.operation_timeout_secs))
-                    .operation_attempt_timeout(Duration::from_secs(
-                        self.operation_attempt_timeout_secs,
-                    ))
-                    .read_timeout(Duration::from_secs(self.read_timeout_secs))
-                    .build(),
-            )
-            .retry_config(RetryConfig::adaptive());
-
-        if let Some(endpoint) = &self.endpoint {
-            config = config.endpoint_url(endpoint);
+        if matches!(
+            (&args.access_key_id, &args.secret_access_key),
+            (Some(_), None) | (None, Some(_))
+        ) {
+            return Err(eyre::eyre!(
+                "aws config for bucket '{}' must set both --access-key-id and --secret-access-key",
+                args.bucket
+            ));
         }
 
-        if let (Some(access_key_id), Some(secret_access_key)) =
-            (&self.access_key_id, &self.secret_access_key)
-        {
-            config = config.credentials_provider(SharedCredentialsProvider::new(Credentials::new(
-                access_key_id, // fmt
-                secret_access_key,
-                None,
-                None,
-                "minio",
-            )));
-        }
-
-        config.load().await
+        Ok(args)
     }
 }
 
@@ -785,7 +769,7 @@ fn parse_str_positional_and_kv(s: &str) -> Result<(Vec<String>, HashMap<String, 
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, str::FromStr};
+    use std::str::FromStr;
 
     use super::*;
 
@@ -832,6 +816,7 @@ mod tests {
                 assert_eq!(args.bucket, "my-bucket");
                 assert_eq!(args.concurrency, DEFAULT_CONCURRENCY); // default
                 assert_eq!(args.region, None);
+                assert_eq!(args.profile, None);
             }
             _ => panic!("expected Aws variant"),
         }
@@ -846,6 +831,16 @@ mod tests {
                 assert_eq!(args.bucket, "my-bucket");
                 assert_eq!(args.concurrency, 64);
                 assert_eq!(args.region.as_deref(), Some("us-west-2"));
+                assert_eq!(args.profile, None);
+            }
+            _ => panic!("expected Aws variant"),
+        }
+
+        let a = BlockDataReaderArgs::from_str("aws my-bucket --profile mainnet").unwrap();
+        match a {
+            BlockDataReaderArgs::Aws(args) => {
+                assert_eq!(args.bucket, "my-bucket");
+                assert_eq!(args.profile.as_deref(), Some("mainnet"));
             }
             _ => panic!("expected Aws variant"),
         }
@@ -859,6 +854,11 @@ mod tests {
             }
             _ => panic!("expected Aws variant"),
         }
+
+        let err = BlockDataReaderArgs::from_str("aws my-bucket --access-key-id only-id")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--secret-access-key"));
     }
 
     #[test]
@@ -1040,6 +1040,7 @@ mod tests {
             bucket: "my-bucket".to_string(),
             region: Some("us-east-1".to_string()),
             endpoint: Some("https://s3.amazonaws.com".to_string()),
+            profile: Some("mainnet".to_string()),
             access_key_id: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
             secret_access_key: Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
             concurrency: 10,
@@ -1069,6 +1070,7 @@ mod tests {
             bucket: "my-bucket".to_string(),
             region: None,
             endpoint: None,
+            profile: None,
             access_key_id: None,
             secret_access_key: None,
             concurrency: 10,
@@ -1090,6 +1092,7 @@ mod tests {
             bucket: "test".to_string(),
             region: None,
             endpoint: None,
+            profile: None,
             access_key_id: Some("SECRET_KEY_ID".to_string()),
             secret_access_key: Some("SECRET_ACCESS_KEY".to_string()),
             concurrency: default_aws_concurrency(),
@@ -1106,5 +1109,32 @@ mod tests {
         assert!(!debug_output.contains("SECRET_ACCESS_KEY"));
         assert!(!pretty_output.contains("SECRET_KEY_ID"));
         assert!(!pretty_output.contains("SECRET_ACCESS_KEY"));
+    }
+
+    #[test]
+    fn aws_archive_args_deserialize_with_missing_optional_fields() {
+        let json = r#"{
+            "Aws": {
+                "bucket": "archive-bucket",
+                "region": "us-east-1",
+                "concurrency": 10,
+                "operation_timeout_secs": 40,
+                "operation_attempt_timeout_secs": 10,
+                "read_timeout_secs": 10
+            }
+        }"#;
+
+        let args: ArchiveArgs = serde_json::from_str(json).unwrap();
+        match args {
+            ArchiveArgs::Aws(args) => {
+                assert_eq!(args.bucket, "archive-bucket");
+                assert_eq!(args.region.as_deref(), Some("us-east-1"));
+                assert_eq!(args.endpoint, None);
+                assert_eq!(args.profile, None);
+                assert_eq!(args.access_key_id, None);
+                assert_eq!(args.secret_access_key, None);
+            }
+            _ => panic!("expected Aws variant"),
+        }
     }
 }

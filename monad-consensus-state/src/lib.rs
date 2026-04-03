@@ -60,10 +60,15 @@ use monad_validator::{
 };
 use tracing::{debug, error, info, trace, warn};
 
-use crate::{command::ConsensusCommand, timestamp::BlockTimestamp};
+use crate::{
+    command::ConsensusCommand,
+    timestamp::BlockTimestamp,
+    vote_delay_metrics::{ns_to_ms, VoteDelayMetricsWindow, VoteDelayTimerStart},
+};
 
 pub mod command;
 pub mod timestamp;
+mod vote_delay_metrics;
 
 // TODO(andr-dev): Make configurable
 const NUM_LEADERS_FORWARD_TXS: usize = 3;
@@ -96,6 +101,11 @@ where
     pacemaker: Pacemaker<ST, SCT, EPT, CCT, CRT>,
 
     block_sync_requests: BTreeMap<BlockId, BlockSyncRequestStatus>,
+
+    /// Last canonical coherent tip emitted
+    canonical_proposed_tip: Option<BlockId>,
+    vote_delay_timer_start: Option<VoteDelayTimerStart>,
+    vote_delay_metrics: VoteDelayMetricsWindow,
 }
 
 impl<ST, SCT, EPT, BPT, SBT, CCT, CRT> PartialEq
@@ -273,7 +283,14 @@ where
                 None,
             ),
             block_sync_requests: Default::default(),
+            canonical_proposed_tip: None,
+            vote_delay_timer_start: None,
+            vote_delay_metrics: VoteDelayMetricsWindow::default(),
         }
+    }
+
+    pub fn refresh_vote_delay_metrics(&mut self, now_ns: u128, metrics: &mut Metrics) {
+        self.vote_delay_metrics.refresh(ns_to_ms(now_ns), metrics);
     }
 
     pub fn blocktree(&self) -> &BlockTree<ST, SCT, EPT, BPT, SBT, CCT, CRT> {
@@ -1122,6 +1139,29 @@ where
         self.send_vote_and_reset_timer(v)
     }
 
+    fn maybe_record_vote_delay_metrics(
+        &mut self,
+        proposal_round: Round,
+        parent_block_round: Round,
+    ) {
+        let Some(timer_start) = self.consensus.vote_delay_timer_start else {
+            return;
+        };
+
+        if timer_start.round != proposal_round || parent_block_round + Round(1) != proposal_round {
+            return;
+        }
+
+        let now_ms = ns_to_ms(self.block_timestamp.get_current_time());
+        self.consensus
+            .vote_delay_metrics
+            .record_ready_after_timer_start(
+                now_ms,
+                now_ms.saturating_sub(timer_start.started_at_ms),
+                self.metrics,
+            );
+    }
+
     #[must_use]
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn send_vote_and_reset_timer(
@@ -1170,14 +1210,20 @@ where
         debug!(?round, ?vote, ?current_leader, ?next_leader, "sending vote");
 
         // start the vote-timer for the next round
+        let next_round = round + Round(1);
+        let vote_pace = self
+            .config
+            .chain_config
+            .get_chain_revision(next_round)
+            .chain_params()
+            .vote_pace;
         cmds.push(ConsensusCommand::ScheduleVote {
-            duration: self
-                .config
-                .chain_config
-                .get_chain_revision(round + Round(1))
-                .chain_params()
-                .vote_pace,
-            round: round + Round(1),
+            duration: vote_pace,
+            round: next_round,
+        });
+        self.consensus.vote_delay_timer_start = Some(VoteDelayTimerStart {
+            round: next_round,
+            started_at_ms: ns_to_ms(self.block_timestamp.get_current_time()),
         });
         self.consensus.scheduled_vote = None;
 
@@ -1256,6 +1302,8 @@ where
                 }),
         );
 
+        cmds.extend(self.update_proposed_head());
+
         // retrieve missing blocks if processed QC is highest and points at an
         // unknown block
         cmds.extend(self.consensus.request_blocks_if_missing_ancestor());
@@ -1306,6 +1354,7 @@ where
                     )
                 }),
         );
+
         let round = self.consensus.pacemaker.get_current_round();
         let round_leader = self.lookup_leader(round);
         debug!(?round, ?round_leader, "leader for round");
@@ -1390,8 +1439,7 @@ where
             // when epoch boundary block is committed, this updates
             // epoch manager records
             self.metrics.consensus_events.commit_block += 1;
-            self.block_policy
-                .update_committed_block(block, &self.config.chain_config);
+            self.block_policy.update_committed_block(block);
             self.epoch_manager
                 .schedule_epoch_start(block.header().seq_num, block.get_block_round());
 
@@ -1449,6 +1497,7 @@ where
         updated_block_id: BlockId,
     ) -> Vec<ConsensusCommand<ST, SCT, EPT, BPT, SBT, CCT, CRT>> {
         let mut cmds = Vec::new();
+
         for newly_coherent_block in self.consensus.pending_block_tree.try_update_coherency(
             self.metrics,
             updated_block_id,
@@ -1461,13 +1510,15 @@ where
                 block_round =? newly_coherent_block.header().block_round,
                 "committing block proposed"
             );
-            // optimistically commit any block that has been added to the blocktree and is coherent
             cmds.push(ConsensusCommand::CommitBlocks(
-                OptimisticPolicyCommit::Proposed(newly_coherent_block.to_owned()),
+                OptimisticPolicyCommit::Proposed {
+                    block: newly_coherent_block.to_owned(),
+                    is_canonical: false,
+                },
             ));
-
-            // TODO update tip to highest round proposed block
         }
+
+        cmds.extend(self.update_proposed_head());
 
         let high_commit_qc = self.consensus.pending_block_tree.get_high_committable_qc();
         if let Some(qc) = high_commit_qc {
@@ -1475,6 +1526,41 @@ where
         }
 
         cmds
+    }
+
+    #[must_use]
+    fn update_proposed_head(
+        &mut self,
+    ) -> Option<ConsensusCommand<ST, SCT, EPT, BPT, SBT, CCT, CRT>> {
+        let high_cert_qc = self.consensus.pacemaker.high_certificate().qc();
+        let canonical_tip_id = self
+            .consensus
+            .pending_block_tree
+            .get_canonical_coherent_tip(high_cert_qc);
+
+        if self.consensus.canonical_proposed_tip == Some(canonical_tip_id) {
+            return None;
+        }
+
+        let block = self
+            .consensus
+            .pending_block_tree
+            .get_block(&canonical_tip_id)?;
+
+        self.consensus.canonical_proposed_tip = Some(canonical_tip_id);
+
+        debug!(
+            seq_num =? block.header().seq_num,
+            block_round =? block.header().block_round,
+            "updating proposed head"
+        );
+
+        Some(ConsensusCommand::CommitBlocks(
+            OptimisticPolicyCommit::Proposed {
+                block: block.to_owned(),
+                is_canonical: true,
+            },
+        ))
     }
 
     #[must_use]
@@ -1493,7 +1579,11 @@ where
         {
             Vec::new()
         } else {
-            panic!("high qc too far ahead of block tree root, restart client and statesync. highqc: {:?}, block-tree root {:?}", high_qc_seq_num, self.consensus.pending_block_tree.get_root_seq_num());
+            panic!(
+                "high qc too far ahead of block tree root, restart client and statesync. highqc: {:?}, block-tree root {:?}",
+                high_qc_seq_num,
+                self.consensus.pending_block_tree.get_root_seq_num()
+            );
         }
     }
 
@@ -1586,6 +1676,7 @@ where
         };
 
         debug!(?v, "vote successful");
+        self.maybe_record_vote_delay_metrics(proposal_round, parent_block_round);
 
         match self.consensus.scheduled_vote {
             Some(OutgoingVoteStatus::TimerFired) => {
@@ -1594,7 +1685,10 @@ where
                 cmds.extend(vote_cmd);
             }
             Some(OutgoingVoteStatus::VoteReady(r)) if r.round >= v.round => {
-                panic!("trying to schedule another vote in same round. scheduled vote {:?}, new vote {:?}", r, v);
+                panic!(
+                    "trying to schedule another vote in same round. scheduled vote {:?}, new vote {:?}",
+                    r, v
+                );
             }
             Some(OutgoingVoteStatus::VoteReady(_)) | None => {
                 if matches!(
@@ -1967,14 +2061,14 @@ mod test {
     use monad_eth_block_validator::EthBlockValidator;
     use monad_eth_types::{EthBlockBody, EthExecutionProtocol, EthHeader, ProposedEthHeader};
     use monad_multi_sig::MultiSig;
-    use monad_state_backend::{InMemoryState, InMemoryStateInner, StateBackend, StateBackendTest};
+    use monad_state_backend::{InMemoryState, InMemoryStateInner, MockExecution, StateBackend};
     use monad_testutil::{
         proposal::ProposalGen,
         signing::{create_certificate_keys, create_keys, get_key},
         validators::create_keys_w_validators,
     };
     use monad_types::{
-        Balance, BlockId, Epoch, ExecutionProtocol, NodeId, Round, RouterTarget, SeqNum, Stake,
+        BlockId, Epoch, ExecutionProtocol, NodeId, Round, RouterTarget, SeqNum, Stake,
         GENESIS_SEQ_NUM,
     };
     use monad_validator::{
@@ -2025,7 +2119,7 @@ mod test {
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         BPT: BlockPolicy<ST, SCT, EthExecutionProtocol, SBT, MockChainConfig, MockChainRevision>,
-        SBT: StateBackend<ST, SCT> + StateBackendTest<ST, SCT>,
+        SBT: StateBackend<ST, SCT> + MockExecution<ST, SCT>,
         BVT: BlockValidator<
             ST,
             SCT,
@@ -2072,7 +2166,7 @@ mod test {
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         BPT: BlockPolicy<ST, SCT, EthExecutionProtocol, SBT, MockChainConfig, MockChainRevision>,
-        SBT: StateBackend<ST, SCT> + StateBackendTest<ST, SCT>,
+        SBT: StateBackend<ST, SCT> + MockExecution<ST, SCT>,
         BVT: BlockValidator<
             ST,
             SCT,
@@ -2206,7 +2300,7 @@ mod test {
                 block.seq_num,
                 block.block_round,
                 block.get_parent_id(),
-                BTreeMap::default(),
+                Vec::default(),
             );
         }
     }
@@ -2356,7 +2450,7 @@ mod test {
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         BPT: BlockPolicy<ST, SCT, EthExecutionProtocol, SBT, MockChainConfig, MockChainRevision>,
-        SBT: StateBackend<ST, SCT> + StateBackendTest<ST, SCT>,
+        SBT: StateBackend<ST, SCT> + MockExecution<ST, SCT>,
         BVT: BlockValidator<ST, SCT, EthExecutionProtocol, BPT, SBT, MockChainConfig, MockChainRevision>,
         VTF: ValidatorSetTypeFactory<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Clone,
         LT: LeaderElection<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Clone,
@@ -2483,9 +2577,9 @@ mod test {
 
     fn generate_block_body(eth_tx_list: Vec<TxEnvelope>) -> EthBlockBody {
         EthBlockBody {
-            transactions: eth_tx_list,
-            ommers: Vec::new(),
-            withdrawals: Vec::new(),
+            transactions: eth_tx_list.into(),
+            ommers: Default::default(),
+            withdrawals: Default::default(),
         }
     }
 
@@ -2511,7 +2605,7 @@ mod test {
         cmds.into_iter()
             .filter_map(|c| match c {
                 ConsensusCommand::Publish {
-                    target: RouterTarget::PointToPoint(_),
+                    target: RouterTarget::PointToPoint(_) | RouterTarget::DirectPointToPoint(_),
                     message,
                 } => match message.deref().deref().message {
                     ProtocolMessage::Vote(vote) => Some(vote),
@@ -2704,7 +2798,7 @@ mod test {
     {
         cmds.iter().find(|c| match c {
             ConsensusCommand::Publish {
-                target: RouterTarget::PointToPoint(..),
+                target: RouterTarget::PointToPoint(..) | RouterTarget::DirectPointToPoint(..),
                 message,
             } => matches!(&message.deref().deref().message, ProtocolMessage::Vote(..)),
             _ => false,
@@ -2723,9 +2817,9 @@ mod test {
     {
         cmds.iter()
             .filter_map(|c| match c {
-                ConsensusCommand::CommitBlocks(OptimisticPolicyCommit::Proposed(block)) => {
-                    Some(block.get_block_round())
-                }
+                ConsensusCommand::CommitBlocks(OptimisticPolicyCommit::Proposed {
+                    block, ..
+                }) => Some(block.get_block_round()),
                 _ => None,
             })
             .collect()
@@ -2803,7 +2897,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -2880,7 +2974,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -2923,7 +3017,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -2983,7 +3077,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -3015,7 +3109,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -3077,7 +3171,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -3167,7 +3261,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -3197,8 +3291,10 @@ mod test {
             matches!(wrapped_state.consensus.scheduled_vote, Some(OutgoingVoteStatus::VoteReady(v)) if v.round == Round(2))
         );
 
+        // Round 1 emitted as canonical from process_qc's update_proposed_head,
+        // Round 2 emitted as non-canonical from loop and canonical from try_update_coherency's update_proposed_head
         let rounds = extract_proposal_commit_rounds(cmds);
-        assert_eq!(rounds, vec![Round(2)]);
+        assert_eq!(rounds, vec![Round(1), Round(2), Round(2)]);
 
         let mut missing_proposals = Vec::new();
         for _ in 0..5 {
@@ -3210,6 +3306,8 @@ mod test {
         let (author, _, verified_message) = p_fut.destructure();
         let cmds = wrapped_state.handle_proposal_message(author, verified_message);
         let rounds = extract_proposal_commit_rounds(cmds);
+        // No newly coherent blocks (parent missing due to gap) and canonical tip (block 2)
+        // hasn't changed, so update_proposed_head is a no-op
         assert_eq!(rounds, vec![]);
 
         // was in Round(2) and skipped over 5 proposals. Handling
@@ -3226,9 +3324,12 @@ mod test {
             cmds.extend(wrapped_state.handle_proposal_message(author, verified_message));
         }
         let rounds = extract_proposal_commit_rounds(cmds);
+        // Each newly coherent block emitted from loop (is_canonical=false), then update_proposed_head
+        // emits the canonical tip (is_canonical=true). Round 7 appears once because update_proposed_head
+        // sees block 8 as canonical tip at that point.
         assert_eq!(
             rounds,
-            vec![3, 4, 5, 6, 7, 8]
+            vec![3, 3, 4, 4, 5, 5, 6, 6, 7, 8, 8]
                 .into_iter()
                 .map(Round)
                 .collect::<Vec<_>>()
@@ -3255,7 +3356,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -3271,9 +3372,9 @@ mod test {
         let proposed_rounds: Vec<_> = cmds
             .iter()
             .filter_map(|c| match c {
-                ConsensusCommand::CommitBlocks(OptimisticPolicyCommit::Proposed(block)) => {
-                    Some(block.get_block_round())
-                }
+                ConsensusCommand::CommitBlocks(OptimisticPolicyCommit::Proposed {
+                    block, ..
+                }) => Some(block.get_block_round()),
                 _ => None,
             })
             .collect();
@@ -3300,17 +3401,21 @@ mod test {
         let block_2_round = verified_message.tip.block_header.block_round;
         let cmds = wrapped_state.handle_proposal_message(author, verified_message);
 
-        // Should have Proposed commit for block 2
+        // Round 1 canonical from process_qc's update_proposed_head,
+        // Round 2 non-canonical from loop + canonical from try_update_coherency's update_proposed_head
         let proposed_rounds: Vec<_> = cmds
             .iter()
             .filter_map(|c| match c {
-                ConsensusCommand::CommitBlocks(OptimisticPolicyCommit::Proposed(block)) => {
-                    Some(block.get_block_round())
-                }
+                ConsensusCommand::CommitBlocks(OptimisticPolicyCommit::Proposed {
+                    block, ..
+                }) => Some(block.get_block_round()),
                 _ => None,
             })
             .collect();
-        assert_eq!(proposed_rounds, vec![block_2_round]);
+        assert_eq!(
+            proposed_rounds,
+            vec![block_1_round, block_2_round, block_2_round]
+        );
 
         // Should have Voted commit for block 1 (QC observed via child proposal)
         let voted_rounds: Vec<_> = cmds
@@ -3346,7 +3451,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -3421,7 +3526,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -3626,7 +3731,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -3675,7 +3780,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -3761,7 +3866,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -3865,7 +3970,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -3936,7 +4041,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -3982,7 +4087,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -4101,7 +4206,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -4142,9 +4247,9 @@ mod test {
             p2.tip.block_header.seq_num,
             p2.tip.block_header.timestamp_ns,
             p2.tip.block_header.round_signature,
-            Some(BASE_FEE),
-            Some(BASE_FEE_TREND),
-            Some(BASE_FEE_MOMENT),
+            BASE_FEE,
+            BASE_FEE_TREND,
+            BASE_FEE_MOMENT,
         );
         let invalid_p2 = ProposalMessage {
             proposal_epoch: invalid_bh2.epoch,
@@ -4181,7 +4286,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -4248,7 +4353,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -4353,7 +4458,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -4449,7 +4554,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -4561,7 +4666,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -4716,7 +4821,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -4835,7 +4940,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -4880,7 +4985,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -4941,7 +5046,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -5048,7 +5153,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -5173,7 +5278,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -5332,7 +5437,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -5448,7 +5553,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -5549,7 +5654,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -5647,7 +5752,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );
@@ -5782,7 +5887,7 @@ mod test {
             ValidatorSetFactory::default(),
             SimpleRoundRobin::default(),
             || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
-            || InMemoryStateInner::genesis(Balance::MAX, execution_delay),
+            || InMemoryStateInner::genesis(execution_delay),
             EthBlockValidator::default,
             execution_delay,
         );

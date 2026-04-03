@@ -39,8 +39,8 @@ use self::{
         },
         call::{monad_admin_ethCallStatistics, monad_debug_traceCall, monad_eth_call},
         gas::{
-            monad_eth_estimateGas, monad_eth_feeHistory, monad_eth_gasPrice,
-            monad_eth_maxPriorityFeePerGas,
+            monad_eth_estimateGas, monad_eth_feeHistory, monad_eth_fillTransaction,
+            monad_eth_gasPrice, monad_eth_maxPriorityFeePerGas,
         },
         txn::{
             monad_eth_getLogs, monad_eth_getTransactionByBlockHashAndIndex,
@@ -51,9 +51,9 @@ use self::{
     },
     meta::{monad_net_version, monad_web3_client_version},
     resources::MonadRpcResources,
+    txpool::{monad_txpool_statusByAddress, monad_txpool_statusByHash},
 };
 use crate::{
-    eth_json_types::serialize_result,
     handlers::{
         debug::{
             MonadDebugTraceBlockByHashParams, MonadDebugTraceBlockByNumberParams,
@@ -61,12 +61,14 @@ use crate::{
         },
         eth::call::monad_createAccessList,
     },
-    jsonrpc::{
-        serialize_with_size_limit, JsonRpcError, JsonRpcResultExt, Request, RequestParams,
-        RequestWrapper, Response, ResponseWrapper,
+    middleware::TimingRequestId,
+    types::{
+        eth_json::serialize_result,
+        jsonrpc::{
+            serialize_with_size_limit, JsonRpcError, JsonRpcResultExt, Request, RequestId,
+            RequestParams, RequestWrapper, Response, ResponseWrapper,
+        },
     },
-    timing::RequestId,
-    vpool::{monad_txpool_statusByAddress, monad_txpool_statusByHash},
 };
 
 mod debug;
@@ -74,12 +76,13 @@ mod debug_replay;
 pub mod eth;
 mod meta;
 pub mod resources;
+mod txpool;
 
 pub async fn rpc_handler(
     root_span: RootSpan,
     body: bytes::Bytes,
     app_state: web::Data<MonadRpcResources>,
-    request_id: RequestId,
+    request_id: TimingRequestId,
 ) -> HttpResponse {
     let request = match RequestWrapper::from_body_bytes(&body) {
         Ok(req) => req,
@@ -99,8 +102,12 @@ pub async fn rpc_handler(
             let response = Response::from_result(request.id.clone(), result);
 
             if let Some(comparator) = &app_state.rpc_comparator {
-                let block_number = if let Some(triedb_env) = &app_state.triedb_reader {
-                    triedb_env.get_latest_voted_block_key().seq_num().0
+                let block_number = if let Some(chain_state) = &app_state.chain_state {
+                    chain_state
+                        .triedb_env
+                        .get_latest_proposed_block_key()
+                        .seq_num()
+                        .0
                 } else {
                     0
                 };
@@ -139,10 +146,7 @@ pub async fn rpc_handler(
 
                     async move {
                         let Ok(request) = Request::from_raw_value(json_request) else {
-                            return (
-                                crate::jsonrpc::RequestId::Null,
-                                Err(JsonRpcError::invalid_request()),
-                            );
+                            return (RequestId::Null, Err(JsonRpcError::invalid_request()));
                         };
                         let (state, id, method, params) =
                             (app_state, request.id, request.method, request.params);
@@ -185,34 +189,24 @@ pub async fn rpc_handler(
 
 #[allow(non_snake_case)]
 async fn admin_ethCallStatistics(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     _params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    if app_state.enable_eth_call_statistics {
-        let available_permits = app_state.rate_limiter.available_permits();
-        if let Some(tracker) = &app_state.eth_call_stats_tracker {
-            monad_admin_ethCallStatistics(
-                app_state.eth_call_executor_fibers,
-                app_state.total_permits,
-                available_permits,
-                tracker,
-            )
-            .await
-            .map(serialize_result)?
-        } else {
-            Err(JsonRpcError::internal_error(
-                "stats tracking not initialized".into(),
-            ))
-        }
-    } else {
-        Err(JsonRpcError::method_not_supported())
-    }
+    let eth_call_handler = app_state.eth_call_handler.as_ref().method_not_supported()?;
+    let tracker = eth_call_handler.stats_tracker().method_not_supported()?;
+    monad_admin_ethCallStatistics(
+        eth_call_handler.config(),
+        eth_call_handler.available_permits(),
+        tracker,
+    )
+    .await
+    .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn debug_getRawBlock(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -225,7 +219,7 @@ async fn debug_getRawBlock(
 
 #[allow(non_snake_case)]
 async fn debug_getRawHeader(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -238,7 +232,7 @@ async fn debug_getRawHeader(
 
 #[allow(non_snake_case)]
 async fn debug_getRawReceipts(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -251,7 +245,7 @@ async fn debug_getRawReceipts(
 
 #[allow(non_snake_case)]
 async fn debug_getRawTransaction(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -264,147 +258,123 @@ async fn debug_getRawTransaction(
 
 #[allow(non_snake_case)]
 async fn debug_traceBlockByHash(
-    request_id: RequestId,
+    request_id: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    let triedb_env = app_state.triedb_reader.as_ref().method_not_supported()?;
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
     let params: MonadDebugTraceBlockByHashParams =
         serde_json::from_str(params.get()).invalid_params()?;
     if params.requires_replay() {
-        return collect_debug_trace_via_replay(request_id, triedb_env, app_state, &params)
+        return collect_debug_trace_via_replay(request_id, chain_state, app_state, &params)
             .await
             .map(serialize_result)?;
     }
-    monad_debug_traceBlockByHash(triedb_env, &app_state.archive_reader, params)
+    monad_debug_traceBlockByHash(chain_state, params)
         .await
         .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn debug_traceBlockByNumber(
-    request_id: RequestId,
+    request_id: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    let triedb_env = app_state.triedb_reader.as_ref().method_not_supported()?;
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
     let params: MonadDebugTraceBlockByNumberParams =
         serde_json::from_str(params.get()).invalid_params()?;
     if params.requires_replay() {
-        return collect_debug_trace_via_replay(request_id, triedb_env, app_state, &params)
+        return collect_debug_trace_via_replay(request_id, chain_state, app_state, &params)
             .await
             .map(serialize_result)?;
     }
 
-    monad_debug_traceBlockByNumber(triedb_env, &app_state.archive_reader, params)
+    monad_debug_traceBlockByNumber(chain_state, params)
         .await
         .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn debug_traceCall(
-    _: RequestId,
+    request_id: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    let triedb_env = app_state.triedb_reader.as_ref().method_not_supported()?;
-    let Some(ref eth_call_executor) = app_state.eth_call_executor else {
-        return Err(JsonRpcError::method_not_supported());
-    };
-    // acquire the concurrent requests permit
-    let _permit = &app_state
-        .rate_limiter
-        .try_acquire()
-        .map_err(|_| JsonRpcError::internal_error("eth_call concurrent requests limit".into()))?;
-
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    let eth_call_handler = app_state.eth_call_handler.as_ref().method_not_supported()?;
     let params = serde_json::from_str(params.get()).invalid_params()?;
-    monad_debug_traceCall(
-        triedb_env,
-        eth_call_executor.clone(),
-        app_state.chain_id,
-        app_state.eth_call_provider_gas_limit,
-        params,
-    )
-    .await
-    .map(serialize_result)?
+    let permit = eth_call_handler.acquire(request_id).await?;
+
+    permit
+        .execute(|executor| {
+            monad_debug_traceCall(
+                chain_state,
+                executor,
+                app_state.chain_id,
+                app_state.eth_call_provider_gas_limit,
+                params,
+            )
+        })
+        .await
+        .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn debug_traceTransaction(
-    request_id: RequestId,
+    request_id: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    let triedb_env = app_state.triedb_reader.as_ref().method_not_supported()?;
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
     let params: MonadDebugTraceTransactionParams =
         serde_json::from_str(params.get()).invalid_params()?;
     if params.requires_replay() {
-        return collect_debug_trace_via_replay(request_id, triedb_env, app_state, &params)
+        return collect_debug_trace_via_replay(request_id, chain_state, app_state, &params)
             .await
             .map(serialize_result)?;
     }
 
-    monad_debug_traceTransaction(triedb_env, &app_state.archive_reader, params)
+    monad_debug_traceTransaction(chain_state, params)
         .await
         .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn eth_call(
-    request_id: RequestId,
+    request_id: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    let triedb_env = app_state.triedb_reader.as_ref().method_not_supported()?;
-    let Some(ref eth_call_executor) = app_state.eth_call_executor else {
-        return Err(JsonRpcError::method_not_supported());
-    };
-
-    // acquire the concurrent requests permit
-    let _permit = match app_state.rate_limiter.try_acquire() {
-        Ok(permit) => permit,
-        Err(_) => {
-            if let Some(tracker) = &app_state.eth_call_stats_tracker {
-                tracker.record_queue_rejection().await;
-            }
-            return Err(JsonRpcError::internal_error(
-                "eth_call concurrent requests limit".into(),
-            ));
-        }
-    };
-
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    let eth_call_handler = app_state.eth_call_handler.as_ref().method_not_supported()?;
     let params = serde_json::from_str(params.get()).invalid_params()?;
+    let permit = eth_call_handler.acquire(request_id).await?;
 
-    if let Some(tracker) = &app_state.eth_call_stats_tracker {
-        tracker.record_request_start(request_id).await;
-    }
-
-    let result = monad_eth_call(
-        triedb_env,
-        eth_call_executor.clone(),
-        app_state.chain_id,
-        app_state.eth_call_provider_gas_limit,
-        params,
-    )
-    .await;
-
-    if let Some(tracker) = &app_state.eth_call_stats_tracker {
-        let is_error = result.is_err();
-        tracker.record_request_complete(&request_id, is_error).await;
-    }
-
-    result.map(serialize_result)?
+    permit
+        .execute(|executor| {
+            monad_eth_call(
+                chain_state,
+                executor,
+                app_state.chain_id,
+                app_state.eth_call_provider_gas_limit,
+                params,
+            )
+        })
+        .await
+        .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn eth_sendRawTransaction(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    let Some(txpool_bridge_client) = &app_state.txpool_bridge_client else {
-        return Err(JsonRpcError::method_not_supported());
-    };
+    let txpool_bridge_client = app_state
+        .txpool_bridge_client
+        .as_ref()
+        .method_not_supported()?;
     let params = serde_json::from_str(params.get()).invalid_params()?;
     monad_eth_sendRawTransaction(
         txpool_bridge_client,
@@ -418,15 +388,15 @@ async fn eth_sendRawTransaction(
 
 #[allow(non_snake_case)]
 async fn eth_sendRawTransactionSync(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    let Some(txpool_bridge_client) = &app_state.txpool_bridge_client else {
-        return Err(JsonRpcError::method_not_supported());
-    };
-
     // Require both chain_state and txpool_bridge_client
+    let txpool_bridge_client = app_state
+        .txpool_bridge_client
+        .as_ref()
+        .method_not_supported()?;
     let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
     let params = serde_json::from_str(params.get()).invalid_params()?;
 
@@ -444,251 +414,234 @@ async fn eth_sendRawTransactionSync(
 }
 
 #[allow(non_snake_case)]
-async fn eth_createAccessList(
-    _: RequestId,
+async fn eth_fillTransaction(
+    request_id: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    let triedb_env = app_state.triedb_reader.as_ref().method_not_supported()?;
-    let Some(ref eth_call_executor) = app_state.eth_call_executor else {
-        return Err(JsonRpcError::method_not_supported());
-    };
-    // acquire the concurrent requests permit
-    let _permit = &app_state
-        .rate_limiter
-        .try_acquire()
-        .map_err(|_| JsonRpcError::internal_error("eth_call concurrent requests limit".into()))?;
-
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    let eth_call_handler = app_state.eth_call_handler.as_ref().method_not_supported()?;
     let params = serde_json::from_str(params.get()).invalid_params()?;
-    monad_createAccessList(
-        triedb_env,
-        eth_call_executor.clone(),
-        app_state.chain_id,
-        app_state.eth_call_provider_gas_limit,
+    let permit = eth_call_handler.acquire(request_id).await?;
+
+    permit
+        .execute(|executor| {
+            monad_eth_fillTransaction(
+                chain_state,
+                executor,
+                app_state.chain_id,
+                app_state.eth_estimate_gas_provider_gas_limit,
+                params,
+            )
+        })
+        .await
+        .map(serialize_result)?
+}
+
+#[allow(non_snake_case)]
+async fn eth_createAccessList(
+    request_id: TimingRequestId,
+    app_state: &MonadRpcResources,
+    params: RequestParams<'_>,
+) -> Result<Box<RawValue>, JsonRpcError> {
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    let eth_call_handler = app_state.eth_call_handler.as_ref().method_not_supported()?;
+    let params = serde_json::from_str(params.get()).invalid_params()?;
+    let permit = eth_call_handler.acquire(request_id).await?;
+
+    permit
+        .execute(|executor| {
+            monad_createAccessList(
+                chain_state,
+                executor,
+                app_state.chain_id,
+                app_state.eth_call_provider_gas_limit,
+                params,
+            )
+        })
+        .await
+        .map(serialize_result)?
+}
+
+#[allow(non_snake_case)]
+async fn eth_getLogs(
+    _: TimingRequestId,
+    app_state: &MonadRpcResources,
+    params: RequestParams<'_>,
+) -> Result<Box<RawValue>, JsonRpcError> {
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    let params = serde_json::from_str(params.get()).invalid_params()?;
+    monad_eth_getLogs(
+        chain_state,
+        app_state.max_response_size,
+        app_state.logs_max_block_range,
         params,
+        app_state.use_eth_get_logs_index,
+        app_state.dry_run_get_logs_index,
+        app_state.max_finalized_block_cache_len,
     )
     .await
     .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
-async fn eth_getLogs(
-    _: RequestId,
+async fn eth_getTransactionByHash(
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    if let Some(chain_state) = app_state.chain_state.as_ref() {
-        let params = serde_json::from_str(params.get()).invalid_params()?;
-        monad_eth_getLogs(
-            chain_state,
-            app_state.max_response_size,
-            app_state.logs_max_block_range,
-            params,
-            app_state.use_eth_get_logs_index,
-            app_state.dry_run_get_logs_index,
-            app_state.max_finalized_block_cache_len,
-        )
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    let params = serde_json::from_str(params.get()).invalid_params()?;
+    monad_eth_getTransactionByHash(chain_state, params)
         .await
         .map(serialize_result)?
-    } else {
-        Err(JsonRpcError::method_not_supported())
-    }
-}
-
-#[allow(non_snake_case)]
-async fn eth_getTransactionByHash(
-    _: RequestId,
-    app_state: &MonadRpcResources,
-    params: RequestParams<'_>,
-) -> Result<Box<RawValue>, JsonRpcError> {
-    if let Some(chain_state) = app_state.chain_state.as_ref() {
-        let params = serde_json::from_str(params.get()).invalid_params()?;
-        monad_eth_getTransactionByHash(chain_state, params)
-            .await
-            .map(serialize_result)?
-    } else {
-        Err(JsonRpcError::method_not_supported())
-    }
 }
 
 #[allow(non_snake_case)]
 async fn eth_getBlockByHash(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    if let Some(chain_state) = &app_state.chain_state {
-        let params = serde_json::from_str(params.get()).invalid_params()?;
-        monad_eth_getBlockByHash(chain_state, params)
-            .await
-            .map(serialize_result)?
-    } else {
-        Err(JsonRpcError::method_not_supported())
-    }
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    let params = serde_json::from_str(params.get()).invalid_params()?;
+    monad_eth_getBlockByHash(chain_state, params)
+        .await
+        .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn eth_getBlockByNumber(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    if let Some(chain_state) = &app_state.chain_state {
-        let params = serde_json::from_str(params.get()).invalid_params()?;
-        monad_eth_getBlockByNumber(chain_state, params)
-            .await
-            .map(serialize_result)?
-    } else {
-        Err(JsonRpcError::method_not_supported())
-    }
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    let params = serde_json::from_str(params.get()).invalid_params()?;
+    monad_eth_getBlockByNumber(chain_state, params)
+        .await
+        .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn eth_getTransactionByBlockHashAndIndex(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    if let Some(chain_state) = &app_state.chain_state {
-        let params = serde_json::from_str(params.get()).invalid_params()?;
-        monad_eth_getTransactionByBlockHashAndIndex(chain_state, params)
-            .await
-            .map(serialize_result)?
-    } else {
-        Err(JsonRpcError::method_not_supported())
-    }
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    let params = serde_json::from_str(params.get()).invalid_params()?;
+    monad_eth_getTransactionByBlockHashAndIndex(chain_state, params)
+        .await
+        .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn eth_getTransactionByBlockNumberAndIndex(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    if let Some(chain_state) = &app_state.chain_state {
-        let params = serde_json::from_str(params.get()).invalid_params()?;
-        monad_eth_getTransactionByBlockNumberAndIndex(chain_state, params)
-            .await
-            .map(serialize_result)?
-    } else {
-        Err(JsonRpcError::method_not_supported())
-    }
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    let params = serde_json::from_str(params.get()).invalid_params()?;
+    monad_eth_getTransactionByBlockNumberAndIndex(chain_state, params)
+        .await
+        .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn eth_getBlockTransactionCountByHash(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    if let Some(chain_state) = app_state.chain_state.as_ref() {
-        let params = serde_json::from_str(params.get()).invalid_params()?;
-        monad_eth_getBlockTransactionCountByHash(chain_state, params)
-            .await
-            .map(serialize_result)?
-    } else {
-        Err(JsonRpcError::method_not_supported())
-    }
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    let params = serde_json::from_str(params.get()).invalid_params()?;
+    monad_eth_getBlockTransactionCountByHash(chain_state, params)
+        .await
+        .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn eth_getBlockTransactionCountByNumber(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    if let Some(chain_state) = app_state.chain_state.as_ref() {
-        let params = serde_json::from_str(params.get()).invalid_params()?;
-        monad_eth_getBlockTransactionCountByNumber(chain_state, params)
-            .await
-            .map(serialize_result)?
-    } else {
-        Err(JsonRpcError::method_not_supported())
-    }
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    let params = serde_json::from_str(params.get()).invalid_params()?;
+    monad_eth_getBlockTransactionCountByNumber(chain_state, params)
+        .await
+        .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn eth_getBalance(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    if let Some(reader) = &app_state.triedb_reader {
-        let params = serde_json::from_str(params.get()).invalid_params()?;
-        monad_eth_getBalance(reader, params)
-            .await
-            .map(serialize_result)?
-    } else {
-        Err(JsonRpcError::method_not_supported())
-    }
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    let params = serde_json::from_str(params.get()).invalid_params()?;
+    monad_eth_getBalance(chain_state, params)
+        .await
+        .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn eth_getCode(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    if let Some(reader) = &app_state.triedb_reader {
-        let params = serde_json::from_str(params.get()).invalid_params()?;
-        monad_eth_getCode(reader, params)
-            .await
-            .map(serialize_result)?
-    } else {
-        Err(JsonRpcError::method_not_supported())
-    }
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    let params = serde_json::from_str(params.get()).invalid_params()?;
+    monad_eth_getCode(chain_state, params)
+        .await
+        .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn eth_getStorageAt(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    if let Some(reader) = &app_state.triedb_reader {
-        let params = serde_json::from_str(params.get()).invalid_params()?;
-        monad_eth_getStorageAt(reader, params)
-            .await
-            .map(serialize_result)?
-    } else {
-        Err(JsonRpcError::method_not_supported())
-    }
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    let params = serde_json::from_str(params.get()).invalid_params()?;
+    monad_eth_getStorageAt(chain_state, params)
+        .await
+        .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn eth_getTransactionCount(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    if let Some(reader) = &app_state.triedb_reader {
-        let params = serde_json::from_str(params.get()).invalid_params()?;
-        monad_eth_getTransactionCount(reader, params)
-            .await
-            .map(serialize_result)?
-    } else {
-        Err(JsonRpcError::method_not_supported())
-    }
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    let params = serde_json::from_str(params.get()).invalid_params()?;
+    monad_eth_getTransactionCount(chain_state, params)
+        .await
+        .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn eth_blockNumber(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     _params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    if let Some(chain_state) = &app_state.chain_state {
-        monad_eth_blockNumber(chain_state)
-            .await
-            .map(serialize_result)?
-    } else {
-        Err(JsonRpcError::method_not_supported())
-    }
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    monad_eth_blockNumber(chain_state)
+        .await
+        .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn eth_chainId(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     _params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -699,7 +652,7 @@ async fn eth_chainId(
 
 #[allow(non_snake_case)]
 async fn eth_syncing(
-    _: RequestId,
+    _: TimingRequestId,
     _app_state: &MonadRpcResources,
     _params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -708,70 +661,44 @@ async fn eth_syncing(
 
 #[allow(non_snake_case)]
 async fn eth_estimateGas(
-    request_id: RequestId,
+    request_id: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    let Some(triedb_env) = &app_state.triedb_reader else {
-        return Err(JsonRpcError::method_not_supported());
-    };
-    let Some(ref eth_call_executor) = app_state.eth_call_executor else {
-        return Err(JsonRpcError::method_not_supported());
-    };
-
-    // acquire the concurrent requests permit
-    let _permit = match app_state.rate_limiter.try_acquire() {
-        Ok(permit) => permit,
-        Err(_) => {
-            if let Some(tracker) = &app_state.eth_call_stats_tracker {
-                tracker.record_queue_rejection().await;
-            }
-            return Err(JsonRpcError::internal_error(
-                "eth_estimateGas concurrent requests limit".into(),
-            ));
-        }
-    };
-
-    if let Some(tracker) = &app_state.eth_call_stats_tracker {
-        tracker.record_request_start(request_id).await;
-    }
-
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    let eth_call_handler = app_state.eth_call_handler.as_ref().method_not_supported()?;
     let params = serde_json::from_str(params.get()).invalid_params()?;
-    let result = monad_eth_estimateGas(
-        triedb_env,
-        eth_call_executor.clone(),
-        app_state.chain_id,
-        app_state.eth_estimate_gas_provider_gas_limit,
-        params,
-    )
-    .await;
+    let permit = eth_call_handler.acquire(request_id).await?;
 
-    if let Some(tracker) = &app_state.eth_call_stats_tracker {
-        let is_error = result.is_err();
-        tracker.record_request_complete(&request_id, is_error).await;
-    }
-
-    result.map(serialize_result)?
+    permit
+        .execute(|executor| {
+            monad_eth_estimateGas(
+                chain_state,
+                executor,
+                app_state.chain_id,
+                app_state.eth_estimate_gas_provider_gas_limit,
+                params,
+            )
+        })
+        .await
+        .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn eth_gasPrice(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     _params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    if let Some(chain_state) = &app_state.chain_state {
-        monad_eth_gasPrice(chain_state)
-            .await
-            .map(serialize_result)?
-    } else {
-        Err(JsonRpcError::method_not_supported())
-    }
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    monad_eth_gasPrice(chain_state)
+        .await
+        .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn eth_maxPriorityFeePerGas(
-    _: RequestId,
+    _: TimingRequestId,
     _app_state: &MonadRpcResources,
     _params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -782,30 +709,24 @@ async fn eth_maxPriorityFeePerGas(
 
 #[allow(non_snake_case)]
 async fn eth_feeHistory(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    if let Some(chain_state) = &app_state.chain_state {
-        let params = serde_json::from_str(params.get()).invalid_params()?;
-        monad_eth_feeHistory(chain_state, params)
-            .await
-            .map(serialize_result)?
-    } else {
-        Err(JsonRpcError::method_not_supported())
-    }
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
+    let params = serde_json::from_str(params.get()).invalid_params()?;
+    monad_eth_feeHistory(chain_state, params)
+        .await
+        .map(serialize_result)?
 }
 
 #[allow(non_snake_case)]
 async fn eth_getTransactionReceipt(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    let Some(chain_state) = &app_state.chain_state else {
-        return Err(JsonRpcError::method_not_supported());
-    };
-
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
     let params = serde_json::from_str(params.get()).invalid_params()?;
     monad_eth_getTransactionReceipt(chain_state, params)
         .await
@@ -814,7 +735,7 @@ async fn eth_getTransactionReceipt(
 
 #[allow(non_snake_case)]
 async fn eth_getBlockReceipts(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -827,7 +748,7 @@ async fn eth_getBlockReceipts(
 
 #[allow(non_snake_case)]
 async fn net_version(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     _params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -836,13 +757,14 @@ async fn net_version(
 
 #[allow(non_snake_case)]
 async fn txpool_statusByHash(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    let Some(txpool_bridge_client) = &app_state.txpool_bridge_client else {
-        return Err(JsonRpcError::method_not_supported());
-    };
+    let txpool_bridge_client = app_state
+        .txpool_bridge_client
+        .as_ref()
+        .method_not_supported()?;
     let params = serde_json::from_str(params.get()).invalid_params()?;
     monad_txpool_statusByHash(txpool_bridge_client, params)
         .await
@@ -851,13 +773,14 @@ async fn txpool_statusByHash(
 
 #[allow(non_snake_case)]
 async fn txpool_statusByAddress(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    let Some(txpool_bridge_client) = &app_state.txpool_bridge_client else {
-        return Err(JsonRpcError::method_not_supported());
-    };
+    let txpool_bridge_client = app_state
+        .txpool_bridge_client
+        .as_ref()
+        .method_not_supported()?;
     let params = serde_json::from_str(params.get()).invalid_params()?;
     monad_txpool_statusByAddress(txpool_bridge_client, params)
         .await
@@ -866,7 +789,7 @@ async fn txpool_statusByAddress(
 
 #[allow(non_snake_case)]
 async fn web3_clientVersion(
-    _: RequestId,
+    _: TimingRequestId,
     _app_state: &MonadRpcResources,
     _params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -909,7 +832,7 @@ macro_rules! enabled_methods {
 
             async fn call(
                 &self,
-                request_id: RequestId,
+                request_id: TimingRequestId,
                 app_state: &MonadRpcResources,
                 params: RequestParams<'_>,
             ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -961,7 +884,8 @@ enabled_methods!(
     net_version,
     txpool_statusByHash,
     txpool_statusByAddress,
-    web3_clientVersion
+    web3_clientVersion,
+    eth_fillTransaction
 );
 
 #[tracing::instrument(level = "debug", skip_all)]
@@ -969,7 +893,7 @@ pub async fn rpc_select(
     app_state: &MonadRpcResources,
     method: &str,
     params: RequestParams<'_>,
-    request_id: RequestId,
+    request_id: TimingRequestId,
 ) -> Result<Box<RawValue>, JsonRpcError> {
     let method: EnabledMethod = method.try_into()?;
     let mut span = method.span();

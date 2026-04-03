@@ -13,11 +13,11 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use alloy_consensus::{ReceiptEnvelope, TxEnvelope};
+use alloy_consensus::{transaction::SignerRecoverable, ReceiptEnvelope, TxEnvelope};
 use alloy_primitives::BlockHash;
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable};
 use eyre::{bail, ensure};
-use monad_triedb_utils::triedb_env::{ReceiptWithLogIndex, TxEnvelopeWithSender};
+use monad_eth_types::{ReceiptWithLogIndex, TxEnvelopeWithSender};
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
@@ -47,7 +47,7 @@ pub struct HeaderSubsetV0 {
     pub block_hash: BlockHash,
     pub block_number: u64,
     pub tx_index: u64,
-    pub gas_used: u128,
+    pub gas_used: u64,
     pub base_fee_per_gas: Option<u64>,
 }
 
@@ -136,7 +136,10 @@ impl IndexDataStorageRepr {
         match result {
             Ok(d) => Ok(d),
             Err(e) => {
-                info!(?e, "Failed to parse IndexDataStorageRepr despite sentinel bit being set. Falling back to raw InlineV0 decoding...");
+                info!(
+                    ?e,
+                    "Failed to parse IndexDataStorageRepr despite sentinel bit being set. Falling back to raw InlineV0 decoding..."
+                );
                 InlineV0::decode(&mut &buf[..])
                     .map(IndexDataStorageRepr::InlineV0)
                     .map_err(Into::into)

@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{num::TryFromIntError, sync::Arc};
+use std::num::TryFromIntError;
 
 use monad_ethcall::{eth_trace_block_or_transaction, CallResult, EthCallExecutor, MonadTracer};
 use monad_triedb_utils::triedb_env::{BlockKey, Triedb};
@@ -21,8 +21,7 @@ use monad_types::SeqNum;
 use serde_json::value::RawValue;
 
 use crate::{
-    chainstate::get_block_key_from_tag,
-    eth_json_types::{BlockTagOrHash, BlockTags, EthHash},
+    chainstate::{get_block_key_from_tag, ChainState},
     handlers::{
         debug::{
             MonadDebugTraceBlockByHashParams, MonadDebugTraceBlockByNumberParams,
@@ -30,8 +29,11 @@ use crate::{
         },
         MonadRpcResources,
     },
-    jsonrpc::{JsonRpcError, JsonRpcResult},
-    timing::RequestId,
+    middleware::TimingRequestId,
+    types::{
+        eth_json::{BlockTagOrHash, BlockTags, EthHash},
+        jsonrpc::{JsonRpcError, JsonRpcResult, JsonRpcResultExt},
+    },
 };
 
 impl From<TracerObject> for MonadTracer {
@@ -131,26 +133,29 @@ impl TryFrom<BlockTagOrHash> for EthHash {
 
 /// A generic handler for debug trace requests that requires transaction replay (e.g., PreStateTracer).
 pub async fn monad_debug_trace_replay<T: Triedb>(
-    triedb_env: &T,
-    eth_call_executor: Arc<EthCallExecutor>,
+    chain_state: &ChainState<T>,
+    eth_call_executor: &EthCallExecutor,
     chain_id: u64,
     params: &impl DebugTraceParams,
 ) -> JsonRpcResult<Box<RawValue>> {
-    let block_key = get_block_key_from_tag(triedb_env, params.into()).ok_or_else(|| {
-        JsonRpcError::internal_error("error getting block key from tag: found none".into())
-    })?;
+    let block_key =
+        get_block_key_from_tag(&chain_state.triedb_env, params.into()).ok_or_else(|| {
+            JsonRpcError::internal_error("error getting block key from tag: found none".into())
+        })?;
     let tracer: MonadTracer = params.tracer().into();
     let (block_key, block_number, transaction_index) = match params.trace_target() {
         TraceTarget::Transaction => {
             let tx_hash: EthHash = params.block_tag_or_hash().try_into()?;
-            let tx_loc = triedb_env
+            let tx_loc = chain_state
+                .triedb_env
                 .get_transaction_location_by_hash(block_key, tx_hash.0)
                 .await
                 .map_err(JsonRpcError::internal_error)?
                 .ok_or_else(|| {
                     JsonRpcError::internal_error(format!("transaction not found: {:?}", tx_hash))
                 })?;
-            let block_key = triedb_env
+            let block_key = chain_state
+                .triedb_env
                 .get_block_key(SeqNum(tx_loc.block_num))
                 .ok_or_else(|| {
                     JsonRpcError::internal_error(
@@ -169,16 +174,20 @@ pub async fn monad_debug_trace_replay<T: Triedb>(
         TraceTarget::Block => {
             let block_key = match params.block_tag_or_hash() {
                 BlockTagOrHash::Hash(block_hash) => {
-                    if let Some(block_num) = triedb_env
+                    if let Some(block_num) = chain_state
+                        .triedb_env
                         .get_block_number_by_hash(block_key, block_hash.0)
                         .await
                         .map_err(JsonRpcError::internal_error)?
                     {
-                        triedb_env.get_block_key(SeqNum(block_num)).ok_or_else(|| {
-                            JsonRpcError::internal_error(
-                                "error getting block key from block number: found none".into(),
-                            )
-                        })?
+                        chain_state
+                            .triedb_env
+                            .get_block_key(SeqNum(block_num))
+                            .ok_or_else(|| {
+                                JsonRpcError::internal_error(
+                                    "error getting block key from block number: found none".into(),
+                                )
+                            })?
                     } else {
                         return Err(JsonRpcError::internal_error(format!(
                             "block not found: {:?}",
@@ -196,14 +205,16 @@ pub async fn monad_debug_trace_replay<T: Triedb>(
             "cannot trace the genesis block".into(),
         ));
     }
-    let header = triedb_env
+    let header = chain_state
+        .triedb_env
         .get_block_header(block_key)
         .await
         .map_err(|e| JsonRpcError::internal_error(format!("error getting block header: {}", e)))?
         .ok_or_else(|| {
             JsonRpcError::internal_error("error getting block header: found none".into())
         })?;
-    let parent_key = triedb_env
+    let parent_key = chain_state
+        .triedb_env
         .get_block_key(SeqNum(block_number - 1))
         .ok_or_else(|| {
             JsonRpcError::internal_error(
@@ -212,7 +223,8 @@ pub async fn monad_debug_trace_replay<T: Triedb>(
         })?;
     let grandparent_key = if block_number > 1 {
         Some(
-            triedb_env
+            chain_state
+                .triedb_env
                 .get_block_key(SeqNum(block_number - 2))
                 .ok_or_else(|| {
                     JsonRpcError::internal_error(
@@ -238,7 +250,7 @@ pub async fn monad_debug_trace_replay<T: Triedb>(
     let raw_payload = match call_result {
         CallResult::Success(monad_ethcall::SuccessCallResult { output_data, .. }) => output_data,
         CallResult::Failure(error) => {
-            return Err(JsonRpcError::eth_call_error(error.message, error.data))
+            return Err(JsonRpcError::eth_call_error(error.message, error.data));
         }
         CallResult::Revert(result) => result.trace,
     };
@@ -249,43 +261,16 @@ pub async fn monad_debug_trace_replay<T: Triedb>(
 }
 
 pub async fn collect_debug_trace_via_replay(
-    request_id: RequestId,
-    triedb_env: &impl Triedb,
+    request_id: TimingRequestId,
+    chain_state: &ChainState<impl Triedb>,
     app_state: &MonadRpcResources,
     params: &impl DebugTraceParams,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    let Some(ref eth_call_executor) = app_state.eth_call_executor else {
-        return Err(JsonRpcError::method_not_supported());
-    };
-    // acquire the concurrent requests permit
-    let _permit = match app_state.rate_limiter.try_acquire() {
-        Ok(permit) => permit,
-        Err(_) => {
-            if let Some(tracker) = &app_state.eth_call_stats_tracker {
-                tracker.record_queue_rejection().await;
-            }
-            return Err(JsonRpcError::internal_error(
-                "eth_call concurrent requests limit".into(),
-            ));
-        }
-    };
+    let eth_call_handler = app_state.eth_call_handler.as_ref().method_not_supported()?;
+    let permit = eth_call_handler.acquire(request_id).await?;
+    let chain_id = app_state.chain_id;
 
-    if let Some(tracker) = &app_state.eth_call_stats_tracker {
-        tracker.record_request_start(request_id).await;
-    }
-
-    let result = monad_debug_trace_replay(
-        triedb_env,
-        eth_call_executor.clone(),
-        app_state.chain_id,
-        params,
-    )
-    .await;
-
-    if let Some(tracker) = &app_state.eth_call_stats_tracker {
-        let is_error = result.is_err();
-        tracker.record_request_complete(&request_id, is_error).await;
-    }
-
-    result
+    permit
+        .execute(|executor| monad_debug_trace_replay(chain_state, executor, chain_id, params))
+        .await
 }

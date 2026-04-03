@@ -23,7 +23,8 @@ use serde::Deserialize;
 pub struct NodeNetworkConfig {
     pub bind_address_host: Ipv4Addr,
     pub bind_address_port: u16,
-    pub authenticated_bind_address_port: Option<u16>,
+    pub authenticated_bind_address_port: u16,
+    pub direct_udp_bind_address_port: Option<u16>,
 
     pub max_rtt_ms: u64,
     pub max_mbps: u16,
@@ -70,7 +71,7 @@ fn default_udp_message_max_age_ms() -> u64 {
 }
 
 fn default_tcp_connections_limit() -> usize {
-    1000
+    100
 }
 
 fn default_tcp_per_ip_connections_limit() -> usize {

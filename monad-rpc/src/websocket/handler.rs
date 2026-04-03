@@ -34,17 +34,20 @@ use tokio::sync::{broadcast, Semaphore, TryAcquireError};
 use tracing::{debug, error, warn};
 
 use crate::{
-    eth_json_types::{
-        serialize_result, EthSubscribeRequest, EthSubscribeResult, EthUnsubscribeRequest,
-        FixedData, MonadNotification, SubscriptionKind,
-    },
     event::{EventServerClient, EventServerClientError, EventServerEvent},
     handlers::{resources::MonadRpcResources, rpc_select},
-    jsonrpc::{
-        serialize_with_size_limit, JsonRpcError, Notification, Request, RequestWrapper, Response,
+    middleware::TimingRequestId,
+    types::{
+        eth_json::{
+            serialize_result, EthSubscribeRequest, EthSubscribeResult, EthUnsubscribeRequest,
+            FixedData, MonadNotification, SubscriptionKind,
+        },
+        jsonrpc::{
+            serialize_with_size_limit, JsonRpcError, Notification, Request, RequestWrapper,
+            Response,
+        },
+        serialize::SharedJsonSerialized,
     },
-    serialize::SharedJsonSerialized,
-    timing::RequestId,
 };
 
 const RECV_MAX_CONTINUATION_SIZE: usize = 2 * 1024 * 1024;
@@ -52,6 +55,7 @@ const RECV_MAX_FRAME_SIZE: usize = 256 * 1024;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 const CLIENT_TIMEOUT_SECS: u64 = 60;
+const COMMIT_STATE_FILTER: BlockCommitState = BlockCommitState::Proposed;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Deserialize, Serialize)]
 pub struct SubscriptionId(pub FixedData<16>);
@@ -201,7 +205,7 @@ async fn handler(
                             }
                             Err(e) => {
                                 if let Err(err) = session
-                                    .text(to_response(&crate::jsonrpc::Response::from_error(e)))
+                                    .text(to_response(&crate::types::jsonrpc::Response::from_error(e)))
                                     .await {
                                     warn!(?err, "ws handler AggregatedMessage text error");
                                     return None;
@@ -222,7 +226,7 @@ async fn handler(
                             }
                             Err(e) => {
                                 if let Err(err) = session
-                                    .binary(to_response(&crate::jsonrpc::Response::from_error(e)))
+                                    .binary(to_response(&crate::types::jsonrpc::Response::from_error(e)))
                                     .await {
                                     warn!(?err, "ws handler AggregatedMessage binary error");
                                     return None;
@@ -295,9 +299,9 @@ async fn handle_notification(
             )));
         }
         EventServerEvent::Block {
+            commit_state,
             header,
-            block: _,
-            logs,
+            transactions,
         } => {
             for (id, _) in subscriptions
                 .get(&SubscriptionKind::MonadNewHeads)
@@ -307,7 +311,7 @@ async fn handle_notification(
                 send_notification(session, id, header.as_ref(), max_response_size).await?;
             }
 
-            if header.commit_state == BlockCommitState::Finalized {
+            if commit_state == COMMIT_STATE_FILTER {
                 for (id, _) in subscriptions
                     .get(&SubscriptionKind::NewHeads)
                     .map(|x| x.iter())
@@ -317,12 +321,14 @@ async fn handle_notification(
                 }
             }
 
+            let iter_logs = || transactions.iter().flat_map(|(_, _, logs)| logs.iter());
+
             for (id, filter) in subscriptions
                 .get(&SubscriptionKind::MonadLogs)
                 .map(|x| x.iter())
                 .unwrap_or_default()
             {
-                let Some(logs) = apply_logs_filter(filter, header.data.as_ref(), logs.iter())
+                let Some(logs) = apply_logs_filter(filter, header.data.as_ref(), iter_logs())
                 else {
                     continue;
                 };
@@ -332,13 +338,13 @@ async fn handle_notification(
                 }
             }
 
-            if header.commit_state == BlockCommitState::Finalized {
+            if commit_state == COMMIT_STATE_FILTER {
                 for (id, filter) in subscriptions
                     .get(&SubscriptionKind::Logs)
                     .map(|x| x.iter())
                     .unwrap_or_default()
                 {
-                    let Some(logs) = apply_logs_filter(filter, header.data.as_ref(), logs.iter())
+                    let Some(logs) = apply_logs_filter(filter, header.data.as_ref(), iter_logs())
                     else {
                         continue;
                     };
@@ -411,7 +417,7 @@ async fn handle_request(
         "eth_subscribe" => {
             let Ok(req) = serde_json::from_str::<EthSubscribeRequest>(request.params.get()) else {
                 if let Err(err) = ctx
-                    .text(to_response(&crate::jsonrpc::Response::new(
+                    .text(to_response(&crate::types::jsonrpc::Response::new(
                         None,
                         Some(JsonRpcError::invalid_params()),
                         request.id,
@@ -436,7 +442,7 @@ async fn handle_request(
                 Params::Logs(filter) => Some(*filter),
                 Params::Bool(_) => {
                     if let Err(err) = ctx
-                        .text(to_response(&crate::jsonrpc::Response::new(
+                        .text(to_response(&crate::types::jsonrpc::Response::new(
                             None,
                             Some(JsonRpcError::invalid_params()),
                             request.id,
@@ -466,7 +472,7 @@ async fn handle_request(
 
             if (subscription_count + 1) > subscription_limit {
                 if let Err(err) = ctx
-                    .text(to_response(&crate::jsonrpc::Response::new(
+                    .text(to_response(&crate::types::jsonrpc::Response::new(
                         None,
                         Some(JsonRpcError::custom(
                             "WebSocket subscription limit reached".to_string(),
@@ -493,7 +499,7 @@ async fn handle_request(
             let id = SubscriptionId(FixedData(random_bytes));
 
             if let Err(err) = ctx
-                .text(to_response(&crate::jsonrpc::Response::from_result(
+                .text(to_response(&crate::types::jsonrpc::Response::from_result(
                     request.id,
                     serialize_result(id),
                 )))
@@ -522,7 +528,7 @@ async fn handle_request(
             let Ok(req) = serde_json::from_str::<EthUnsubscribeRequest>(request.params.get())
             else {
                 if let Err(err) = ctx
-                    .text(to_response(&crate::jsonrpc::Response::new(
+                    .text(to_response(&crate::types::jsonrpc::Response::new(
                         None,
                         Some(JsonRpcError::invalid_params()),
                         request.id,
@@ -561,7 +567,7 @@ async fn handle_request(
             }
 
             if let Err(err) = ctx
-                .text(to_response(&crate::jsonrpc::Response::from_result(
+                .text(to_response(&crate::types::jsonrpc::Response::from_result(
                     request.id,
                     serialize_result(exists),
                 )))
@@ -578,7 +584,8 @@ async fn handle_request(
             }
         }
         method => {
-            let result = rpc_select(app_state, method, request.params, RequestId::random()).await;
+            let result =
+                rpc_select(app_state, method, request.params, TimingRequestId::random()).await;
             let response = Response::from_result(request.id.clone(), result);
             let result =
                 match serialize_with_size_limit(&response, app_state.max_response_size as usize) {
@@ -657,7 +664,7 @@ fn to_response<S: Serialize + std::fmt::Debug>(resp: &S) -> String {
         Ok(resp) => resp,
         Err(e) => {
             error!("error serializing response: {:?} for {:?}", e, resp);
-            serde_json::to_string(&crate::jsonrpc::Response::from_error(
+            serde_json::to_string(&crate::types::jsonrpc::Response::from_error(
                 JsonRpcError::internal_error("serializing response".to_string()),
             ))
             .expect("failed to serialize error response")
@@ -681,7 +688,7 @@ fn parse_request<'p>(body: &'p bytes::Bytes) -> Result<Request<'p>, JsonRpcError
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::time::Duration;
 
     use actix_http::{ws, ws::Frame};
     use actix_web::{web, App};
@@ -690,44 +697,40 @@ mod tests {
     use futures_util::{SinkExt as _, StreamExt as _};
     use monad_event_ring::SnapshotEventRing;
     use serde_json::json;
-    use tokio::sync::Semaphore;
 
     use super::ws_handler;
     use crate::{
-        eth_json_types::{EthSubscribeResult, FixedData},
         event::EventServer,
-        handlers::{eth::call::EthCallStatsTracker, resources::MonadRpcResources},
-        hex,
+        handlers::resources::MonadRpcResources,
         txpool::EthTxPoolBridgeClient,
+        types::{
+            eth_json::{EthSubscribeResult, FixedData},
+            ethhex,
+        },
         websocket::handler::{ConnectionLimit, SubscriptionLimit},
     };
 
     fn create_test_server() -> actix_test::TestServer {
         const SNAPSHOT_NAME: &str = "ETHEREUM_MAINNET_30B_15M";
         const SNAPSHOT_ZSTD_BYTES: &[u8] = include_bytes!(
-            "../../../monad-exec-events/test/data/exec-events-emn-30b-15m/snapshot.zst"
+            "../../../monad-execution/rust/crates/monad-exec-events/test/data/exec-events-emn-30b-15m/snapshot.zst"
         );
 
         let snapshot =
-            SnapshotEventRing::new_from_zstd_bytes(SNAPSHOT_ZSTD_BYTES, SNAPSHOT_NAME).unwrap();
+            SnapshotEventRing::new_from_zstd_bytes(SNAPSHOT_NAME, SNAPSHOT_ZSTD_BYTES, None)
+                .unwrap();
 
         let ws_server_handle =
             EventServer::start_for_testing_with_delay(snapshot, Duration::from_secs(1));
 
         let app_state = MonadRpcResources {
             txpool_bridge_client: Some(EthTxPoolBridgeClient::for_testing()),
-            triedb_reader: None,
-            eth_call_executor: None,
-            eth_call_executor_fibers: 64,
-            eth_call_stats_tracker: Some(Arc::new(EthCallStatsTracker::default())),
-            archive_reader: None,
+            eth_call_handler: None,
             chain_id: 1337,
             chain_state: None,
             batch_request_limit: 5,
             max_response_size: 25_000_000,
             allow_unprotected_txs: false,
-            rate_limiter: Arc::new(Semaphore::new(1000)),
-            total_permits: 1000,
             logs_max_block_range: 1000,
             eth_call_provider_gas_limit: u64::MAX,
             eth_estimate_gas_provider_gas_limit: u64::MAX,
@@ -736,7 +739,6 @@ mod tests {
             dry_run_get_logs_index: false,
             use_eth_get_logs_index: false,
             max_finalized_block_cache_len: 200,
-            enable_eth_call_statistics: true,
             metrics: None,
             rpc_comparator: None,
         };
@@ -788,7 +790,7 @@ mod tests {
         assert!(matches!(frame, Frame::Text(_)));
         let subscription_id = if let Frame::Text(resp) = frame {
             let resp: serde_json::Value = serde_json::from_slice(&resp).unwrap();
-            let resp: crate::jsonrpc::Response = serde_json::from_value(resp).unwrap();
+            let resp: crate::types::jsonrpc::Response = serde_json::from_value(resp).unwrap();
             let resp: FixedData<16> = serde_json::from_str(resp.result.unwrap().get()).unwrap();
             resp
         } else {
@@ -808,7 +810,7 @@ mod tests {
                                 .unwrap();
                         }
                         Frame::Text(update) => {
-                            let update: crate::jsonrpc::Notification<EthSubscribeResult> =
+                            let update: crate::types::jsonrpc::Notification<EthSubscribeResult> =
                                 serde_json::from_slice(&update).unwrap();
                             assert_eq!(update.params.subscription.0, subscription_id.0);
                         }
@@ -822,7 +824,7 @@ mod tests {
                 let body = json!({
                     "jsonrpc": "2.0",
                     "method": "eth_unsubscribe",
-                    "params": [hex::encode(&subscription_id.0)],
+                    "params": [ethhex::encode_bytes(&subscription_id.0)],
                     "id": 1
                 });
 
@@ -836,10 +838,11 @@ mod tests {
                     assert!(matches!(frame, Frame::Text(_)));
                     if let Frame::Text(resp) = frame {
                         let resp: serde_json::Value = serde_json::from_slice(&resp).unwrap();
-                        let resp: crate::jsonrpc::Response = match serde_json::from_value(resp) {
-                            Ok(resp) => resp,
-                            Err(_) => continue,
-                        };
+                        let resp: crate::types::jsonrpc::Response =
+                            match serde_json::from_value(resp) {
+                                Ok(resp) => resp,
+                                Err(_) => continue,
+                            };
                         let resp: bool = serde_json::from_str(resp.result.unwrap().get()).unwrap();
                         assert!(resp);
                         return;

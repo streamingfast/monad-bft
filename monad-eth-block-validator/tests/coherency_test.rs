@@ -467,7 +467,7 @@ fn check_txpool_coherency(
             NopStateBackend,
             MonadChainConfig,
             MonadChainRevision,
-        >>::update_committed_block(&mut block_policy, extending_block, chain_config);
+        >>::update_committed_block(&mut block_policy, extending_block);
     }
 
     // insert transactions of the incoming block into txpool
@@ -491,7 +491,7 @@ fn check_txpool_coherency(
     }
 
     // create proposal
-    let base_fee = block_under_test.header().base_fee.unwrap_or(0);
+    let base_fee = block_under_test.header().base_fee;
     let timestamp_ns = block_under_test.header().timestamp_ns;
     let beneficiary: [u8; 20] = block_under_test
         .header()
@@ -647,9 +647,9 @@ fn create_block_body_helper(
 ) -> ConsensusBlockBody<EthExecutionProtocol> {
     ConsensusBlockBody::new(ConsensusBlockBodyInner {
         execution_body: EthBlockBody {
-            transactions: txs.iter().map(|tx| tx.tx().to_owned()).collect(),
-            ommers: Vec::default(),
-            withdrawals: Vec::default(),
+            transactions: txs.iter().map(|tx| tx.inner().to_owned()).collect(),
+            ommers: Default::default(),
+            withdrawals: Default::default(),
         },
     })
 }
@@ -696,9 +696,9 @@ fn create_block_header_helper(
         seq_num,
         timestamp,
         signature,
-        Some(base_fee),
-        Some(base_trend),
-        Some(base_moment),
+        base_fee,
+        base_trend,
+        base_moment,
     )
 }
 
@@ -719,9 +719,7 @@ fn create_test_block_helper(
         .compute_base_fee::<EthValidatedBlock<NopSignature, MockSignatures<NopSignature>>>(
             blocks,
             chain_config,
-            timestamp,
-        )
-        .unwrap();
+        );
     let header = create_block_header_helper(
         round,
         seq_num,
@@ -815,7 +813,7 @@ pub fn make_signed_authorization(
     nonce: u64,
 ) -> SignedAuthorization {
     let authorization = Authorization {
-        chain_id: MONAD_DEVNET_CHAIN_ID,
+        chain_id: U256::from(MONAD_DEVNET_CHAIN_ID),
         address,
         nonce,
     };
@@ -1278,7 +1276,7 @@ fn invalid_delegation_non_emptying_same_block_inputs() -> (
 
     // Invalid delegation with wrong chain id
     let invalid_auth = Authorization {
-        chain_id: MONAD_DEVNET_CHAIN_ID + 999,
+        chain_id: U256::from(MONAD_DEVNET_CHAIN_ID + 999),
         address: Address::default(),
         nonce: 0,
     };
@@ -1429,7 +1427,7 @@ fn invalid_delegation_non_emptying_different_blocks_inputs() -> (
 
     // Invalid delegation with wrong chain id
     let invalid_auth = Authorization {
-        chain_id: MONAD_DEVNET_CHAIN_ID + 999,
+        chain_id: U256::from(MONAD_DEVNET_CHAIN_ID + 999),
         address: Address::default(),
         nonce: 0,
     };
@@ -1478,7 +1476,7 @@ fn invalid_delegation_non_emptying_different_blocks_inputs_2() -> (
 
     // Invalid delegation with wrong chain id
     let invalid_auth = Authorization {
-        chain_id: MONAD_DEVNET_CHAIN_ID + 999,
+        chain_id: U256::from(MONAD_DEVNET_CHAIN_ID + 999),
         address: Address::default(),
         nonce: 0,
     };
@@ -2209,7 +2207,7 @@ fn invalid_delegation_non_emptying_sufficient_inputs() -> (
 
     // Invalid delegation with wrong chain id
     let invalid_auth = Authorization {
-        chain_id: MONAD_DEVNET_CHAIN_ID + 999,
+        chain_id: U256::from(MONAD_DEVNET_CHAIN_ID + 999),
         address: Address::default(),
         nonce: 0,
     };
@@ -2257,7 +2255,7 @@ fn invalid_delegation_non_emptying_insufficient_inputs() -> (
 
     // Invalid delegation with wrong chain id
     let invalid_auth = Authorization {
-        chain_id: MONAD_DEVNET_CHAIN_ID + 999,
+        chain_id: U256::from(MONAD_DEVNET_CHAIN_ID + 999),
         address: Address::default(),
         nonce: 0,
     };

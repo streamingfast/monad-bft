@@ -322,6 +322,7 @@ mod tests {
         test_utils::{mock_block, mock_rx, mock_tx, MemoryStorage},
     };
     use monad_compress::util::BoundedWriter;
+    use monad_eth_types::ReceiptWithLogIndex;
 
     use super::*;
 
@@ -340,7 +341,7 @@ mod tests {
                 .transactions
                 .iter()
                 .enumerate()
-                .map(|(i, _)| mock_rx(10, (i + 1) as u128 * 21000))
+                .map(|(i, _)| mock_rx(10, (i + 1) as u64 * 21000))
                 .collect();
             archive
                 .archive_receipts(receipts, block.header.number, WritePolicy::NoClobber)

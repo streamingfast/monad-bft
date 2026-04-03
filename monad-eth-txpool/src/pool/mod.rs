@@ -346,10 +346,10 @@ where
             transactions: system_transactions
                 .into_iter()
                 .chain(user_transactions)
-                .map(|tx| tx.into_tx())
+                .map(|tx| tx.into_inner())
                 .collect(),
-            ommers: Vec::new(),
-            withdrawals: Vec::new(),
+            ommers: Default::default(),
+            withdrawals: Default::default(),
         };
 
         // Monad does not use request hashes yet
@@ -686,7 +686,6 @@ where
             block_policy.get_execution_delay(),
             base_fee,
             &self.chain_revision,
-            &self.execution_revision,
         )?;
 
         let proposal = sequencer.build_proposal(

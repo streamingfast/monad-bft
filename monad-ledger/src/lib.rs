@@ -69,9 +69,20 @@ where
     phantom: PhantomData<ST>,
 }
 
-const GAUGE_EXECUTION_LEDGER_NUM_COMMITS: &str = "monad.execution_ledger.num_commits";
-const GAUGE_EXECUTION_LEDGER_NUM_TX_COMMITS: &str = "monad.execution_ledger.num_tx_commits";
-const GAUGE_EXECUTION_LEDGER_BLOCK_NUM: &str = "monad.execution_ledger.block_num";
+monad_executor::metric_consts! {
+    GAUGE_EXECUTION_LEDGER_NUM_COMMITS {
+        name: "monad.execution_ledger.num_commits",
+        help: "Blocks committed to the execution ledger",
+    }
+    GAUGE_EXECUTION_LEDGER_NUM_TX_COMMITS {
+        name: "monad.execution_ledger.num_tx_commits",
+        help: "Transactions committed to the execution ledger",
+    }
+    GAUGE_EXECUTION_LEDGER_BLOCK_NUM {
+        name: "monad.execution_ledger.block_num",
+        help: "Current block number in the execution ledger",
+    }
+}
 
 impl<ST, SCT> MonadBlockFileLedger<ST, SCT>
 where
@@ -254,17 +265,20 @@ where
     fn exec(&mut self, commands: Vec<Self::Command>) {
         for command in commands {
             match command {
-                LedgerCommand::LedgerCommit(OptimisticCommit::Proposed(block)) => {
-                    let block_id = block.get_id();
-
+                LedgerCommand::LedgerCommit(OptimisticCommit::Proposed {
+                    block,
+                    is_canonical,
+                }) => {
                     // this can panic because failure to persist a block is fatal error
                     self.write_bft_block(&block);
 
-                    self.update_cache(block);
+                    if is_canonical {
+                        self.bft_block_persist
+                            .update_proposed_head(&block.get_id())
+                            .unwrap();
+                    }
 
-                    self.bft_block_persist
-                        .update_proposed_head(&block_id)
-                        .unwrap();
+                    self.update_cache(block);
                 }
                 LedgerCommand::LedgerCommit(OptimisticCommit::Voted(block)) => {
                     let block_id = block.get_id();

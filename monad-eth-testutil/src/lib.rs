@@ -19,7 +19,9 @@ use std::{
 };
 
 use alloy_consensus::{
-    constants::EMPTY_WITHDRAWALS, proofs::calculate_transaction_root, transaction::Recovered,
+    constants::EMPTY_WITHDRAWALS,
+    proofs::calculate_transaction_root,
+    transaction::{Recovered, SignerRecoverable},
     Eip658Value, Receipt, ReceiptWithBloom, SignableTransaction, Transaction, TxEip1559, TxEip7702,
     TxEnvelope, TxLegacy, EMPTY_OMMER_ROOT_HASH,
 };
@@ -46,7 +48,7 @@ use monad_crypto::{
 use monad_eth_block_policy::{
     compute_txn_max_gas_cost,
     nonce_usage::{NonceUsage, NonceUsageMap},
-    pre_tfm_compute_max_txn_cost, EthValidatedBlock,
+    EthValidatedBlock,
 };
 use monad_eth_types::{EthBlockBody, EthExecutionProtocol, ProposedEthHeader, ValidatedTx};
 use monad_secp::KeyPair;
@@ -100,13 +102,24 @@ pub fn make_legacy_tx(
     nonce: u64,
     input_len: usize,
 ) -> TxEnvelope {
+    make_legacy_tx_with_value(sender, 0, gas_price, gas_limit, nonce, input_len)
+}
+
+pub fn make_legacy_tx_with_value(
+    sender: FixedBytes<32>,
+    value: u128,
+    gas_price: u128,
+    gas_limit: u64,
+    nonce: u64,
+    input_len: usize,
+) -> TxEnvelope {
     let transaction = TxLegacy {
         chain_id: Some(1337),
         nonce,
         gas_price,
         gas_limit,
         to: TxKind::Call(Address::repeat_byte(0u8)),
-        value: Default::default(),
+        value: U256::from(value),
         input: vec![0; input_len].into(),
     };
 
@@ -221,7 +234,7 @@ pub fn make_signed_authorization(
     nonce: u64,
 ) -> SignedAuthorization {
     let authorization = Authorization {
-        chain_id: 1337,
+        chain_id: U256::from(1337),
         address,
         nonce,
     };
@@ -287,7 +300,6 @@ fn compute_expected_txn_fees_and_nonce_usages(
                             first_txn_value: U256::ZERO,
                             first_txn_gas: Balance::ZERO,
                             max_gas_cost: Balance::ZERO,
-                            max_txn_cost: Balance::ZERO,
                             is_delegated: true,
                             delegation_before_first_txn: true,
                         });
@@ -306,7 +318,6 @@ fn compute_expected_txn_fees_and_nonce_usages(
                 first_txn_value: eth_txn.value(),
                 first_txn_gas: compute_txn_max_gas_cost(eth_txn, BASE_FEE),
                 max_gas_cost: Balance::ZERO,
-                max_txn_cost: pre_tfm_compute_max_txn_cost(eth_txn),
                 is_delegated: false,
                 delegation_before_first_txn: false,
             });
@@ -365,9 +376,9 @@ pub fn generate_consensus_test_block(
 
     let body = ConsensusBlockBody::new(ConsensusBlockBodyInner {
         execution_body: EthBlockBody {
-            transactions: txs.iter().map(|tx| tx.tx().to_owned()).collect(),
-            ommers: Vec::default(),
-            withdrawals: Vec::default(),
+            transactions: txs.iter().map(|tx| tx.inner().to_owned()).collect(),
+            ommers: Default::default(),
+            withdrawals: Default::default(),
         },
     });
 
@@ -397,9 +408,9 @@ pub fn generate_consensus_test_block(
         seq_num,
         0,
         signature,
-        Some(monad_tfm::base_fee::MIN_BASE_FEE),
-        Some(monad_tfm::base_fee::GENESIS_BASE_FEE_TREND),
-        Some(monad_tfm::base_fee::GENESIS_BASE_FEE_MOMENT),
+        monad_tfm::base_fee::MIN_BASE_FEE,
+        monad_tfm::base_fee::GENESIS_BASE_FEE_TREND,
+        monad_tfm::base_fee::GENESIS_BASE_FEE_MOMENT,
     );
 
     let (txn_fees, nonce_usages) = compute_expected_txn_fees_and_nonce_usages(&txs);

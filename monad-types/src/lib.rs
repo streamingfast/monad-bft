@@ -134,6 +134,7 @@ impl FromStr for Round {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+// A non-empty span of rounds
 pub struct RoundSpan {
     pub start: Round, // inclusive
     pub end: Round,   // exclusive
@@ -165,12 +166,9 @@ impl RoundSpan {
     }
 }
 
-impl Default for RoundSpan {
-    fn default() -> Self {
-        Self {
-            start: Round::MIN,
-            end: Round::MIN,
-        }
+impl From<RoundSpan> for std::ops::Range<Round> {
+    fn from(span: RoundSpan) -> Self {
+        span.start..span.end
     }
 }
 
@@ -374,7 +372,7 @@ impl SeqNum {
 
     /// This tells us what the boundary block of the epoch is. Note that this only indicates when
     /// the next epoch's round is scheduled.
-    pub fn is_epoch_end(&self, epoch_length: SeqNum) -> bool {
+    pub fn is_boundary_block(&self, epoch_length: SeqNum) -> bool {
         *self % epoch_length == epoch_length - SeqNum(1)
     }
 
@@ -384,7 +382,7 @@ impl SeqNum {
     /// Current design locks the info for epoch n + 1 by the end of epoch n. The
     /// validators have epoch_start_delay to prepare themselves for any duties
     pub fn get_locked_epoch(&self, epoch_length: SeqNum) -> Epoch {
-        assert!(self.is_epoch_end(epoch_length));
+        assert!(self.is_boundary_block(epoch_length));
         (*self).to_epoch(epoch_length) + Epoch(1)
     }
 
@@ -661,6 +659,7 @@ pub enum RouterTarget<P: PubKey> {
     Broadcast(Epoch),
     Raptorcast(Epoch), // sharded raptor-aware broadcast
     PointToPoint(NodeId<P>),
+    DirectPointToPoint(NodeId<P>),
     TcpPointToPoint {
         to: NodeId<P>,
         completion: Option<futures::channel::oneshot::Sender<()>>,
@@ -866,6 +865,33 @@ impl<T, const N: usize> std::ops::DerefMut for LimitedVec<T, N> {
 impl<T, const N: usize> From<Vec<T>> for LimitedVec<T, N> {
     fn from(vec: Vec<T>) -> Self {
         Self(vec)
+    }
+}
+
+impl<T: Serialize, const N: usize> Serialize for LimitedVec<T, N> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for LimitedVec<T, N> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<T>::deserialize(deserializer).map(Self)
+    }
+}
+
+impl<T, const N: usize> FromIterator<T> for LimitedVec<T, N> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl<'a, T, const N: usize> IntoIterator for &'a LimitedVec<T, N> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
     }
 }
 

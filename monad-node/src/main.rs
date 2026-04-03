@@ -530,10 +530,10 @@ where
         IpAddr::V4(node_config.network.bind_address_host),
         node_config.network.bind_address_port,
     );
-    let authenticated_bind_address = node_config
-        .network
-        .authenticated_bind_address_port
-        .map(|port| SocketAddr::new(IpAddr::V4(node_config.network.bind_address_host), port));
+    let authenticated_bind_address = SocketAddr::new(
+        IpAddr::V4(node_config.network.bind_address_host),
+        node_config.network.authenticated_bind_address_port,
+    );
     let Some(SocketAddr::V4(name_record_address)) = resolve_domain_v4(
         &NodeId::new(identity.pubkey()),
         &peer_discovery_config.self_address,
@@ -569,36 +569,30 @@ where
             network_config.tcp_rate_limit_burst,
         );
 
-    let mut udp_sockets: Vec<(UdpSocketId, std::net::SocketAddr)> =
-        vec![(UdpSocketId::Raptorcast, bind_address)];
-    if let Some(auth_addr) = authenticated_bind_address {
-        udp_sockets.push((UdpSocketId::AuthenticatedRaptorcast, auth_addr));
-    }
     dp_builder = dp_builder
-        .with_udp_sockets(udp_sockets)
+        .with_udp_sockets([
+            (UdpSocketId::Raptorcast, bind_address),
+            (
+                UdpSocketId::AuthenticatedRaptorcast,
+                authenticated_bind_address,
+            ),
+        ])
         .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_address)]);
 
-    // auth port in peer discovery config and network config should be set and unset simultaneously
     assert_eq!(
-        peer_discovery_config.self_auth_port.is_some(),
-        network_config.authenticated_bind_address_port.is_some()
+        peer_discovery_config.self_direct_udp_port.is_some(),
+        network_config.direct_udp_bind_address_port.is_some()
     );
 
     let self_id = NodeId::new(identity.pubkey());
-    let self_record = match peer_discovery_config.self_auth_port {
-        Some(auth_port) => NameRecord::new_with_authentication(
-            *name_record_address.ip(),
-            name_record_address.port(),
-            name_record_address.port(),
-            auth_port,
-            peer_discovery_config.self_record_seq_num,
-        ),
-        None => NameRecord::new(
-            *name_record_address.ip(),
-            name_record_address.port(),
-            peer_discovery_config.self_record_seq_num,
-        ),
-    };
+    let self_record = NameRecord::new_with_ports(
+        *name_record_address.ip(),
+        name_record_address.port(),
+        name_record_address.port(),
+        Some(peer_discovery_config.self_auth_port),
+        peer_discovery_config.self_direct_udp_port,
+        peer_discovery_config.self_record_seq_num,
+    );
     let self_record = MonadNameRecord::new(self_record, &identity);
     info!(?self_id, ?self_record, "self name record");
     assert!(
@@ -629,6 +623,7 @@ where
                 signature: peer.name_record_sig,
                 record_seq_num: peer.record_seq_num,
                 auth_port: peer.auth_port,
+                direct_udp_port: peer.direct_udp_port,
             };
 
             match MonadNameRecord::try_from(&peer_entry) {
@@ -696,8 +691,11 @@ where
 
     let shared_key = Arc::new(identity);
     let wireauth_config = monad_wireauth::Config::default();
-    let auth_protocol =
-        monad_raptorcast::auth::WireAuthProtocol::new(wireauth_config, shared_key.clone());
+    let auth_protocol = monad_raptorcast::auth::WireAuthProtocol::new(
+        &monad_raptorcast::auth::metrics::UDP_METRICS,
+        wireauth_config,
+        shared_key.clone(),
+    );
 
     MultiRouter::new(
         self_id,
@@ -743,9 +741,20 @@ fn resolve_domain_v4<P: PubKey>(node_id: &NodeId<P>, domain: &String) -> Option<
     None
 }
 
-const GAUGE_TOTAL_UPTIME_US: &str = "monad.total_uptime_us";
-const GAUGE_STATE_TOTAL_UPDATE_US: &str = "monad.state.total_update_us";
-const GAUGE_NODE_INFO: &str = "monad_node_info";
+monad_executor::metric_consts! {
+    GAUGE_TOTAL_UPTIME_US {
+        name: "monad.total_uptime_us",
+        help: "Total node uptime in microseconds",
+    }
+    GAUGE_STATE_TOTAL_UPDATE_US {
+        name: "monad.state.total_update_us",
+        help: "Total time spent updating state in microseconds",
+    }
+    GAUGE_NODE_INFO {
+        name: "monad_node_info",
+        help: "Node info indicator (always 1)",
+    }
+}
 
 fn send_metrics(
     meter: &opentelemetry::metrics::Meter,
@@ -755,27 +764,36 @@ fn send_metrics(
     process_start: &Instant,
     total_state_update_elapsed: &Duration,
 ) {
-    let node_info_gauge = gauge_cache
-        .entry(GAUGE_NODE_INFO)
-        .or_insert_with(|| meter.u64_gauge(GAUGE_NODE_INFO).build());
+    let node_info_gauge = gauge_cache.entry(GAUGE_NODE_INFO.name).or_insert_with(|| {
+        meter
+            .u64_gauge(GAUGE_NODE_INFO.name)
+            .with_description(GAUGE_NODE_INFO.help)
+            .build()
+    });
     node_info_gauge.record(1, &[]);
 
-    for (k, v) in state_metrics
+    for (k, v, desc) in state_metrics
         .metrics()
         .into_iter()
         .chain(executor_metrics.into_inner())
         .chain(std::iter::once((
-            GAUGE_TOTAL_UPTIME_US,
+            GAUGE_TOTAL_UPTIME_US.name,
             process_start.elapsed().as_micros() as u64,
+            GAUGE_TOTAL_UPTIME_US.help,
         )))
         .chain(std::iter::once((
-            GAUGE_STATE_TOTAL_UPDATE_US,
+            GAUGE_STATE_TOTAL_UPDATE_US.name,
             total_state_update_elapsed.as_micros() as u64,
+            GAUGE_STATE_TOTAL_UPDATE_US.help,
         )))
     {
-        let gauge = gauge_cache
-            .entry(k)
-            .or_insert_with(|| meter.u64_gauge(k).build());
+        let gauge = gauge_cache.entry(k).or_insert_with(|| {
+            if desc.is_empty() {
+                meter.u64_gauge(k).build()
+            } else {
+                meter.u64_gauge(k).with_description(desc).build()
+            }
+        });
         gauge.record(v, &[]);
     }
 }

@@ -25,6 +25,7 @@ use alloy_consensus::{
     TxEnvelope, EMPTY_OMMER_ROOT_HASH,
 };
 use alloy_eips::eip7702::{RecoveredAuthority, RecoveredAuthorization};
+use alloy_primitives::U256;
 use alloy_rlp::Encodable;
 use error::{EthBlockValidationError, HeaderError, PayloadError, TxnError};
 use monad_chain_config::{
@@ -44,7 +45,7 @@ use monad_crypto::certificate_signature::{
 use monad_eth_block_policy::{
     compute_txn_max_gas_cost,
     nonce_usage::{NonceUsage, NonceUsageMap},
-    pre_tfm_compute_max_txn_cost, timestamp_ns_to_secs,
+    timestamp_ns_to_secs,
     validation::static_validate_transaction,
     EthBlockPolicy, EthValidatedBlock,
 };
@@ -287,17 +288,11 @@ where
             ));
         }
 
-        if execution_chain_params.tfm_enabled {
-            if let Some(consensus_header_base_fee) = header.base_fee {
-                if consensus_header_base_fee != *base_fee_per_gas {
-                    return Err(HeaderError::InvalidBaseFee {
-                        consensus_header_base_fee,
-                        eth_header_base_fee: *base_fee_per_gas,
-                    });
-                }
-            } else {
-                return Err(HeaderError::EmptyHeaderBaseFee);
-            }
+        if header.base_fee != *base_fee_per_gas {
+            return Err(HeaderError::InvalidBaseFee {
+                consensus_header_base_fee: header.base_fee,
+                eth_header_base_fee: *base_fee_per_gas,
+            });
         }
 
         // Monad does not use request hashes yet
@@ -353,11 +348,11 @@ where
         } = &body.execution_body;
 
         if !ommers.is_empty() {
-            return Err(PayloadError::NonEmptyOmmers(ommers.clone()).into());
+            return Err(PayloadError::NonEmptyOmmers(ommers.to_vec()).into());
         }
 
         if !withdrawals.is_empty() {
-            return Err(PayloadError::NonEmptyWithdrawals(withdrawals.clone()).into());
+            return Err(PayloadError::NonEmptyWithdrawals(withdrawals.to_vec()).into());
         }
 
         // early return if number of transactions exceed limit
@@ -380,7 +375,7 @@ where
 
         // recovering the signers verifies that these are valid signatures
         let recovered_txns: VecDeque<Recovered<TxEnvelope>> = transactions
-            .into_par_iter()
+            .par_iter()
             .map(|tx| {
                 let _span = trace_span!("validator: recover signer").entered();
                 let signer = tx.secp256k1_recover()?;
@@ -444,7 +439,7 @@ where
                             return Err(TxnError::NonceOverflow.into());
                         };
 
-                        if expected_nonce != sys_txn.tx().nonce() {
+                        if expected_nonce != sys_txn.nonce() {
                             debug!(
                                 expected_nonce,
                                 ?sys_txn,
@@ -499,9 +494,7 @@ where
 
         let mut txn_fees: TxnFees = TxnFees::default();
         for eth_txn in validated_txns.iter() {
-            let block_base_fee = header
-                .base_fee
-                .unwrap_or(monad_tfm::base_fee::PRE_TFM_BASE_FEE);
+            let block_base_fee = header.base_fee;
             if eth_txn.max_fee_per_gas() < block_base_fee.into() {
                 debug!(
                     ?eth_txn,
@@ -560,14 +553,13 @@ where
                             first_txn_value: Balance::ZERO,
                             first_txn_gas: Balance::ZERO,
                             max_gas_cost: Balance::ZERO,
-                            max_txn_cost: Balance::ZERO,
                             is_delegated: true,
                             delegation_before_first_txn: true,
                         });
 
                     // authorizations with invalid chain id are skipped for nonce tracking
-                    if recovered_auth.chain_id() != 0_u64
-                        && recovered_auth.chain_id() != chain_config.chain_id()
+                    if !recovered_auth.chain_id().is_zero()
+                        && *recovered_auth.chain_id() != U256::from(chain_config.chain_id())
                     {
                         continue;
                     }
@@ -610,15 +602,11 @@ where
                     e.max_gas_cost = e
                         .max_gas_cost
                         .saturating_add(compute_txn_max_gas_cost(eth_txn, block_base_fee));
-                    e.max_txn_cost = e
-                        .max_txn_cost
-                        .saturating_add(pre_tfm_compute_max_txn_cost(eth_txn));
                 })
                 .or_insert(TxnFee {
                     first_txn_value: eth_txn.value(),
                     first_txn_gas: compute_txn_max_gas_cost(eth_txn, block_base_fee),
                     max_gas_cost: Balance::ZERO,
-                    max_txn_cost: pre_tfm_compute_max_txn_cost(eth_txn),
                     is_delegated: false,
                     delegation_before_first_txn: false,
                 });
@@ -634,9 +622,9 @@ where
 mod test {
     use std::{collections::BTreeMap, time::Duration};
 
-    use alloy_consensus::Signed;
+    use alloy_consensus::{transaction::SignerRecoverable, Signed};
     use alloy_eips::eip7702::SignedAuthorization;
-    use alloy_primitives::{Address, FixedBytes, PrimitiveSignature, B256, U256};
+    use alloy_primitives::{Address, FixedBytes, Signature, B256, U256};
     use itertools::{FoldWhile, Itertools};
     use monad_chain_config::{
         revision::{ChainParams, MockChainRevision},
@@ -683,9 +671,9 @@ mod test {
             GENESIS_SEQ_NUM + SeqNum(1),
             1,
             RoundSignature::new(Round(1), &nop_keypair),
-            Some(BASE_FEE as u64),
-            Some(BASE_FEE_TREND),
-            Some(BASE_FEE_MOMENT),
+            BASE_FEE as u64,
+            BASE_FEE_TREND,
+            BASE_FEE_MOMENT,
         )
     }
 
@@ -719,9 +707,9 @@ mod test {
         let txs = vec![txn1, txn2];
         let payload = ConsensusBlockBody::new(ConsensusBlockBodyInner {
             execution_body: EthBlockBody {
-                transactions: txs,
-                ommers: Vec::new(),
-                withdrawals: Vec::new(),
+                transactions: txs.into(),
+                ommers: Default::default(),
+                withdrawals: Default::default(),
             },
         });
         let header = get_header(payload.get_id());
@@ -770,9 +758,9 @@ mod test {
         let txs = vec![txn1, txn2, txn3];
         let payload = ConsensusBlockBody::new(ConsensusBlockBodyInner {
             execution_body: EthBlockBody {
-                transactions: txs,
-                ommers: Vec::new(),
-                withdrawals: Vec::new(),
+                transactions: txs.into(),
+                ommers: Default::default(),
+                withdrawals: Default::default(),
             },
         });
         let header = get_header(payload.get_id());
@@ -811,9 +799,9 @@ mod test {
         let txs = vec![txn1, txn2];
         let payload = ConsensusBlockBody::new(ConsensusBlockBodyInner {
             execution_body: EthBlockBody {
-                transactions: txs,
-                ommers: Vec::new(),
-                withdrawals: Vec::new(),
+                transactions: txs.into(),
+                ommers: Default::default(),
+                withdrawals: Default::default(),
             },
         });
         let header = get_header(payload.get_id());
@@ -855,9 +843,9 @@ mod test {
         let txs = vec![txn1, txn2];
         let payload = ConsensusBlockBody::new(ConsensusBlockBodyInner {
             execution_body: EthBlockBody {
-                transactions: txs,
-                ommers: Vec::new(),
-                withdrawals: Vec::new(),
+                transactions: txs.into(),
+                ommers: Default::default(),
+                withdrawals: Default::default(),
             },
         });
         let header = get_header(payload.get_id());
@@ -903,9 +891,9 @@ mod test {
         let txs = vec![txn1, txn2];
         let payload = ConsensusBlockBody::new(ConsensusBlockBodyInner {
             execution_body: EthBlockBody {
-                transactions: txs,
-                ommers: Vec::new(),
-                withdrawals: Vec::new(),
+                transactions: txs.into(),
+                ommers: Default::default(),
+                withdrawals: Default::default(),
             },
         });
         let header = get_header(payload.get_id());
@@ -935,9 +923,9 @@ mod test {
         let txs = vec![txn1, txn2];
         let payload = ConsensusBlockBody::new(ConsensusBlockBodyInner {
             execution_body: EthBlockBody {
-                transactions: txs,
-                ommers: Vec::new(),
-                withdrawals: Vec::new(),
+                transactions: txs.into(),
+                ommers: Default::default(),
+                withdrawals: Default::default(),
             },
         });
         let header = get_header(payload.get_id());
@@ -978,9 +966,9 @@ mod test {
         let txs = vec![txn1];
         let payload = ConsensusBlockBody::new(ConsensusBlockBodyInner {
             execution_body: EthBlockBody {
-                transactions: txs,
-                ommers: Vec::new(),
-                withdrawals: Vec::new(),
+                transactions: txs.into(),
+                ommers: Default::default(),
+                withdrawals: Default::default(),
             },
         });
         let header = get_header(payload.get_id());
@@ -1008,9 +996,9 @@ mod test {
         let txs = vec![valid_txn.clone()];
         let payload = ConsensusBlockBody::new(ConsensusBlockBodyInner {
             execution_body: EthBlockBody {
-                transactions: txs,
-                ommers: Vec::new(),
-                withdrawals: Vec::new(),
+                transactions: txs.into(),
+                ommers: Default::default(),
+                withdrawals: Default::default(),
             },
         });
         let header = get_header(payload.get_id());
@@ -1035,7 +1023,7 @@ mod test {
         let new_s = secp256k1_n.saturating_sub(original_signature.s());
 
         // form the new signature and transaction
-        let invalid_signature = PrimitiveSignature::from_scalars_and_parity(
+        let invalid_signature = Signature::from_scalars_and_parity(
             original_signature.r().into(),
             new_s.into(),
             !original_signature.v(),
@@ -1046,17 +1034,17 @@ mod test {
 
         // both transactions recover to the same signer
         assert_eq!(
-            valid_txn.recover_signer().unwrap(),
-            invalid_txn.recover_signer().unwrap()
+            valid_txn.recover_signer_unchecked().unwrap(),
+            invalid_txn.recover_signer_unchecked().unwrap()
         );
 
         // create a block with the above transaction
         let txs = vec![invalid_txn];
         let payload = ConsensusBlockBody::new(ConsensusBlockBodyInner {
             execution_body: EthBlockBody {
-                transactions: txs,
-                ommers: Vec::new(),
-                withdrawals: Vec::new(),
+                transactions: txs.into(),
+                ommers: Default::default(),
+                withdrawals: Default::default(),
             },
         });
         let header = get_header(payload.get_id());
@@ -1108,9 +1096,9 @@ mod test {
         let txs = vec![txn1, txn2, txn3];
         let payload = ConsensusBlockBody::new(ConsensusBlockBodyInner {
             execution_body: EthBlockBody {
-                transactions: txs,
-                ommers: Vec::new(),
-                withdrawals: Vec::new(),
+                transactions: txs.into(),
+                ommers: Default::default(),
+                withdrawals: Default::default(),
             },
         });
         let header = get_header(payload.get_id());
@@ -1154,9 +1142,9 @@ mod test {
         let txs = vec![txn1, txn2, txn3];
         let payload = ConsensusBlockBody::new(ConsensusBlockBodyInner {
             execution_body: EthBlockBody {
-                transactions: txs,
-                ommers: Vec::new(),
-                withdrawals: Vec::new(),
+                transactions: txs.into(),
+                ommers: Default::default(),
+                withdrawals: Default::default(),
             },
         });
         let header = get_header(payload.get_id());
@@ -1200,9 +1188,9 @@ mod test {
         let txs = vec![txn1, txn2, txn3];
         let payload = ConsensusBlockBody::new(ConsensusBlockBodyInner {
             execution_body: EthBlockBody {
-                transactions: txs,
-                ommers: Vec::new(),
-                withdrawals: Vec::new(),
+                transactions: txs.into(),
+                ommers: Default::default(),
+                withdrawals: Default::default(),
             },
         });
         let header = get_header(payload.get_id());
@@ -1248,9 +1236,9 @@ mod test {
         let txs = vec![txn1, txn2, txn3, txn4];
         let payload = ConsensusBlockBody::new(ConsensusBlockBodyInner {
             execution_body: EthBlockBody {
-                transactions: txs,
-                ommers: Vec::new(),
-                withdrawals: Vec::new(),
+                transactions: txs.into(),
+                ommers: Default::default(),
+                withdrawals: Default::default(),
             },
         });
         let header = get_header(payload.get_id());
@@ -1301,9 +1289,9 @@ mod test {
         let txs = vec![txn1, txn2, txn3, txn4];
         let payload = ConsensusBlockBody::new(ConsensusBlockBodyInner {
             execution_body: EthBlockBody {
-                transactions: txs,
-                ommers: Vec::new(),
-                withdrawals: Vec::new(),
+                transactions: txs.into(),
+                ommers: Default::default(),
+                withdrawals: Default::default(),
             },
         });
         let header = get_header(payload.get_id());
@@ -1386,9 +1374,9 @@ mod test {
         // payload with empty transactions
         let payload = ConsensusBlockBody::new(ConsensusBlockBodyInner {
             execution_body: EthBlockBody {
-                transactions: Vec::new(),
-                ommers: Vec::new(),
-                withdrawals: Vec::new(),
+                transactions: Default::default(),
+                ommers: Default::default(),
+                withdrawals: Default::default(),
             },
         });
 
@@ -1438,9 +1426,9 @@ mod test {
             seq_num,
             timestamp_ns,
             round_signature,
-            Some(consensus_base_fee),
-            Some(BASE_FEE_TREND),
-            Some(BASE_FEE_MOMENT),
+            consensus_base_fee,
+            BASE_FEE_TREND,
+            BASE_FEE_MOMENT,
         );
 
         let result =

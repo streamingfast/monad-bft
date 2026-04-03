@@ -19,6 +19,7 @@ pub use alloy_consensus::{Receipt, SignableTransaction, TxEip1559};
 pub use alloy_primitives::{Bloom, Log, LogData, B256};
 pub use alloy_signer::SignerSync;
 pub use alloy_signer_local::PrivateKeySigner;
+use monad_eth_types::{ReceiptWithLogIndex, TxEnvelopeWithSender};
 use mongodb::{options::ClientOptions, Client};
 
 pub use crate::{kvstore::memory::MemoryStorage, prelude::*};
@@ -40,7 +41,7 @@ pub fn mock_tx(salt: u64) -> TxEnvelopeWithSender {
     }
 }
 
-pub fn mock_rx(receipt_len: usize, cumulative_gas: u128) -> ReceiptWithLogIndex {
+pub fn mock_rx(receipt_len: usize, cumulative_gas: u64) -> ReceiptWithLogIndex {
     let receipt = ReceiptEnvelope::Eip1559(ReceiptWithBloom::new(
         Receipt::<Log> {
             logs: vec![Log {

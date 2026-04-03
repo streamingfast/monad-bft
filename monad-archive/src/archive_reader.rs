@@ -15,7 +15,7 @@
 
 use alloy_primitives::BlockHash;
 use eyre::Result;
-use monad_triedb_utils::triedb_env::ReceiptWithLogIndex;
+use monad_eth_types::{ReceiptWithLogIndex, TxEnvelopeWithSender};
 use tracing::trace;
 
 use crate::{
@@ -166,7 +166,7 @@ impl ArchiveReader {
             read_timeout_secs: 2,
             ..Default::default()
         };
-        let config = args.config().await;
+        let config = args.config().await?;
         let block_data_reader =
             BlockDataArchive::new(Bucket::new(bucket.clone(), &config, Metrics::none()));
 

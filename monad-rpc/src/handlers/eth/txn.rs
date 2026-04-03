@@ -15,103 +15,27 @@
 
 use std::time::Duration;
 
-use alloy_consensus::{ReceiptEnvelope, ReceiptWithBloom, Transaction as _, TxEnvelope};
-use alloy_primitives::{Address, FixedBytes, TxKind};
-use alloy_rlp::Decodable;
-use alloy_rpc_types::{Filter, Log, Receipt, TransactionReceipt};
+use alloy_consensus::{Transaction as _, TxEnvelope};
+use alloy_eips::Decodable2718;
+use alloy_primitives::{Address, FixedBytes};
+use alloy_rpc_types::{Filter, TransactionReceipt};
 use monad_rpc_docs::rpc;
-use monad_triedb_utils::triedb_env::{ReceiptWithLogIndex, Triedb, TxEnvelopeWithSender};
+use monad_triedb_utils::triedb_env::Triedb;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, trace, warn};
 
 use crate::{
     chainstate::{ChainState, ChainStateError},
-    eth_json_types::{
-        BlockTagOrHash, BlockTags, EthHash, MonadLog, MonadTransaction, MonadTransactionReceipt,
-        Quantity, UnformattedData,
-    },
-    jsonrpc::{ChainStateResultMap, JsonRpcError, JsonRpcResult},
     txpool::{EthTxPoolBridgeClient, TxStatus},
-};
-
-pub fn parse_tx_receipt(
-    block_hash: FixedBytes<32>,
-    block_num: u64,
-    block_timestamp: Option<u64>,
-    base_fee_per_gas: Option<u64>,
-    tx_index: u64,
-    tx: TxEnvelopeWithSender,
-    receipt: ReceiptWithLogIndex,
-    gas_used: u128,
-) -> TransactionReceipt {
-    let TxEnvelopeWithSender { tx, sender } = tx;
-
-    let ReceiptWithLogIndex {
-        receipt,
-        starting_log_index,
-    } = receipt;
-
-    let block_hash = Some(block_hash);
-    let block_number = Some(block_num);
-
-    let logs: Vec<Log> = receipt
-        .logs()
-        .iter()
-        .enumerate()
-        .map(|(log_index, log)| Log {
-            inner: log.clone(),
-            block_hash,
-            block_number,
-            block_timestamp,
-            transaction_hash: Some(*tx.tx_hash()),
-            transaction_index: Some(tx_index),
-            log_index: Some(starting_log_index + log_index as u64),
-            removed: Default::default(),
-        })
-        .collect();
-
-    let contract_address = match tx.kind() {
-        TxKind::Create => Some(sender.create(tx.nonce())),
-        _ => None,
-    };
-
-    let receipt_with_bloom = ReceiptWithBloom {
-        receipt: Receipt {
-            status: receipt.status().into(),
-            cumulative_gas_used: receipt.cumulative_gas_used(),
-            logs,
+    types::{
+        eth_json::{
+            BlockTagOrHash, BlockTags, EthHash, MonadLog, MonadTransaction,
+            MonadTransactionReceipt, Quantity, UnformattedData,
         },
-        logs_bloom: *receipt.logs_bloom(),
-    };
-
-    let inner_receipt: ReceiptEnvelope<Log> = match receipt {
-        ReceiptEnvelope::Legacy(_) => ReceiptEnvelope::Legacy(receipt_with_bloom),
-        ReceiptEnvelope::Eip2930(_) => ReceiptEnvelope::Eip2930(receipt_with_bloom),
-        ReceiptEnvelope::Eip1559(_) => ReceiptEnvelope::Eip1559(receipt_with_bloom),
-        ReceiptEnvelope::Eip7702(_) => ReceiptEnvelope::Eip7702(receipt_with_bloom),
-        _ => ReceiptEnvelope::Eip1559(receipt_with_bloom),
-    };
-
-    let tx_receipt = TransactionReceipt {
-        inner: inner_receipt,
-        transaction_hash: *tx.tx_hash(),
-        transaction_index: Some(tx_index),
-        block_hash,
-        block_number,
-        from: sender,
-        to: tx.to(),
-        contract_address,
-        gas_used,
-        // effective gas price is calculated according to eth json rpc specification
-        effective_gas_price: tx.effective_gas_price(base_fee_per_gas),
-        // TODO: EIP4844 fields
-        blob_gas_used: None,
-        blob_gas_price: None,
-        authorization_list: tx.authorization_list().map(|s| s.to_vec()),
-    };
-    tx_receipt
-}
+        jsonrpc::{ChainStateResultMap, JsonRpcError, JsonRpcResult},
+    },
+};
 
 pub enum FilterError {
     InvalidBlockRange,
@@ -226,7 +150,7 @@ fn validate_and_decode_tx(
     allow_unprotected_txs: bool,
     decode_error_fn: impl FnOnce() -> JsonRpcError,
 ) -> Result<TxEnvelope, JsonRpcError> {
-    let tx = TxEnvelope::decode(&mut &hex_tx[..]).map_err(|err| {
+    let tx = TxEnvelope::decode_2718_exact(hex_tx).map_err(|err| {
         debug!(?err, "eth txn decode failed");
         decode_error_fn()
     })?;
@@ -477,7 +401,7 @@ pub async fn monad_eth_getTransactionByBlockNumberAndIndex<T: Triedb>(
 
     chain_state
         .get_transaction_with_block_and_index(
-            crate::eth_json_types::BlockTagOrHash::BlockTags(params.block_tag),
+            crate::types::eth_json::BlockTagOrHash::BlockTags(params.block_tag),
             params.index.0,
         )
         .await
@@ -492,14 +416,15 @@ mod tests {
     use alloy_rlp::Encodable;
     use alloy_signer::SignerSync;
     use alloy_signer_local::PrivateKeySigner;
-    use monad_triedb_utils::{mock_triedb::MockTriedb, triedb_env::Account};
+    use monad_eth_types::EthAccount;
+    use monad_triedb_utils::mock_triedb::MockTriedb;
 
     use super::{
         monad_eth_sendRawTransaction, monad_eth_sendRawTransactionSync,
         MonadEthSendRawTransactionParams, MonadEthSendRawTransactionSyncParams,
     };
     use crate::{
-        chainstate::ChainState, eth_json_types::UnformattedData, txpool::EthTxPoolBridgeClient,
+        chainstate::ChainState, txpool::EthTxPoolBridgeClient, types::eth_json::UnformattedData,
     };
 
     fn serialize_tx(tx: impl Encodable + Encodable2718) -> UnformattedData {
@@ -543,7 +468,7 @@ mod tests {
 
         triedb.set_account(
             signer.address().0.into(),
-            Account {
+            EthAccount {
                 nonce: 10,
                 ..Default::default()
             },
@@ -586,7 +511,7 @@ mod tests {
 
         triedb.set_account(
             signer.address().0.into(),
-            Account {
+            EthAccount {
                 nonce: 10,
                 ..Default::default()
             },

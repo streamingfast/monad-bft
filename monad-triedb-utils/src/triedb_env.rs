@@ -25,13 +25,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy_consensus::{Header, ReceiptEnvelope, TxEnvelope};
-use alloy_primitives::{keccak256, Address, FixedBytes, U256};
-use alloy_rlp::{encode_list, BytesMut, Decodable, Encodable};
+use alloy_consensus::Header;
+use alloy_primitives::keccak256;
+use alloy_rlp::Decodable;
 use futures::{channel::oneshot, FutureExt};
+use monad_eth_types::{
+    BlockHeader, EthAccount, EthAddress, EthBlockHash, EthCodeHash, EthStorageKey, EthTxHash,
+    ReceiptWithLogIndex, TransactionLocation, TxEnvelopeWithSender,
+};
 use monad_triedb::{TraverseEntry, TriedbHandle};
 use monad_types::{BlockId, Hash, SeqNum};
-use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
 
 use crate::{
@@ -41,12 +44,6 @@ use crate::{
     },
     key::{create_range_key, create_triedb_key, KeyInput, Version},
 };
-
-pub type EthAddress = [u8; 20];
-pub type EthStorageKey = [u8; 32];
-pub type EthCodeHash = [u8; 32];
-pub type EthTxHash = [u8; 32];
-pub type EthBlockHash = [u8; 32];
 
 enum TriedbRequest {
     AsyncRangeGetRequest(RangeGetRequest),
@@ -91,106 +88,6 @@ struct AsyncRequest {
     block_key: BlockKey,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct Account {
-    pub nonce: u64,
-    pub balance: U256,
-    pub code_hash: [u8; 32],
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct BlockHeader {
-    pub hash: FixedBytes<32>,
-    pub header: Header,
-}
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct TransactionLocation {
-    pub tx_index: u64,
-    pub block_num: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReceiptWithLogIndex {
-    pub receipt: ReceiptEnvelope,
-    pub starting_log_index: u64,
-}
-
-impl Encodable for ReceiptWithLogIndex {
-    fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
-        let mut encoded_receipt: BytesMut = BytesMut::new();
-        self.receipt.encode(&mut encoded_receipt);
-        let enc: [&dyn Encodable; 2] = [&encoded_receipt, &self.starting_log_index];
-        encode_list::<_, dyn Encodable>(&enc, out);
-    }
-}
-
-impl Decodable for ReceiptWithLogIndex {
-    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
-        let alloy_rlp::Header {
-            list,
-            payload_length: _,
-        } = alloy_rlp::Header::decode(buf)?;
-        if !list {
-            return Err(alloy_rlp::Error::UnexpectedString);
-        }
-
-        let alloy_rlp::Header {
-            list,
-            payload_length: _,
-        } = alloy_rlp::Header::decode(buf)?;
-        if list {
-            return Err(alloy_rlp::Error::UnexpectedList);
-        }
-        let receipt = ReceiptEnvelope::decode(buf)?;
-        let starting_log_index = u64::decode(buf)?;
-
-        Ok(ReceiptWithLogIndex {
-            receipt,
-            starting_log_index,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TxEnvelopeWithSender {
-    pub tx: TxEnvelope,
-    pub sender: Address,
-}
-
-impl Encodable for TxEnvelopeWithSender {
-    fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
-        let mut encoded_tx: BytesMut = BytesMut::new();
-        self.tx.encode(&mut encoded_tx);
-        let enc: [&dyn Encodable; 2] = [&encoded_tx, &self.sender];
-        encode_list::<_, dyn Encodable>(&enc, out);
-    }
-}
-
-impl Decodable for TxEnvelopeWithSender {
-    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
-        let alloy_rlp::Header {
-            list,
-            payload_length: _,
-        } = alloy_rlp::Header::decode(buf)?;
-        if !list {
-            return Err(alloy_rlp::Error::UnexpectedString);
-        }
-
-        let alloy_rlp::Header {
-            list,
-            payload_length: _,
-        } = alloy_rlp::Header::decode(buf)?;
-        if list {
-            return Err(alloy_rlp::Error::UnexpectedList);
-        }
-        let tx = TxEnvelope::decode(buf)?;
-        let sender = Address::decode(buf)?;
-
-        Ok(TxEnvelopeWithSender { tx, sender })
-    }
-}
-
 const MAX_QUEUE_BEFORE_POLL: usize = 100;
 const MAX_POLL_COMPLETIONS: usize = usize::MAX;
 const META_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -205,6 +102,19 @@ fn get_latest_voted_block_key(triedb_handle: &TriedbHandle) -> Option<ProposedBl
     Some(ProposedBlockKey(
         latest_voted_seq_num,
         latest_voted_id_before,
+    ))
+}
+
+fn get_latest_proposed_block_key(triedb_handle: &TriedbHandle) -> Option<ProposedBlockKey> {
+    let latest_proposed_id_before = BlockId(Hash(triedb_handle.latest_proposed_block_id()?));
+    let latest_proposed_seq_num = SeqNum(triedb_handle.latest_proposed_block()?);
+    let latest_proposed_id_after = BlockId(Hash(triedb_handle.latest_proposed_block_id()?));
+    if latest_proposed_id_before != latest_proposed_id_after {
+        return None;
+    }
+    Some(ProposedBlockKey(
+        latest_proposed_seq_num,
+        latest_proposed_id_before,
     ))
 }
 
@@ -226,9 +136,13 @@ fn polling_thread(
     let triedb_async_traverse_concurrency_tracker: Arc<()> = Arc::new(());
 
     let mut last_meta_updated = Instant::now();
-    let (mut last_finalized, mut last_voted) = {
+    let (mut last_finalized, mut last_voted, mut last_proposed) = {
         let meta = meta.lock().expect("poller mutex poisoned");
-        (meta.latest_finalized, meta.latest_voted)
+        (
+            meta.latest_finalized,
+            meta.latest_voted,
+            meta.latest_proposed,
+        )
     };
 
     loop {
@@ -245,11 +159,21 @@ fn polling_thread(
                 // retry in case of a race
             }
 
+            let mut latest_proposed = latest_voted;
+            for _ in 0..3 {
+                if let Some(proposed) = get_latest_proposed_block_key(&triedb_handle) {
+                    latest_proposed = BlockKey::Proposed(proposed);
+                    break;
+                }
+                // retry in case of a race
+            }
+
             last_meta_updated = Instant::now();
 
             let finalized_is_updated = last_finalized != latest_finalized;
             let voted_is_updated = last_voted != latest_voted;
-            if finalized_is_updated || voted_is_updated {
+            let proposed_is_updated = last_proposed != latest_proposed;
+            if finalized_is_updated || voted_is_updated || proposed_is_updated {
                 if finalized_is_updated {
                     last_finalized = latest_finalized;
                     populate_cache(
@@ -271,9 +195,22 @@ fn polling_thread(
                     }
                 }
 
+                if proposed_is_updated {
+                    last_proposed = latest_proposed;
+                    if let BlockKey::Proposed(_) = latest_proposed {
+                        populate_cache(
+                            &tokio_handle,
+                            &triedb_handle,
+                            meta.clone(),
+                            latest_proposed,
+                        );
+                    }
+                }
+
                 let mut meta = meta.lock().expect("triedb poller mutex poisoned");
                 meta.latest_finalized = latest_finalized;
                 meta.latest_voted = latest_voted;
+                meta.latest_proposed = latest_proposed;
                 while meta
                     .voted_proposals
                     .first_key_value()
@@ -492,6 +429,7 @@ pub trait Triedb: Debug {
     fn get_latest_finalized_block_key(&self) -> FinalizedBlockKey;
     /// returns a FinalizedBlockKey if latest_voted doesn't exist
     fn get_latest_voted_block_key(&self) -> BlockKey;
+    fn get_latest_proposed_block_key(&self) -> BlockKey;
     /// returns None if block number was never known to be valid
     /// a known-to-be-finalized BlockKey will never return None
     ///
@@ -512,7 +450,7 @@ pub trait Triedb: Debug {
         &self,
         key: BlockKey,
         addr: EthAddress,
-    ) -> impl std::future::Future<Output = Result<Account, String>> + Send;
+    ) -> impl std::future::Future<Output = Result<EthAccount, String>> + Send;
     fn get_storage_at(
         &self,
         key: BlockKey,
@@ -585,6 +523,7 @@ pub struct TriedbEnv {
 struct TriedbEnvMeta {
     latest_finalized: FinalizedBlockKey,
     latest_voted: BlockKey,
+    latest_proposed: BlockKey,
     voted_proposals: BTreeMap<SeqNum, BlockId>,
 
     cache_manager: CacheManager,
@@ -674,14 +613,16 @@ impl TriedbEnv {
         max_finalized_block_cache_len: usize,
         max_voted_block_cache_len: usize,
     ) -> Self {
-        let latest_finalized = {
-            let triedb_handle: TriedbHandle = TriedbHandle::try_new(triedb_path, node_lru_max_mem)
-                .expect("triedb should exist in path");
-            SeqNum(triedb_handle.latest_finalized_block().unwrap_or_default())
-        };
+        let triedb_handle: TriedbHandle = TriedbHandle::try_new(triedb_path, node_lru_max_mem)
+            .expect("triedb should exist in path");
+        let latest_finalized = FinalizedBlockKey(SeqNum(
+            triedb_handle.latest_finalized_block().unwrap_or_default(),
+        ));
+
         let meta = Arc::new(Mutex::new(TriedbEnvMeta {
-            latest_finalized: FinalizedBlockKey(latest_finalized),
-            latest_voted: BlockKey::Finalized(FinalizedBlockKey(latest_finalized)),
+            latest_finalized,
+            latest_voted: BlockKey::Finalized(latest_finalized),
+            latest_proposed: BlockKey::Finalized(latest_finalized),
             voted_proposals: Default::default(),
             cache_manager: CacheManager::new(
                 max_finalized_block_cache_len,
@@ -932,6 +873,10 @@ impl Triedb for TriedbEnv {
         let meta = self.meta.lock().expect("mutex poisoned");
         meta.latest_voted
     }
+    fn get_latest_proposed_block_key(&self) -> BlockKey {
+        let meta = self.meta.lock().expect("mutex poisoned");
+        meta.latest_proposed
+    }
     fn get_block_key(&self, seq_num: SeqNum) -> Option<BlockKey> {
         let meta = self.meta.lock().expect("mutex poisoned");
         if let Some(&voted_block_id) = meta.voted_proposals.get(&seq_num) {
@@ -943,6 +888,8 @@ impl Triedb for TriedbEnv {
         } else if seq_num <= meta.latest_finalized.0 {
             // this seq_num is finalized
             Some(BlockKey::Finalized(FinalizedBlockKey(seq_num)))
+        } else if seq_num == *meta.latest_proposed.seq_num() {
+            Some(meta.latest_proposed)
         } else {
             // get_block_key must return a state that was valid at some point
             // thus, it's not safe to default to finalized
@@ -961,20 +908,16 @@ impl Triedb for TriedbEnv {
     }
 
     #[tracing::instrument(level = "debug")]
-    async fn get_account(&self, block_key: BlockKey, addr: EthAddress) -> Result<Account, String> {
-        match self
-            .handle_async_request(block_key, KeyInput::Address(&addr), |data| {
-                rlp_decode_account(data).ok_or_else(|| String::from("Decoding account error"))
-            })
-            .await?
-        {
-            Some(account) => Ok(Account {
-                nonce: account.nonce,
-                balance: account.balance,
-                code_hash: account.code_hash.map_or([0u8; 32], |bytes| bytes.0),
-            }),
-            None => Ok(Account::default()),
-        }
+    async fn get_account(
+        &self,
+        block_key: BlockKey,
+        addr: EthAddress,
+    ) -> Result<EthAccount, String> {
+        self.handle_async_request(block_key, KeyInput::Address(&addr), |data| {
+            rlp_decode_account(data).ok_or_else(|| String::from("Decoding account error"))
+        })
+        .await
+        .map(Option::unwrap_or_default)
     }
 
     #[tracing::instrument(level = "debug")]

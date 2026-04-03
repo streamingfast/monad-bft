@@ -36,9 +36,12 @@ use monad_peer_discovery::mock::NopDiscovery;
 use monad_raptorcast::{
     create_dataplane_for_tests, new_defaulted_raptorcast_for_tests,
     packet::build_messages,
-    raptorcast_secondary::{group_message::FullNodesGroupMessage, SecondaryOutboundMessage},
+    raptorcast_secondary::{
+        group_message::FullNodesGroupMessage, SecondaryOutboundMessage,
+        SecondaryRaptorCastModeConfig,
+    },
     udp::{GroupId, MAX_REDUNDANCY},
-    util::{BuildTarget, EpochValidators, Group, Redundancy},
+    util::{BuildTarget, Redundancy, SecondaryGroup, SecondaryGroupAssignment},
     DataplaneHandles, RaptorCast, RaptorCastEvent,
 };
 use monad_secp::{KeyPair, SecpSignature};
@@ -83,11 +86,7 @@ pub fn different_symbol_sizes() {
         };
 
         let valset = BTreeMap::from([(rx_nodeid, Stake::ONE), (tx_nodeid, Stake::ONE)]);
-        let validators = EpochValidators {
-            validators: ValidatorSet::new_unchecked(valset),
-        };
-
-        let epoch_validators = validators.view_without(vec![&tx_nodeid]);
+        let validators = ValidatorSet::new_unchecked(valset);
 
         let messages = build_messages::<SignatureType>(
             &tx_keypair,
@@ -96,7 +95,7 @@ pub fn different_symbol_sizes() {
             Redundancy::from_u8(2),
             GroupId::Primary(Epoch(0)), // epoch_no
             0,                          // unix_ts_ms
-            BuildTarget::Raptorcast(epoch_validators),
+            BuildTarget::Raptorcast(&validators),
             &known_addresses,
         );
 
@@ -141,11 +140,7 @@ pub fn buffer_count_overflow() {
     let tx_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
 
     let valset = BTreeMap::from([(rx_nodeid, Stake::ONE), (tx_nodeid, Stake::ONE)]);
-    let validators = EpochValidators {
-        validators: ValidatorSet::new_unchecked(valset),
-    };
-
-    let epoch_validators = validators.view_without(vec![&tx_nodeid]);
+    let validators = ValidatorSet::new_unchecked(valset);
 
     let messages = build_messages::<SignatureType>(
         &tx_keypair,
@@ -154,7 +149,7 @@ pub fn buffer_count_overflow() {
         Redundancy::from_u8(2),
         GroupId::Primary(Epoch(0)), // epoch_no
         0,                          // unix_ts_ms
-        BuildTarget::Raptorcast(epoch_validators),
+        BuildTarget::Raptorcast(&validators),
         &known_addresses,
     );
 
@@ -215,11 +210,7 @@ pub fn valid_rebroadcast() {
         .unwrap();
 
     let valset = BTreeMap::from([(rx_nodeid, Stake::ONE), (tx_nodeid, Stake::ONE)]);
-    let validators = EpochValidators {
-        validators: ValidatorSet::new_unchecked(valset),
-    };
-
-    let epoch_validators = validators.view_without(vec![&tx_nodeid]);
+    let validators = ValidatorSet::new_unchecked(valset);
 
     let messages = build_messages::<SignatureType>(
         &tx_keypair,
@@ -228,7 +219,7 @@ pub fn valid_rebroadcast() {
         MAX_REDUNDANCY,             // redundancy,
         GroupId::Primary(Epoch(0)), // epoch_no
         0,                          // unix_ts_ms
-        BuildTarget::Raptorcast(epoch_validators),
+        BuildTarget::Raptorcast(&validators),
         &known_addresses,
     );
 
@@ -584,28 +575,23 @@ async fn delete_expired_groups() {
     raptorcast.exec(vec![RouterCommand::UpdateCurrentRound(Epoch(1), Round(1))]);
 
     // setup
-    let (send_net_messages, _) = unbounded_channel::<FullNodesGroupMessage<SignatureType>>();
-    let (send_group_infos, recv_group_infos) = unbounded_channel::<Group<PubKeyType>>();
+    let (send_group_messages, _) = unbounded_channel::<FullNodesGroupMessage<SignatureType>>();
+    let (send_group_infos, recv_group_infos) =
+        unbounded_channel::<SecondaryGroupAssignment<PubKeyType>>();
     let (_, recv_outbound_from_secondary) =
         unbounded_channel::<SecondaryOutboundMessage<PubKeyType>>();
-    raptorcast.set_is_dynamic_full_node(true);
     raptorcast.bind_channel_to_secondary_raptorcast(
-        send_net_messages,
+        SecondaryRaptorCastModeConfig::Client,
+        send_group_messages,
         recv_group_infos,
         recv_outbound_from_secondary,
     );
 
     // populate raptorcast group
-    let group = Group::new_fullnode_group(
-        vec![],
-        &node_id,
-        node_id,
-        RoundSpan {
-            start: Round(1),
-            end: Round(10),
-        },
-    );
-    send_group_infos.send(group).unwrap();
+    let round_span = RoundSpan::new(Round(1), Round(10)).unwrap();
+    let group = SecondaryGroup::new([node_id].into_iter().collect()).unwrap();
+    let assignment = SecondaryGroupAssignment::new(node_id, round_span, group);
+    send_group_infos.send(assignment).unwrap();
 
     loop {
         tokio::select! {
@@ -615,19 +601,22 @@ async fn delete_expired_groups() {
         }
     }
 
-    let rebroadcast_map = raptorcast.get_rebroadcast_groups().get_fullnode_map();
+    let full_node_groups = raptorcast.get_full_node_groups();
     assert_eq!(
-        rebroadcast_map.len(),
+        full_node_groups.len(),
         1,
-        "Expected one group in rebroadcast map"
+        "Expected one group in full node groups"
     );
 
     // round increment beyond group end round
     raptorcast.exec(vec![RouterCommand::UpdateCurrentRound(Epoch(1), Round(11))]);
-    let rebroadcast_map = raptorcast.get_rebroadcast_groups().get_fullnode_map();
+    let full_node_groups = raptorcast.get_full_node_groups();
 
     // expired group should be deleted
-    assert!(rebroadcast_map.is_empty(), "Expected empty rebroadcast map");
+    assert!(
+        full_node_groups.is_empty(),
+        "Expected empty full node groups"
+    );
 }
 
 #[tokio::test]

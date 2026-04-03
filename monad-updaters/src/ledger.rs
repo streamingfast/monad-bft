@@ -34,7 +34,7 @@ use monad_crypto::certificate_signature::{
 };
 use monad_executor::{Executor, ExecutorMetricsChain};
 use monad_executor_glue::{BlockSyncEvent, LedgerCommand, MonadEvent};
-use monad_state_backend::{InMemoryState, StateBackendTest};
+use monad_state_backend::{InMemoryState, MockExecution};
 use monad_types::{BlockId, ExecutionProtocol, SeqNum};
 use monad_validator::signature_collection::SignatureCollection;
 
@@ -178,13 +178,16 @@ where
     fn exec(&mut self, cmds: Vec<Self::Command>) {
         for cmd in cmds {
             match cmd {
-                LedgerCommand::LedgerCommit(OptimisticCommit::Proposed(block)) => {
+                LedgerCommand::LedgerCommit(OptimisticCommit::Proposed {
+                    block,
+                    is_canonical: _,
+                }) => {
                     self.state_backend.lock().unwrap().ledger_propose(
                         block.get_id(),
                         block.get_seq_num(),
                         block.get_block_round(),
                         block.get_parent_id(),
-                        BTreeMap::default(), // TODO parse out txs
+                        vec![], // TODO parse out txs
                     );
                     self.blocks.insert(block.get_id(), block);
                 }
@@ -217,6 +220,9 @@ where
                             self.get_headers(block_range),
                         ),
                     });
+                    if let Some(waker) = self.waker.take() {
+                        waker.wake();
+                    }
                 }
                 LedgerCommand::LedgerFetchPayload(payload_id) => {
                     self.events.push_back(BlockSyncEvent::SelfResponse {
@@ -224,6 +230,9 @@ where
                             self.get_payload(payload_id),
                         ),
                     });
+                    if let Some(waker) = self.waker.take() {
+                        waker.wake();
+                    }
                 }
             }
         }
@@ -247,9 +256,13 @@ where
         if let Some(event) = this.events.pop_front() {
             return Poll::Ready(Some(MonadEvent::BlockSyncEvent(event)));
         }
-        if this.waker.is_none() {
+
+        if let Some(waker) = this.waker.as_mut() {
+            waker.clone_from(cx.waker());
+        } else {
             this.waker = Some(cx.waker().clone());
         }
+
         Poll::Pending
     }
 }

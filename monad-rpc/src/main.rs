@@ -19,27 +19,27 @@ use actix_web::{web, App, HttpServer};
 use agent::AgentBuilder;
 use clap::Parser;
 use monad_archive::archive_reader::{redact_mongo_url, ArchiveReader};
-use monad_ethcall::EthCallExecutor;
-use monad_event_ring::EventRing;
+use monad_event_ring::{EventRing, EventRingPath};
 use monad_node_config::MonadNodeConfig;
 use monad_pprof::start_pprof_server;
 use monad_rpc::{
-    chainstate::{buffer::ChainStateBuffer, ChainState},
+    chainstate::{
+        buffer::ChainStateBuffer,
+        eth_call_handler::{EthCallHandler, EthCallHandlerConfig},
+        ChainState,
+    },
     comparator::RpcComparator,
     event::EventServer,
     handlers::{
         resources::{MonadJsonRootSpanBuilder, MonadRpcResources},
         rpc_handler,
     },
-    metrics,
-    timing::TimingMiddleware,
+    middleware::{DecompressionGuard, Metrics, TimingMiddleware},
     txpool::EthTxPoolBridge,
     websocket, MONAD_RPC_VERSION,
 };
 use monad_tracing_timing::TimingsLayer;
 use monad_triedb_utils::triedb_env::TriedbEnv;
-use opentelemetry::metrics::MeterProvider;
-use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 use tracing_actix_web::TracingLogger;
 use tracing_manytrace::{ManytraceLayer, TracingExtension};
@@ -123,11 +123,6 @@ async fn main() -> std::io::Result<()> {
         });
     }
 
-    // initialize concurrent requests limiter
-    let concurrent_requests_limiter = Arc::new(Semaphore::new(
-        args.eth_call_max_concurrent_requests as usize,
-    ));
-
     MONAD_RPC_VERSION.map(|v| info!("starting monad-rpc with version {}", v));
 
     let (txpool_bridge_client, _txpool_bridge_handle) = if let Some(ipc_path) = args.ipc_path {
@@ -155,7 +150,9 @@ async fn main() -> std::io::Result<()> {
         };
         (Some(txpool_bridge_client), Some(_txpool_bridge_handle))
     } else {
-        warn!("--ipc-path is not set, tx pool will be disabled. This means that the node will not be able to send transactions.");
+        warn!(
+            "--ipc-path is not set, tx pool will be disabled. This means that the node will not be able to send transactions."
+        );
         (None, None)
     };
 
@@ -264,57 +261,52 @@ async fn main() -> std::io::Result<()> {
         }
     };
 
-    let low_pool_config = monad_ethcall::PoolConfig {
-        num_threads: args.eth_call_executor_threads,
-        num_fibers: args.eth_call_executor_fibers,
-        timeout_sec: args.eth_call_executor_queuing_timeout,
-        queue_limit: args.eth_call_max_concurrent_requests,
-    };
-    let high_pool_config = monad_ethcall::PoolConfig {
-        num_threads: args.eth_call_high_executor_threads,
-        num_fibers: args.eth_call_high_executor_fibers,
-        timeout_sec: args.eth_call_high_executor_queuing_timeout,
-        queue_limit: args.eth_call_high_max_concurrent_requests,
-    };
-    let block_pool_config = monad_ethcall::PoolConfig {
-        num_threads: args.eth_trace_block_executor_threads,
-        num_fibers: args.eth_trace_block_executor_fibers,
-        timeout_sec: args.eth_trace_block_executor_queuing_timeout,
-        queue_limit: args.eth_trace_block_max_concurrent_requests,
-    };
-    let tx_exec_num_fibers = args.eth_trace_tx_executor_fibers;
-
-    let eth_call_executor = args.triedb_path.clone().as_deref().map(|path| {
-        Arc::new(EthCallExecutor::new(
-            low_pool_config,
-            high_pool_config,
-            block_pool_config,
-            tx_exec_num_fibers,
-            args.eth_call_executor_node_lru_max_mem,
-            path,
-        ))
+    let eth_call_handler = args.triedb_path.clone().as_deref().map(|triedb_path| {
+        EthCallHandler::new(
+            EthCallHandlerConfig {
+                enable_stats: args.enable_admin_eth_call_statistics,
+                pool_low: monad_ethcall::PoolConfig {
+                    num_threads: args.eth_call_executor_threads,
+                    num_fibers: args.eth_call_executor_fibers,
+                    timeout_sec: args.eth_call_executor_queuing_timeout,
+                    queue_limit: args.eth_call_max_concurrent_requests,
+                },
+                pool_high: monad_ethcall::PoolConfig {
+                    num_threads: args.eth_call_high_executor_threads,
+                    num_fibers: args.eth_call_high_executor_fibers,
+                    timeout_sec: args.eth_call_high_executor_queuing_timeout,
+                    queue_limit: args.eth_call_high_max_concurrent_requests,
+                },
+                pool_block: monad_ethcall::PoolConfig {
+                    num_threads: args.eth_trace_block_executor_threads,
+                    num_fibers: args.eth_trace_block_executor_fibers,
+                    timeout_sec: args.eth_trace_block_executor_queuing_timeout,
+                    queue_limit: args.eth_trace_block_max_concurrent_requests,
+                },
+                tx_exec_num_fibers: args.eth_trace_tx_executor_fibers,
+                node_cache_max_mem: args.eth_call_executor_node_lru_max_mem,
+                max_concurrent_permits: args.eth_call_max_concurrent_requests as usize,
+            },
+            triedb_path,
+        )
     });
 
-    let meter_provider: Option<opentelemetry_sdk::metrics::SdkMeterProvider> =
-        args.otel_endpoint.as_ref().map(|endpoint| {
-            let provider = metrics::build_otel_meter_provider(
-                endpoint,
-                node_config.node_name.clone(),
-                std::time::Duration::from_secs(5),
-            )
-            .expect("failed to build otel meter");
-            opentelemetry::global::set_meter_provider(provider.clone());
-            provider
-        });
+    let with_metrics = args.otel_endpoint.map(|otel_endpoint| {
+        Metrics::new_with_otel_endpoint(
+            otel_endpoint,
+            node_config.node_name.clone(),
+            std::time::Duration::from_secs(5),
+        )
+    });
 
-    let with_metrics = meter_provider
-        .as_ref()
-        .map(|provider| metrics::Metrics::new(provider.clone().meter("opentelemetry")));
+    let decompression_guard = DecompressionGuard::new(args.max_request_size);
 
     // Configure event ring, websocket server and event cache.
     let (events_client, events_for_cache) = if let Some(exec_event_path) = args.exec_event_path {
-        let event_ring =
-            EventRing::new_from_path(exec_event_path).expect("Execution event ring is ready");
+        let event_ring_path =
+            EventRingPath::resolve(exec_event_path).expect("Execution event ring path resolves");
+
+        let event_ring = EventRing::new(event_ring_path).expect("Execution event ring is ready");
 
         let events_client = EventServer::start(event_ring);
 
@@ -337,8 +329,20 @@ async fn main() -> std::io::Result<()> {
 
         let event_buffer2 = event_buffer.clone();
         tokio::spawn(async move {
-            while let Ok(event) = events_for_cache.recv().await {
-                event_buffer2.insert(event).await;
+            loop {
+                match events_for_cache.recv().await {
+                    Ok(event) => event_buffer2.insert(event).await,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(lag_count)) => {
+                        warn!(
+                            ?lag_count,
+                            "event server channel lagged, events will be missing"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        error!("event server closed");
+                        break;
+                    }
+                }
             }
         });
 
@@ -347,9 +351,7 @@ async fn main() -> std::io::Result<()> {
         None
     };
 
-    let chain_state = triedb_env
-        .clone()
-        .map(|t| ChainState::new(event_buffer, t, archive_reader.clone()));
+    let chain_state = triedb_env.map(|t| ChainState::new(event_buffer, t, archive_reader));
 
     let rpc_comparator: Option<RpcComparator> = args
         .rpc_comparison_endpoint
@@ -358,17 +360,12 @@ async fn main() -> std::io::Result<()> {
 
     let app_state = MonadRpcResources::new(
         txpool_bridge_client,
-        triedb_env,
-        eth_call_executor,
-        args.eth_call_executor_fibers as usize,
-        archive_reader,
+        eth_call_handler,
         node_config.chain_id,
         chain_state,
         args.batch_request_limit,
         args.max_response_size,
         args.allow_unprotected_txs,
-        concurrent_requests_limiter,
-        args.eth_call_max_concurrent_requests as usize,
         args.eth_get_logs_max_block_range,
         args.eth_call_provider_gas_limit,
         args.eth_estimate_gas_provider_gas_limit,
@@ -377,7 +374,6 @@ async fn main() -> std::io::Result<()> {
         args.dry_run_get_logs_index,
         args.use_eth_get_logs_index,
         args.max_finalized_block_cache_len,
-        args.enable_admin_eth_call_statistics,
         with_metrics.clone(),
         rpc_comparator.clone(),
     );
@@ -412,6 +408,7 @@ async fn main() -> std::io::Result<()> {
     let app = match with_metrics {
         Some(metrics) => HttpServer::new(move || {
             App::new()
+                .wrap(decompression_guard.clone())
                 .wrap(metrics.clone())
                 .wrap(TracingLogger::<MonadJsonRootSpanBuilder>::new())
                 .wrap(TimingMiddleware)
@@ -425,6 +422,7 @@ async fn main() -> std::io::Result<()> {
         .run(),
         None => HttpServer::new(move || {
             App::new()
+                .wrap(decompression_guard.clone())
                 .wrap(TracingLogger::<MonadJsonRootSpanBuilder>::new())
                 .wrap(TimingMiddleware)
                 .app_data(web::PayloadConfig::default().limit(args.max_request_size))
@@ -456,263 +454,4 @@ async fn main() -> std::io::Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-
-    use actix_http::{Request, StatusCode};
-    use actix_web::{
-        body::{to_bytes, MessageBody},
-        dev::{Service, ServiceResponse},
-        test, Error,
-    };
-    use jsonrpc::Response;
-    use monad_rpc::{
-        handlers::eth::call::EthCallStatsTracker,
-        jsonrpc::{self, JsonRpcError, RequestId, ResponseWrapper},
-        txpool::EthTxPoolBridgeClient,
-    };
-    use serde_json::{json, Value};
-    use test_case::test_case;
-
-    use super::*;
-
-    async fn init_server(
-    ) -> impl Service<Request, Response = ServiceResponse<impl MessageBody>, Error = Error> {
-        let app_state = MonadRpcResources {
-            txpool_bridge_client: Some(EthTxPoolBridgeClient::for_testing()),
-            triedb_reader: None,
-            eth_call_executor: None,
-            eth_call_executor_fibers: 64,
-            eth_call_stats_tracker: Some(Arc::new(EthCallStatsTracker::default())),
-            archive_reader: None,
-            chain_id: 1337,
-            chain_state: None,
-            batch_request_limit: 5,
-            max_response_size: 25_000_000,
-            allow_unprotected_txs: false,
-            rate_limiter: Arc::new(Semaphore::new(1000)),
-            total_permits: 1000,
-            logs_max_block_range: 1000,
-            eth_call_provider_gas_limit: u64::MAX,
-            eth_estimate_gas_provider_gas_limit: u64::MAX,
-            eth_send_raw_transaction_sync_default_timeout_ms: 2_000,
-            eth_send_raw_transaction_sync_max_timeout_ms: 10_000,
-            dry_run_get_logs_index: false,
-            use_eth_get_logs_index: false,
-            max_finalized_block_cache_len: 200,
-            enable_eth_call_statistics: true,
-            metrics: None,
-            rpc_comparator: None,
-        };
-
-        test::init_service(
-            App::new()
-                .wrap(TracingLogger::<MonadJsonRootSpanBuilder>::new())
-                .app_data(web::PayloadConfig::default().limit(2_000_000))
-                .app_data(web::Data::new(app_state.clone()))
-                .service(web::resource("/").route(web::post().to(rpc_handler))),
-        )
-        .await
-    }
-
-    async fn recover_response_body(
-        resp: ServiceResponse<impl MessageBody>,
-    ) -> ResponseWrapper<Response> {
-        let b = to_bytes(resp.into_body())
-            .await
-            .unwrap_or_else(|_| panic!("body to_bytes failed"));
-
-        ResponseWrapper::from_body_bytes(b).unwrap()
-    }
-
-    #[actix_web::test]
-    async fn test_rpc_request_size() {
-        let app = init_server().await;
-
-        // payload within limit
-        let payload = json!(
-            {
-                "jsonrpc": "2.0",
-                "method": "subtract",
-                "params": vec![1; 950_000],
-                "id": 1
-            }
-        );
-        let req = test::TestRequest::post()
-            .uri("/")
-            .set_payload(payload.to_string())
-            .to_request();
-        let resp = app.call(req).await.unwrap();
-        let resp = recover_response_body(resp).await;
-
-        match resp {
-            ResponseWrapper::Batch(_) => panic!("expected single response"),
-            ResponseWrapper::Single(resp) => match resp.error {
-                Some(e) => assert_eq!(e.code, -32601),
-                None => panic!("expected error in response"),
-            },
-        }
-
-        // payload too large
-        let payload = json!(
-            {
-                "jsonrpc": "2.0",
-                "method": "subtract",
-                "params": vec![1; 1_000_000],
-                "id": 1
-            }
-        );
-        let req = test::TestRequest::post()
-            .uri("/")
-            .set_payload(payload.to_string())
-            .to_request();
-        let resp = app.call(req).await.unwrap();
-        assert_eq!(resp.response().status(), StatusCode::from_u16(413).unwrap());
-    }
-
-    #[actix_web::test]
-    async fn test_rpc_method_not_found() {
-        let app = init_server().await;
-
-        let payload = json!(
-            {
-                "jsonrpc": "2.0",
-                "method": "subtract",
-                "params": [42, 43],
-                "id": 1
-            }
-        );
-        let req = test::TestRequest::post()
-            .uri("/")
-            .set_payload(payload.to_string())
-            .to_request();
-
-        let resp = app.call(req).await.unwrap();
-
-        let resp = recover_response_body(resp).await;
-
-        match resp {
-            ResponseWrapper::Batch(_) => panic!("expected single response"),
-            ResponseWrapper::Single(resp) => match resp.error {
-                Some(e) => assert_eq!(e.code, -32601),
-                None => panic!("expected error in response"),
-            },
-        }
-    }
-
-    #[allow(non_snake_case)]
-    #[test_case(json!([]), ResponseWrapper::Single(Response::new(None, Some(JsonRpcError::custom("empty batch request".to_string())), RequestId::Null)); "empty batch")]
-    #[test_case(json!([1]), ResponseWrapper::Batch(vec![Response::new(None, Some(JsonRpcError::invalid_request()), RequestId::Null)]); "invalid batch but not empty")]
-    #[test_case(json!([
-        {"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1}
-    ]),
-    ResponseWrapper::Batch(
-        vec![Response::new(Some(serde_json::from_str("\"0x539\"").unwrap()), None, RequestId::Number(1))]
-    ); "valid batch request")]
-    #[test_case(json!([1, 2, 3, 4]),
-    ResponseWrapper::Batch(vec![
-        Response::new(None, Some(JsonRpcError::invalid_request()), RequestId::Null),
-        Response::new(None, Some(JsonRpcError::invalid_request()), RequestId::Null),
-        Response::new(None, Some(JsonRpcError::invalid_request()), RequestId::Null),
-        Response::new(None, Some(JsonRpcError::invalid_request()), RequestId::Null),
-    ]); "multiple invalid batch")]
-    #[test_case(json!([
-        {"jsonrpc": "2.0", "method": "subtract", "params": [42, 43], "id": 1},
-        1,
-        {"jsonrpc": "2.0", "method": "subtract", "params": [42, 43], "id": 1}
-    ]),
-    ResponseWrapper::Batch(
-        vec![
-            Response::new(None, Some(JsonRpcError::method_not_found()), RequestId::Number(1)),
-            Response::new(None, Some(JsonRpcError::invalid_request()), RequestId::Null),
-            Response::new(None, Some(JsonRpcError::method_not_found()), RequestId::Number(1)),
-        ],
-    ); "partial success")]
-    #[test_case(json!([
-        {"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1},
-        {"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1},
-        {"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1},
-        {"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1},
-        {"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1},
-        {"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1}
-    ]),
-    ResponseWrapper::Single(
-        Response::new(None, Some(JsonRpcError::custom("number of requests in batch request exceeds limit of 5".to_string())), RequestId::Null)
-    ); "exceed batch request limit")]
-    #[actix_web::test]
-    async fn json_rpc_specification_batch_compliance(
-        payload: Value,
-        expected: ResponseWrapper<Response>,
-    ) {
-        let app = init_server().await;
-
-        let req = test::TestRequest::post()
-            .uri("/")
-            .set_payload(payload.to_string())
-            .to_request();
-
-        let resp = app.call(req).await.unwrap();
-
-        let resp = recover_response_body(resp).await;
-
-        assert_eq!(resp, expected);
-    }
-
-    #[allow(non_snake_case)]
-    #[actix_web::test]
-    async fn test_monad_eth_call_sha256_precompile() {
-        let app = init_server().await;
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "method": "eth_call",
-            "params": [
-                {
-                    "to": "0x0000000000000000000000000000000000000002",
-                    "data": "0x68656c6c6f" // hex for "hello"
-                },
-                "latest"
-            ],
-            "id": 1
-        });
-
-        let req = actix_web::test::TestRequest::post()
-            .uri("/")
-            .set_payload(payload.to_string())
-            .to_request();
-
-        let resp: jsonrpc::Response = actix_test::call_and_read_body_json(&app, req).await;
-        assert!(resp.result.is_none());
-    }
-
-    #[allow(non_snake_case)]
-    #[actix_web::test]
-    async fn test_monad_eth_call() {
-        let app = init_server().await;
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "method": "eth_call",
-            "params": [
-            {
-                "from": "0xb60e8dd61c5d32be8058bb8eb970870f07233155",
-                "to": "0xd46e8dd67c5d32be8058bb8eb970870f07244567",
-                "gas": "0x76c0",
-                "gasPrice": "0x9184e72a000",
-                "value": "0x9184e72a",
-                "data": "0xd46e8dd67c5d32be8d46e8dd67c5d32be8058bb8eb970870f072445675058bb8eb970870f072445675"
-            },
-            "latest"
-            ],
-            "id": 1
-        });
-
-        let req = actix_web::test::TestRequest::post()
-            .uri("/")
-            .set_payload(payload.to_string())
-            .to_request();
-
-        let resp: jsonrpc::Response = actix_test::call_and_read_body_json(&app, req).await;
-        assert!(resp.result.is_none());
-    }
 }

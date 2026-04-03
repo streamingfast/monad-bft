@@ -49,7 +49,7 @@ use monad_crypto::certificate_signature::{
 };
 use monad_state_backend::StateBackend;
 use monad_types::{
-    deserialize_pubkey, serialize_pubkey, Epoch, ExecutionProtocol, IpcEncodable, NodeId, Round,
+    deserialize_pubkey, serialize_pubkey, Epoch, ExecutionProtocol, LimitedVec, IpcEncodable, NodeId, Round,
     RouterTarget, SeqNum, Stake, UdpPriority,
 };
 use monad_validator::signature_collection::SignatureCollection;
@@ -57,6 +57,10 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 const STATESYNC_NETWORK_MESSAGE_NAME: &str = "StateSyncNetworkMessage";
+
+/// maximum number of upserts we can send in a single response
+/// at 75 bytes per upsert, approx 1.5MB
+pub const MAX_UPSERTS_PER_RESPONSE: usize = 20_000;
 
 pub enum RouterCommand<ST: CertificateSignatureRecoverable, OM> {
     // Publish should not be replayed
@@ -284,27 +288,48 @@ pub struct PeerEntry<ST: CertificateSignatureRecoverable> {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_port: Option<u16>,
+
+    #[serde(
+        alias = "direct_udp_auth_port",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub direct_udp_port: Option<u16>,
 }
 
 impl<ST: CertificateSignatureRecoverable> Encodable for PeerEntry<ST> {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
-        if let Some(auth_port) = self.auth_port {
-            let enc: [&dyn Encodable; 5] = [
-                &self.pubkey,
-                &self.addr.to_string(),
-                &self.signature,
-                &self.record_seq_num,
-                &auth_port,
-            ];
-            encode_list::<_, dyn Encodable>(&enc, out);
-        } else {
-            let enc: [&dyn Encodable; 4] = [
-                &self.pubkey,
-                &self.addr.to_string(),
-                &self.signature,
-                &self.record_seq_num,
-            ];
-            encode_list::<_, dyn Encodable>(&enc, out);
+        let addr = self.addr.to_string();
+        let base = [
+            &self.pubkey as &dyn Encodable,
+            &addr as &dyn Encodable,
+            &self.signature as &dyn Encodable,
+            &self.record_seq_num as &dyn Encodable,
+        ];
+
+        match (self.auth_port, self.direct_udp_port) {
+            (None, None) => encode_list::<_, dyn Encodable>(&base, out),
+            (Some(auth_port), None) => {
+                let enc = [
+                    base[0],
+                    base[1],
+                    base[2],
+                    base[3],
+                    &auth_port as &dyn Encodable,
+                ];
+                encode_list::<_, dyn Encodable>(&enc, out);
+            }
+            (auth_port, Some(direct_udp_port)) => {
+                let auth_port = auth_port.unwrap_or_default();
+                let enc = [
+                    base[0],
+                    base[1],
+                    base[2],
+                    base[3],
+                    &auth_port as &dyn Encodable,
+                    &direct_udp_port as &dyn Encodable,
+                ];
+                encode_list::<_, dyn Encodable>(&enc, out);
+            }
         }
     }
 }
@@ -322,10 +347,30 @@ impl<ST: CertificateSignatureRecoverable> Decodable for PeerEntry<ST> {
         let record_seq_num = u64::decode(&mut payload)?;
 
         let auth_port = if !payload.is_empty() {
-            Some(u16::decode(&mut payload)?)
+            let port = u16::decode(&mut payload)?;
+            if port == 0 {
+                None
+            } else {
+                Some(port)
+            }
         } else {
             None
         };
+
+        let direct_udp_port = if !payload.is_empty() {
+            let port = u16::decode(&mut payload)?;
+            if port == 0 {
+                None
+            } else {
+                Some(port)
+            }
+        } else {
+            None
+        };
+
+        if !payload.is_empty() {
+            return Err(alloy_rlp::Error::Custom("extra bytes in peer entry"));
+        }
 
         Ok(Self {
             pubkey,
@@ -333,6 +378,7 @@ impl<ST: CertificateSignatureRecoverable> Decodable for PeerEntry<ST> {
             signature,
             record_seq_num,
             auth_port,
+            direct_udp_port,
         })
     }
 }
@@ -1112,10 +1158,9 @@ where
         timestamp_ns: u128,
         round_signature: RoundSignature<SCT::SignatureType>,
         // base fee fields used to populate consensus block header
-        // they are set to None pre tfm activation
-        base_fee: Option<u64>,
-        base_fee_trend: Option<u64>,
-        base_fee_moment: Option<u64>,
+        base_fee: u64,
+        base_fee_trend: u64,
+        base_fee_moment: u64,
         delayed_execution_results: Vec<EPT::FinalizedHeader>,
         proposed_execution_inputs: ProposedExecutionInputs<EPT>,
         parent_hash: [u8; 32],
@@ -1207,6 +1252,7 @@ where
                     }
                 };
 
+<<<<<<< HEAD
                 let base_fee_buf: Vec<&dyn Encodable> = match base_fee {
                     None => {
                         vec![&1u8]
@@ -1238,6 +1284,8 @@ where
                     inputs: proposed_execution_inputs,
                     parent_hash: *parent_hash,
                 };
+=======
+>>>>>>> v0.14.0
                 let enc: [&dyn Encodable; 14] = [
                     &1u8,
                     epoch,
@@ -1246,9 +1294,9 @@ where
                     high_qc,
                     timestamp_ns,
                     round_signature,
-                    &base_fee_buf,
-                    &base_fee_trend_buf,
-                    &base_fee_moment_buf,
+                    base_fee,
+                    base_fee_trend,
+                    base_fee_moment,
                     delayed_execution_results,
                     &ipc_inputs,
                     &tc_buf,
@@ -1284,36 +1332,9 @@ where
                 let high_qc = QuorumCertificate::<SCT>::decode(&mut payload)?;
                 let timestamp_ns = u128::decode(&mut payload)?;
                 let round_signature = RoundSignature::<SCT::SignatureType>::decode(&mut payload)?;
-                let mut base_fee_payload = Header::decode_bytes(&mut payload, true)?;
-                let base_fee = match u8::decode(&mut base_fee_payload)? {
-                    1 => None,
-                    2 => Some(u64::decode(&mut base_fee_payload)?),
-                    _ => {
-                        return Err(alloy_rlp::Error::Custom(
-                            "failed to decode unknown base_fee in mempool event",
-                        ))
-                    }
-                };
-                let mut base_fee_trend_payload = Header::decode_bytes(&mut payload, true)?;
-                let base_fee_trend = match u8::decode(&mut base_fee_trend_payload)? {
-                    1 => None,
-                    2 => Some(u64::decode(&mut base_fee_trend_payload)?),
-                    _ => {
-                        return Err(alloy_rlp::Error::Custom(
-                            "failed to decode unknown base_fee_trend in mempool event",
-                        ))
-                    }
-                };
-                let mut base_fee_moment_payload = Header::decode_bytes(&mut payload, true)?;
-                let base_fee_moment = match u8::decode(&mut base_fee_moment_payload)? {
-                    1 => None,
-                    2 => Some(u64::decode(&mut base_fee_moment_payload)?),
-                    _ => {
-                        return Err(alloy_rlp::Error::Custom(
-                            "failed to decode unknown base_fee_moment in mempool event",
-                        ))
-                    }
-                };
+                let base_fee = u64::decode(&mut payload)?;
+                let base_fee_trend = u64::decode(&mut payload)?;
+                let base_fee_moment = u64::decode(&mut payload)?;
 
                 let delayed_execution_results = Vec::<EPT::FinalizedHeader>::decode(&mut payload)?;
                 let proposed_execution_inputs =
@@ -1403,10 +1424,7 @@ where
                 .field("timestamp_ns", timestamp_ns)
                 .field("round_signature", round_signature)
                 .field("base_fee", &base_fee)
-                .field(
-                    "base_fee_trend",
-                    &base_fee_trend.map(|trend| trend.cast_signed()),
-                )
+                .field("base_fee_trend", &base_fee_trend.cast_signed())
                 .field("base_fee_moment", &base_fee_moment)
                 .field("delayed_execution_results", delayed_execution_results)
                 .field("proposed_execution_inputs", proposed_execution_inputs)
@@ -1484,6 +1502,9 @@ impl Decodable for StateSyncRequest {
             let until = u64::decode(&mut payload)?;
             let old_target = u64::decode(&mut payload)?;
 
+            if !payload.is_empty() {
+                return Err(alloy_rlp::Error::UnexpectedLength);
+            }
             Ok(Self {
                 version,
                 prefix,
@@ -1598,17 +1619,23 @@ impl Decodable for StateSyncUpsertType {
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
         let mut payload = alloy_rlp::Header::decode_bytes(buf, true)?;
 
-        match u8::decode(&mut payload)? {
-            1 => Ok(Self::Code),
-            2 => Ok(Self::Account),
-            3 => Ok(Self::Storage),
-            4 => Ok(Self::AccountDelete),
-            5 => Ok(Self::StorageDelete),
-            6 => Ok(Self::Header),
-            _ => Err(alloy_rlp::Error::Custom(
-                "failed to decode unknown StateSyncUpsertType",
-            )),
+        let result = match u8::decode(&mut payload)? {
+            1 => Self::Code,
+            2 => Self::Account,
+            3 => Self::Storage,
+            4 => Self::AccountDelete,
+            5 => Self::StorageDelete,
+            6 => Self::Header,
+            _ => {
+                return Err(alloy_rlp::Error::Custom(
+                    "failed to decode unknown StateSyncUpsertType",
+                ))
+            }
+        };
+        if !payload.is_empty() {
+            return Err(alloy_rlp::Error::UnexpectedLength);
         }
+        Ok(result)
     }
 }
 
@@ -1696,13 +1723,19 @@ impl Decodable for StateSyncResponse {
         let request = StateSyncRequest::decode(&mut payload)?;
         // check if server version is past V1: upsert fork
         let response: Vec<StateSyncUpsertV1> = if version >= STATESYNC_VERSION_V1 {
-            Vec::<StateSyncUpsertV1>::decode(&mut payload)?
+            LimitedVec::<StateSyncUpsertV1, MAX_UPSERTS_PER_RESPONSE>::decode(&mut payload)?
+                .into_inner()
         } else {
-            let v0_response = Vec::<StateSyncUpsertV0>::decode(&mut payload)?;
+            let v0_response =
+                LimitedVec::<StateSyncUpsertV0, MAX_UPSERTS_PER_RESPONSE>::decode(&mut payload)?
+                    .into_inner();
             v0_response.iter().map(StateSyncUpsertV0::as_v1).collect()
         };
         let response_n = u64::decode(&mut payload)?;
 
+        if !payload.is_empty() {
+            return Err(alloy_rlp::Error::UnexpectedLength);
+        }
         Ok(Self {
             version,
             nonce,
@@ -1803,16 +1836,22 @@ impl Decodable for StateSyncNetworkMessage {
             ));
         }
 
-        match u8::decode(&mut payload)? {
-            1 => Ok(Self::Request(StateSyncRequest::decode(&mut payload)?)),
-            2 => Ok(Self::Response(StateSyncResponse::decode(&mut payload)?)),
-            3 => Ok(Self::BadVersion(StateSyncBadVersion::decode(&mut payload)?)),
-            4 => Ok(Self::Completion(SessionId::decode(&mut payload)?)),
-            5 => Ok(Self::NotWhitelisted),
-            _ => Err(alloy_rlp::Error::Custom(
-                "failed to decode unknown StateSyncNetworkMessage",
-            )),
+        let result = match u8::decode(&mut payload)? {
+            1 => Self::Request(StateSyncRequest::decode(&mut payload)?),
+            2 => Self::Response(StateSyncResponse::decode(&mut payload)?),
+            3 => Self::BadVersion(StateSyncBadVersion::decode(&mut payload)?),
+            4 => Self::Completion(SessionId::decode(&mut payload)?),
+            5 => Self::NotWhitelisted,
+            _ => {
+                return Err(alloy_rlp::Error::Custom(
+                    "failed to decode unknown StateSyncNetworkMessage",
+                ))
+            }
+        };
+        if !payload.is_empty() {
+            return Err(alloy_rlp::Error::UnexpectedLength);
         }
+        Ok(result)
     }
 }
 
@@ -2411,6 +2450,7 @@ where
 mod tests {
     use std::net::SocketAddrV4;
 
+    use alloy_rlp::{encode_list, Encodable};
     use monad_crypto::{
         certificate_signature::{CertificateSignaturePubKey, PubKey},
         NopSignature,
@@ -2576,9 +2616,76 @@ mod tests {
             signature,
             record_seq_num,
             auth_port: None,
+            direct_udp_port: None,
         };
         let encoded = alloy_rlp::encode(&entry);
         let decoded: PeerEntry<NopSignature> = alloy_rlp::decode_exact(&encoded).unwrap();
         assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn peer_entry_rlp_encode_decode_with_direct_udp_only() {
+        let pubkey = CertificateSignaturePubKey::<NopSignature>::from_bytes(&[2u8; 32]).unwrap();
+        let addr: SocketAddrV4 = "127.0.0.1:8001".parse().unwrap();
+        let signature = NopSignature { pubkey, id: 4321 };
+        let entry = PeerEntry {
+            pubkey,
+            addr,
+            signature,
+            record_seq_num: 7,
+            auth_port: None,
+            direct_udp_port: Some(9001),
+        };
+
+        let encoded = alloy_rlp::encode(&entry);
+        let decoded: PeerEntry<NopSignature> = alloy_rlp::decode_exact(&encoded).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn peer_entry_rlp_decode_legacy_auth_only_form() {
+        let pubkey = CertificateSignaturePubKey::<NopSignature>::from_bytes(&[3u8; 32]).unwrap();
+        let addr: SocketAddrV4 = "127.0.0.1:8002".parse().unwrap();
+        let signature = NopSignature { pubkey, id: 99 };
+        let record_seq_num = 11u64;
+        let auth_port = 9002u16;
+        let enc: [&dyn Encodable; 5] = [
+            &pubkey,
+            &addr.to_string(),
+            &signature,
+            &record_seq_num,
+            &auth_port,
+        ];
+        let mut encoded = Vec::new();
+        encode_list::<_, dyn Encodable>(&enc, &mut encoded);
+
+        let decoded: PeerEntry<NopSignature> = alloy_rlp::decode_exact(&encoded).unwrap();
+        assert_eq!(decoded.auth_port, Some(auth_port));
+        assert_eq!(decoded.direct_udp_port, None);
+    }
+
+    #[test]
+    fn peer_entry_rlp_decode_rejects_extra_fields() {
+        let pubkey = CertificateSignaturePubKey::<NopSignature>::from_bytes(&[4u8; 32]).unwrap();
+        let addr: SocketAddrV4 = "127.0.0.1:8003".parse().unwrap();
+        let signature = NopSignature { pubkey, id: 7 };
+        let record_seq_num = 12u64;
+        let auth_port = 9003u16;
+        let direct_udp_port = 9004u16;
+        let extra_port = 9005u16;
+        let enc: [&dyn Encodable; 7] = [
+            &pubkey,
+            &addr.to_string(),
+            &signature,
+            &record_seq_num,
+            &auth_port,
+            &direct_udp_port,
+            &extra_port,
+        ];
+        let mut encoded = Vec::new();
+        encode_list::<_, dyn Encodable>(&enc, &mut encoded);
+
+        let decoded = alloy_rlp::decode_exact::<PeerEntry<NopSignature>>(&encoded);
+        assert!(decoded.is_err());
     }
 }
