@@ -418,6 +418,7 @@ where
                 base_fee_moment,
                 delayed_execution_results,
                 proposed_execution_inputs,
+                parent_hash,
                 last_round_tc,
                 fresh_proposal_certificate,
             } => Some(MempoolEvent::Proposal {
@@ -432,6 +433,7 @@ where
                 base_fee_moment,
                 delayed_execution_results,
                 proposed_execution_inputs,
+                parent_hash,
                 last_round_tc,
                 fresh_proposal_certificate,
             }),

@@ -139,6 +139,7 @@ where
         base_fee_moment: u64,
         delayed_execution_results: Vec<EPT::FinalizedHeader>,
         proposed_execution_inputs: ProposedExecutionInputs<EPT>,
+        parent_hash: [u8; 32],
         last_round_tc: Option<TimeoutCertificate<ST, SCT, EPT>>,
         fresh_proposal_certificate: Option<FreshProposalCertificate<SCT>>,
     },
@@ -470,6 +471,16 @@ where
                     let (base_fee, base_fee_trend, base_fee_moment) = self
                         .block_policy
                         .compute_base_fee(&extending_blocks, &self.chain_config);
+
+                    let parent_hash: [u8; 32] = extending_blocks
+                        .last()
+                        .and_then(|b| {
+                            b.header()
+                                .delayed_execution_results
+                                .last()
+                                .map(|h| h.0.hash_slow().0)
+                        })
+                        .unwrap_or([0_u8; 32]);
 
                     match self.pool.create_proposal(
                         &mut event_tracker,
