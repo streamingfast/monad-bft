@@ -347,7 +347,17 @@ where
                     let (base_fee, base_fee_trend, base_fee_moment) =
                         block_policy.compute_base_fee(&extending_blocks, &self.chain_config);
 
-                    let (proposed_execution_inputs, parent_hash) = pool
+                    let parent_hash: [u8; 32] = extending_blocks
+                        .last()
+                        .and_then(|b| {
+                            b.header()
+                                .delayed_execution_results
+                                .last()
+                                .map(|h| h.0.hash_slow().0)
+                        })
+                        .unwrap_or([0_u8; 32]);
+
+                    let proposal = pool
                         .create_proposal(
                             &mut event_tracker,
                             epoch,
@@ -366,8 +376,8 @@ where
                             state_backend,
                             &self.chain_config,
                         )
-                        .expect("proposal succeeds")
-                        .proposed_execution_inputs;
+                        .expect("proposal succeeds");
+                    let proposed_execution_inputs = proposal.proposed_execution_inputs;
 
                     let seq_num = if self.byzantine_config.no_increment_seq_num {
                         seq_num - SeqNum(1)
