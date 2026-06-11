@@ -1037,6 +1037,15 @@ where
 
                 if take_checkpoint {
                     if let Some(checkpoint_cmd) = ConsensusChildState::new(self).checkpoint() {
+                        // Note that this is not written to disk synchronously
+                        //
+                        // This is intentional since we want to avoid blocking the consensus state
+                        // machine on disk IO (fsync)
+                        //
+                        // There is no practically exploitable attack here since a malicious actor
+                        // would have to cause f+1 nodes to crash immediately after taking a
+                        // checkpoint and before the checkpoint is written to disk, which is
+                        // not a realistic attack vector
                         cmds.push(Command::ConfigFileCommand(checkpoint_cmd));
                     }
                 }
@@ -1158,7 +1167,15 @@ where
                     else {
                         unreachable!("DoneSync invoked while ConsensusState is live")
                     };
-                    assert_eq!(db_status, &DbSyncStatus::Started);
+
+                    // db_status will almost always be DbSyncStatus::Started
+                    //
+                    // db_status can be DbSyncStatus::Waiting if the statesync target is reset and
+                    // the old target returns DoneSync before the new RequestSync is emitted
+                    assert!(matches!(
+                        db_status,
+                        DbSyncStatus::Waiting | DbSyncStatus::Started
+                    ));
 
                     let delay = self.consensus_config.execution_delay;
                     let maybe_target = block_buffer
@@ -1167,6 +1184,7 @@ where
                     match maybe_target {
                         Some(target) if n >= target => {
                             assert_eq!(n, target);
+                            assert_eq!(db_status, &DbSyncStatus::Started);
 
                             tracing::info!(?target, ?n, "done db statesync");
                             *db_status = DbSyncStatus::Done;

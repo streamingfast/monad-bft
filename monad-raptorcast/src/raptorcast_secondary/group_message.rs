@@ -19,7 +19,12 @@ use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey,
 };
 use monad_peer_discovery::MonadNameRecord;
-use monad_types::{LimitedVec, NodeId, Round};
+use monad_types::{BoundedU64, LimitedVec, NodeId, Round, RoundSpan};
+
+/// Maximum number of peers/name records allowed in a secondary raptorcast message.
+/// This is to set an upper bound on RLP deserialization memory usage, and the upper
+/// bound on full-node group size used by deterministic secondary raptorcast.
+pub(crate) const MAX_PEERS_IN_GROUP: usize = 500;
 
 #[derive(RlpEncodable, RlpDecodable, Debug, Eq, PartialEq, Clone)]
 pub struct PrepareGroup<PT: PubKey> {
@@ -36,15 +41,67 @@ pub struct PrepareGroupResponse<PT: PubKey> {
     pub accept: bool,
 }
 
-/// Maximum number of peers/name records allowed in a ConfirmGroup message.
-/// This is to set an upper bound on RLP deserialization memory usage.
-const MAX_PEERS_IN_CONFIRM_GROUP: usize = 500;
-
 #[derive(Debug, Clone, RlpEncodable, RlpDecodable, Eq, PartialEq)]
 pub struct ConfirmGroup<ST: CertificateSignatureRecoverable> {
     pub prepare: PrepareGroup<CertificateSignaturePubKey<ST>>,
-    pub peers: LimitedVec<NodeId<CertificateSignaturePubKey<ST>>, MAX_PEERS_IN_CONFIRM_GROUP>,
-    pub name_records: LimitedVec<MonadNameRecord<ST>, MAX_PEERS_IN_CONFIRM_GROUP>,
+    pub peers: LimitedVec<NodeId<CertificateSignaturePubKey<ST>>, MAX_PEERS_IN_GROUP>,
+    pub name_records: LimitedVec<MonadNameRecord<ST>, MAX_PEERS_IN_GROUP>,
+}
+
+const NO_CONF_REASON_GROUP_FULL: u8 = 1;
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum NoConfirmReason {
+    GroupFull,
+}
+
+impl Encodable for NoConfirmReason {
+    fn encode(&self, out: &mut dyn BufMut) {
+        match self {
+            Self::GroupFull => {
+                let enc: [&dyn Encodable; 1] = [&NO_CONF_REASON_GROUP_FULL];
+                encode_list::<_, dyn Encodable>(&enc, out);
+            }
+        }
+    }
+}
+
+impl Decodable for NoConfirmReason {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let mut payload = Header::decode_bytes(buf, true)?;
+        let reason = match u8::decode(&mut payload)? {
+            NO_CONF_REASON_GROUP_FULL => Self::GroupFull,
+            _ => {
+                return Err(alloy_rlp::Error::Custom(
+                    "Unknown NoConfirmReason enum variant",
+                ))
+            }
+        };
+        if !payload.is_empty() {
+            return Err(alloy_rlp::Error::Custom("Extra bytes in NoConfirmReason"));
+        }
+        Ok(reason)
+    }
+}
+
+#[derive(Debug, Clone, RlpEncodable, RlpDecodable, Eq, PartialEq)]
+pub struct NoConfirm<PT: PubKey> {
+    pub prepare: PrepareGroup<PT>,
+    pub reason: NoConfirmReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, RlpEncodable, RlpDecodable)]
+pub struct PeerParticipation<PT: PubKey> {
+    pub peer: NodeId<PT>,
+    pub participation_score: BoundedU64<100>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, RlpEncodable, RlpDecodable)]
+pub struct PeerParticipationReport<PT: PubKey> {
+    pub reporter: NodeId<PT>,
+    pub validator_id: NodeId<PT>,
+    pub round_span: RoundSpan,
+    pub peer_scores: LimitedVec<PeerParticipation<PT>, MAX_PEERS_IN_GROUP>,
 }
 
 const GROUP_MSG_VERSION: u8 = 1;
@@ -52,12 +109,16 @@ const GROUP_MSG_VERSION: u8 = 1;
 const MESSAGE_TYPE_PREP_REQ: u8 = 1;
 const MESSAGE_TYPE_PREP_RES: u8 = 2;
 const MESSAGE_TYPE_CONF_GRP: u8 = 3;
+const MESSAGE_TYPE_NO_CONF: u8 = 4;
+const MESSAGE_TYPE_PARTICIPATION_REPORT: u8 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FullNodesGroupMessage<ST: CertificateSignatureRecoverable> {
     PrepareGroup(PrepareGroup<CertificateSignaturePubKey<ST>>), // MESSAGE_TYPE_PREP_REQ
     PrepareGroupResponse(PrepareGroupResponse<CertificateSignaturePubKey<ST>>), // MESSAGE_TYPE_PREP_RES
     ConfirmGroup(ConfirmGroup<ST>), // MESSAGE_TYPE_CONF_GRP
+    NoConfirm(NoConfirm<CertificateSignaturePubKey<ST>>), // MESSAGE_TYPE_NO_CONF
+    ParticipationReport(PeerParticipationReport<CertificateSignaturePubKey<ST>>), // MESSAGE_TYPE_PARTICIPATION_REPORT
 }
 
 impl<ST: CertificateSignatureRecoverable> Encodable for FullNodesGroupMessage<ST> {
@@ -74,6 +135,15 @@ impl<ST: CertificateSignatureRecoverable> Encodable for FullNodesGroupMessage<ST
             }
             Self::ConfirmGroup(inner_msg) => {
                 let enc: [&dyn Encodable; 3] = [&version, &MESSAGE_TYPE_CONF_GRP, inner_msg];
+                encode_list::<_, dyn Encodable>(&enc, out);
+            }
+            Self::NoConfirm(inner_msg) => {
+                let enc: [&dyn Encodable; 3] = [&version, &MESSAGE_TYPE_NO_CONF, inner_msg];
+                encode_list::<_, dyn Encodable>(&enc, out);
+            }
+            Self::ParticipationReport(inner_msg) => {
+                let enc: [&dyn Encodable; 3] =
+                    [&version, &MESSAGE_TYPE_PARTICIPATION_REPORT, inner_msg];
                 encode_list::<_, dyn Encodable>(&enc, out);
             }
         }
@@ -93,6 +163,10 @@ impl<ST: CertificateSignatureRecoverable> Decodable for FullNodesGroupMessage<ST
                 Self::PrepareGroupResponse(PrepareGroupResponse::decode(&mut payload)?)
             }
             MESSAGE_TYPE_CONF_GRP => Self::ConfirmGroup(ConfirmGroup::decode(&mut payload)?),
+            MESSAGE_TYPE_NO_CONF => Self::NoConfirm(NoConfirm::decode(&mut payload)?),
+            MESSAGE_TYPE_PARTICIPATION_REPORT => {
+                Self::ParticipationReport(PeerParticipationReport::decode(&mut payload)?)
+            }
             _ => {
                 return Err(alloy_rlp::Error::Custom(
                     "Unknown FullNodesGroupMessage enum variant",
@@ -125,15 +199,6 @@ mod tests {
         NodeId::new(pub_key)
     }
 
-    fn enum_name(ev: &FullNodesGroupMessage<ST>) -> String {
-        match ev {
-            FullNodesGroupMessage::PrepareGroup(_) => "PrepareGroup",
-            FullNodesGroupMessage::PrepareGroupResponse(_) => "PrepareGroupResponse",
-            FullNodesGroupMessage::ConfirmGroup(_) => "ConfirmGroup",
-        }
-        .to_string()
-    }
-
     fn make_prep_group(seed: u32) -> PrepareGroup<CertificateSignaturePubKey<ST>> {
         PrepareGroup {
             validator_id: nid(seed as u64),
@@ -150,7 +215,10 @@ mod tests {
                 let ip = std::net::Ipv4Addr::new(seed as u8, 0, 0, 1);
                 let port = (seed + 16) as u16;
 
-                MonadNameRecord::<ST>::new(NameRecord::new(ip, port, (seed + 200) as u64), &key)
+                MonadNameRecord::<ST>::new(
+                    NameRecord::new(ip, port, port, port, 0, (seed + 200) as u64),
+                    &key,
+                )
             })
             .collect()
     }
@@ -162,11 +230,6 @@ mod tests {
 
         let mut encoded_bytes = Vec::new();
         org_enum.encode(&mut encoded_bytes); // 41 bytes
-        println!(
-            "{} encoded_bytes: {}",
-            enum_name(&org_enum),
-            encoded_bytes.len()
-        );
 
         let decoded_enum =
             FullNodesGroupMessage::<ST>::decode(&mut encoded_bytes.as_slice()).unwrap();
@@ -184,11 +247,6 @@ mod tests {
 
         let mut encoded_bytes = Vec::new();
         org_enum.encode(&mut encoded_bytes); // 79 bytes
-        println!(
-            "{} encoded_bytes: {}",
-            enum_name(&org_enum),
-            encoded_bytes.len()
-        );
 
         let decoded_enum =
             FullNodesGroupMessage::<ST>::decode(&mut encoded_bytes.as_slice()).unwrap();
@@ -206,14 +264,75 @@ mod tests {
 
         let mut encoded_bytes = Vec::new();
         org_enum.encode(&mut encoded_bytes); // 306 bytes
-        println!(
-            "{} encoded_bytes: {}",
-            enum_name(&org_enum),
-            encoded_bytes.len()
-        );
 
         let decoded_enum =
             FullNodesGroupMessage::<ST>::decode(&mut encoded_bytes.as_slice()).unwrap();
         assert_eq!(decoded_enum, org_enum);
+    }
+
+    #[test]
+    fn serialize_roundtrip_group_no_conf() {
+        let org_msg = NoConfirm {
+            prepare: make_prep_group(13),
+            reason: NoConfirmReason::GroupFull,
+        };
+        let org_enum = FullNodesGroupMessage::NoConfirm(org_msg);
+
+        let mut encoded_bytes = Vec::new();
+        org_enum.encode(&mut encoded_bytes); // 44 bytes
+
+        insta::assert_debug_snapshot!("no_conf_encoded", hex::encode(&encoded_bytes));
+
+        let decoded_enum =
+            FullNodesGroupMessage::<ST>::decode(&mut encoded_bytes.as_slice()).unwrap();
+        assert_eq!(decoded_enum, org_enum);
+    }
+
+    #[test]
+    fn no_confirm_reason_rejects_extra_bytes() {
+        // Encode NoConfirmReason::GroupFull normally: RLP list with single u8
+        // Valid encoding is [0xc1, 0x01] - a list of length 1 containing the byte 0x01
+        // We'll create a malformed encoding with extra bytes: [0xc2, 0x01, 0xff]
+        let malformed_encoding: &[u8] = &[0xc2, 0x01, 0xff];
+
+        let result = NoConfirmReason::decode(&mut &malformed_encoding[..]);
+        assert_eq!(
+            result.unwrap_err(),
+            alloy_rlp::Error::Custom("Extra bytes in NoConfirmReason")
+        );
+    }
+
+    #[test]
+    fn serialize_roundtrip_participation_report() {
+        let org_msg = PeerParticipationReport {
+            reporter: nid(5),
+            validator_id: nid(1),
+            round_span: RoundSpan::new(Round(10), Round(20)).unwrap(),
+            peer_scores: vec![
+                PeerParticipation {
+                    peer: nid(2),
+                    participation_score: BoundedU64::new(85).unwrap(),
+                },
+                PeerParticipation {
+                    peer: nid(3),
+                    participation_score: BoundedU64::new(100).unwrap(),
+                },
+                PeerParticipation {
+                    peer: nid(4),
+                    participation_score: BoundedU64::new(0).unwrap(),
+                },
+            ]
+            .into(),
+        };
+        let message = FullNodesGroupMessage::ParticipationReport(org_msg);
+
+        let mut encoded_bytes = Vec::new();
+        message.encode(&mut encoded_bytes);
+
+        insta::assert_debug_snapshot!("participation_report_encoded", hex::encode(&encoded_bytes));
+
+        let decoded_enum =
+            FullNodesGroupMessage::<ST>::decode(&mut encoded_bytes.as_slice()).unwrap();
+        assert_eq!(decoded_enum, message);
     }
 }

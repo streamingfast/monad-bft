@@ -450,25 +450,12 @@ fn check_txpool_coherency(
     state_backend: &NopStateBackend,
     root_info: RootInfo,
 ) {
-    let mut block_policy = TestBlockPolicy::new(GENESIS_SEQ_NUM, 3);
+    let block_policy = TestBlockPolicy::new(GENESIS_SEQ_NUM, 3);
 
     let mut txpool = create_test_txpool(chain_config);
     let metrics = EthTxPoolMetrics::default();
     let mut ipc_events = BTreeMap::default();
     let mut event_tracker = EthTxPoolEventTracker::new(&metrics, &mut ipc_events);
-
-    // insert extending blocks to txpool
-    for extending_block in extending_blocks.iter() {
-        txpool.update_committed_block(&mut event_tracker, chain_config, extending_block.clone());
-        <TestBlockPolicy as BlockPolicy<
-            NopSignature,
-            MockSignatures<NopSignature>,
-            EthExecutionProtocol,
-            NopStateBackend,
-            MonadChainConfig,
-            MonadChainRevision,
-        >>::update_committed_block(&mut block_policy, extending_block);
-    }
 
     // insert transactions of the incoming block into txpool
     let block_txs: Vec<Recovered<TxEnvelope>> = block_under_test
@@ -484,7 +471,14 @@ fn check_txpool_coherency(
             chain_config,
             block_txs
                 .into_iter()
-                .map(|tx| (tx, PoolTxKind::Forwarded))
+                .map(|tx| {
+                    (
+                        tx,
+                        PoolTxKind::Forwarded {
+                            sender: *block_under_test.get_author(),
+                        },
+                    )
+                })
                 .collect(),
             |_tx| {},
         );
@@ -519,7 +513,8 @@ fn check_txpool_coherency(
             state_backend,
             chain_config,
         )
-        .unwrap();
+        .unwrap()
+        .proposed_execution_inputs;
 
     info!(
         "Txpool created proposal with {} txs for seq_num {:?}",

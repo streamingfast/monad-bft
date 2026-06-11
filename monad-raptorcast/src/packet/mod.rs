@@ -13,9 +13,11 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-pub(crate) mod assembler;
 pub(crate) mod assigner;
 mod builder;
+mod chunk;
+pub mod deterministic;
+pub mod regular;
 
 use std::{collections::HashMap, net::SocketAddr};
 
@@ -25,15 +27,8 @@ use monad_crypto::certificate_signature::{
 };
 use monad_types::NodeId;
 
-pub(crate) use self::{
-    assembler::{Chunk, PacketLayout},
-    assigner::ChunkAssigner,
-    builder::MessageBuilder,
-};
-use crate::{
-    udp::GroupId,
-    util::{BuildTarget, Redundancy},
-};
+pub(crate) use self::{builder::MessageBuilder, chunk::Chunk};
+use crate::util::{BroadcastMode, BuildTarget, Redundancy};
 
 #[derive(Debug)]
 pub enum BuildError {
@@ -51,23 +46,30 @@ pub enum BuildError {
     TooManyChunks,
     // app message is too large
     AppMessageTooLarge,
+    // app message is empty
+    AppMessageEmpty,
     // total stake is zero
     ZeroTotalStake,
     // redundancy is too high
     RedundancyTooHigh,
+    // broadcast mode not supported
+    InvalidBroadcastMode(BroadcastMode),
+    // encoding scheme not supported
+    InvalidEncodingScheme,
+    // chunk ids are not contiguous starting from 0, as required by
+    // deterministic RC
+    NonContiguousChunkIds,
 }
 
 type Result<A, E = BuildError> = std::result::Result<A, E>;
 
-#[allow(clippy::too_many_arguments)]
 pub fn build_messages<ST>(
     key: &ST::KeyPairType,
     segment_size: u16,
     app_message: Bytes,
     redundancy: Redundancy,
-    group_id: GroupId,
     unix_ts_ms: u64,
-    build_target: BuildTarget<CertificateSignaturePubKey<ST>>,
+    build_target: BuildTarget<'_, CertificateSignaturePubKey<ST>>,
     known_addresses: &HashMap<NodeId<CertificateSignaturePubKey<ST>>, SocketAddr>,
 ) -> Vec<(SocketAddr, Bytes)>
 where
@@ -75,12 +77,10 @@ where
 {
     let builder = MessageBuilder::<ST>::new(key)
         .segment_size(segment_size)
-        .group_id(group_id)
         .unix_ts_ms(unix_ts_ms)
         .redundancy(redundancy);
 
     let packets = builder
-        .prepare()
         .build_vec(&app_message, &build_target)
         .unwrap_log_on_error(&app_message, &build_target);
 
@@ -96,7 +96,11 @@ where
 
 // retrofit original error handling
 pub trait RetrofitResult<T> {
-    fn unwrap_log_on_error<PT>(self, ctx_app_msg: &[u8], ctx_build_target: &BuildTarget<PT>) -> T
+    fn unwrap_log_on_error<PT>(
+        self,
+        ctx_app_msg: &[u8],
+        ctx_build_target: &BuildTarget<'_, PT>,
+    ) -> T
     where
         PT: PubKey;
 }
@@ -105,7 +109,11 @@ impl<T> RetrofitResult<T> for Result<T>
 where
     T: Default,
 {
-    fn unwrap_log_on_error<PT>(self, ctx_app_msg: &[u8], ctx_build_target: &BuildTarget<PT>) -> T
+    fn unwrap_log_on_error<PT>(
+        self,
+        ctx_app_msg: &[u8],
+        ctx_build_target: &BuildTarget<'_, PT>,
+    ) -> T
     where
         PT: PubKey,
     {

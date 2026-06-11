@@ -20,28 +20,33 @@ use std::{
 
 use alloy_consensus::{Header, SignableTransaction, TxEip1559, TxEip7702, TxEnvelope, TxLegacy};
 use alloy_eips::eip7702::SignedAuthorization;
-use alloy_primitives::{Address, Signature, TxKind, Uint, B256, U256, U64, U8};
-use alloy_rpc_types::{AccessList, AccessListItem, AccessListResult};
+use alloy_primitives::{Address, Bytes, Signature, TxKind, Uint, B256, U256, U64, U8};
+use alloy_rpc_types::{AccessList, AccessListItem};
 use monad_chain_config::execution_revision::MonadExecutionRevision;
-use monad_ethcall::{eth_call, CallResult, EthCallExecutor, MonadTracer, StateOverrideSet};
+use monad_ethcall::{
+    eth_call, CallResult, EthCallExecutor, EthCallRequest, EthCallResult, FailureCallResult,
+    MonadTracer, StateOverrideSet,
+};
 use monad_rpc_docs::rpc;
 use monad_triedb_utils::triedb_env::{
     BlockKey, FinalizedBlockKey, ProposedBlockKey, Triedb, TriedbPath,
 };
 use monad_types::{BlockId, Hash, SeqNum};
 use serde::{Deserialize, Serialize};
-use serde_cbor;
 use serde_json::value::RawValue;
 use tracing::{debug, trace};
 
 use crate::{
-    chainstate::{
+    data::{
         eth_call_handler::{EthCallHandlerConfig, EthCallStatsTracker},
-        get_block_key_from_tag_or_hash, ChainState,
+        get_block_key_from_tag_or_hash, DataProvider,
     },
-    handlers::debug::{decode_call_frame, Tracer, TracerObject},
+    handlers::{
+        debug::{decode_call_frame, TracerObject},
+        parse_ethcall_chain_id,
+    },
     types::{
-        eth_json::BlockTagOrHash,
+        eth_json::{BlockTagOrHash, MonadCreateAccessListResult},
         ethhex,
         jsonrpc::{JsonRpcError, JsonRpcResult},
     },
@@ -76,7 +81,7 @@ impl schemars::JsonSchema for CallRequest {
     }
 
     fn schema_id() -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Borrowed(concat!(module_path!(), "::NonGenericType"))
+        std::borrow::Cow::Borrowed(concat!(module_path!(), "::CallRequest"))
     }
 
     fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
@@ -116,50 +121,46 @@ impl CallRequest {
 
     pub fn fill_gas_prices(&mut self, base_fee: U256) -> Result<(), JsonRpcError> {
         match self.gas_price_details {
-            GasPriceDetails::Legacy { mut gas_price } => {
+            GasPriceDetails::Legacy { gas_price } => {
                 if gas_price < base_fee {
-                    gas_price = base_fee;
-                    self.gas_price_details = GasPriceDetails::Legacy { gas_price };
+                    self.gas_price_details = GasPriceDetails::Legacy {
+                        gas_price: base_fee,
+                    };
                 }
             }
             GasPriceDetails::Eip1559 {
                 max_fee_per_gas,
                 max_priority_fee_per_gas,
             } => {
+                let effective_fee_cap = base_fee
+                    .checked_add(max_priority_fee_per_gas.unwrap_or_default())
+                    .ok_or_else(|| {
+                        JsonRpcError::eth_call_error("tip too high".to_string(), None)
+                    })?;
+
                 let max_fee_per_gas = match max_fee_per_gas {
                     Some(mut max_fee_per_gas) => {
-                        if max_fee_per_gas != U256::ZERO && max_fee_per_gas < base_fee {
+                        if max_fee_per_gas == U256::ZERO {
+                            max_fee_per_gas = base_fee;
+                        } else if max_fee_per_gas < base_fee {
                             return Err(JsonRpcError::eth_call_error(
                                 "max fee per gas less than block base fee".to_string(),
                                 None,
                             ));
-                        } else if max_fee_per_gas == U256::ZERO {
-                            max_fee_per_gas = base_fee;
                         }
 
-                        if max_priority_fee_per_gas.is_some()
-                            && max_fee_per_gas < max_priority_fee_per_gas.unwrap_or_default()
-                        {
-                            return Err(JsonRpcError::eth_call_error(
-                                "priority fee greater than max".to_string(),
-                                None,
-                            ));
+                        if let Some(max_priority_fee_per_gas) = max_priority_fee_per_gas {
+                            if max_fee_per_gas < max_priority_fee_per_gas {
+                                return Err(JsonRpcError::eth_call_error(
+                                    "priority fee greater than max".to_string(),
+                                    None,
+                                ));
+                            }
                         }
 
-                        min(
-                            max_fee_per_gas,
-                            base_fee
-                                .checked_add(max_priority_fee_per_gas.unwrap_or_default())
-                                .ok_or_else(|| {
-                                    JsonRpcError::eth_call_error("tip too high".to_string(), None)
-                                })?,
-                        )
+                        min(max_fee_per_gas, effective_fee_cap)
                     }
-                    None => base_fee
-                        .checked_add(max_priority_fee_per_gas.unwrap_or_default())
-                        .ok_or_else(|| {
-                            JsonRpcError::eth_call_error("tip too high".to_string(), None)
-                        })?,
+                    None => effective_fee_cap,
                 };
 
                 self.gas_price_details = GasPriceDetails::Eip1559 {
@@ -168,6 +169,7 @@ impl CallRequest {
                 };
             }
         };
+
         Ok(())
     }
 }
@@ -208,157 +210,139 @@ impl Default for GasPriceDetails {
 impl TryFrom<CallRequest> for TxEnvelope {
     type Error = JsonRpcError;
     fn try_from(call_request: CallRequest) -> Result<Self, JsonRpcError> {
-        match call_request {
-            CallRequest {
-                gas_price_details: GasPriceDetails::Legacy { gas_price },
-                ..
-            } => {
-                // Legacy
+        let CallRequest {
+            from,
+            to,
+            gas,
+            gas_price_details,
+            value,
+            input: CallInput { input, data },
+            nonce,
+            chain_id,
+            access_list,
+            authorization_list,
+            max_fee_per_blob_gas,
+            blob_versioned_hashes,
+            transaction_type,
+        } = call_request;
 
-                // default signature as eth_call doesn't require it
-                let signature = Signature::new(U256::from(0), U256::from(0), false);
+        let nonce = nonce
+            .unwrap_or_default()
+            .try_into()
+            .map_err(|_| JsonRpcError::invalid_params())?;
+
+        let gas_limit = gas
+            .unwrap_or(Uint::from(u64::MAX))
+            .try_into()
+            .map_err(|_| JsonRpcError::invalid_params())?;
+
+        let value = value.unwrap_or_default();
+        let input = input.unwrap_or_default();
+
+        // default signature as eth_call doesn't require it
+        let signature = Signature::new(U256::ZERO, U256::ZERO, false);
+
+        match gas_price_details {
+            GasPriceDetails::Legacy { gas_price } => {
                 let transaction = TxLegacy {
-                    chain_id: call_request
-                        .chain_id
+                    chain_id: chain_id
                         .map(|id| id.try_into())
                         .transpose()
                         .map_err(|_| JsonRpcError::invalid_params())?,
-                    nonce: call_request
-                        .nonce
-                        .unwrap_or_default()
-                        .try_into()
-                        .map_err(|_| JsonRpcError::invalid_params())?,
+                    nonce,
                     gas_price: gas_price
                         .try_into()
                         .map_err(|_| JsonRpcError::invalid_params())?,
-                    gas_limit: call_request
-                        .gas
-                        .unwrap_or(Uint::from(u64::MAX))
-                        .try_into()
-                        .map_err(|_| JsonRpcError::invalid_params())?,
-                    to: if let Some(to) = call_request.to {
+                    gas_limit,
+                    to: if let Some(to) = to {
                         TxKind::Call(to)
                     } else {
                         // EIP-3860
-                        check_contract_creation_size(&call_request)?;
+                        check_contract_creation_size(Some(&input))?;
                         TxKind::Create
                     },
-                    value: call_request.value.unwrap_or_default(),
-                    input: call_request.input.input.unwrap_or_default(),
+                    value,
+                    input,
                 };
 
                 Ok(transaction.into_signed(signature).into())
             }
-            CallRequest {
-                authorization_list: Some(auth_list),
-                gas_price_details:
-                    GasPriceDetails::Eip1559 {
+            GasPriceDetails::Eip1559 {
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+            } => {
+                let chain_id = chain_id
+                    .unwrap_or_default()
+                    .try_into()
+                    .map_err(|_| JsonRpcError::invalid_params())?;
+
+                let max_fee_per_gas = max_fee_per_gas
+                    .unwrap_or_default()
+                    .try_into()
+                    .map_err(|_| JsonRpcError::invalid_params())?;
+
+                let max_priority_fee_per_gas = max_priority_fee_per_gas
+                    .unwrap_or_default()
+                    .try_into()
+                    .map_err(|_| JsonRpcError::invalid_params())?;
+
+                let access_list = access_list.unwrap_or_default();
+
+                if let Some(authorization_list) = authorization_list {
+                    let transaction = TxEip7702 {
+                        chain_id,
+                        nonce,
+                        gas_limit,
                         max_fee_per_gas,
                         max_priority_fee_per_gas,
-                    },
-                ..
-            } => {
-                // EIP-7702
+                        to: to.ok_or(JsonRpcError::invalid_params())?,
+                        value,
+                        access_list,
+                        authorization_list,
+                        input,
+                    };
 
-                // default signature as eth_call doesn't require it
-                let signature = Signature::new(U256::from(0), U256::from(0), false);
-                let transaction = TxEip7702 {
-                    chain_id: call_request
-                        .chain_id
-                        .unwrap_or_default()
-                        .try_into()
-                        .map_err(|_| JsonRpcError::invalid_params())?,
-                    nonce: call_request
-                        .nonce
-                        .unwrap_or_default()
-                        .try_into()
-                        .map_err(|_| JsonRpcError::invalid_params())?,
-                    max_fee_per_gas: max_fee_per_gas
-                        .unwrap_or_default()
-                        .try_into()
-                        .map_err(|_| JsonRpcError::invalid_params())?,
-                    max_priority_fee_per_gas: max_priority_fee_per_gas
-                        .unwrap_or_default()
-                        .try_into()
-                        .map_err(|_| JsonRpcError::invalid_params())?,
-                    gas_limit: call_request
-                        .gas
-                        .unwrap_or(Uint::from(u64::MAX))
-                        .try_into()
-                        .map_err(|_| JsonRpcError::invalid_params())?,
-                    access_list: call_request.access_list.unwrap_or_default(),
-                    authorization_list: auth_list,
-                    to: call_request.to.ok_or(JsonRpcError::invalid_params())?,
-                    value: call_request.value.unwrap_or_default(),
-                    input: call_request.input.input.unwrap_or_default(),
-                };
-
-                Ok(transaction.into_signed(signature).into())
-            }
-            CallRequest {
-                gas_price_details:
-                    GasPriceDetails::Eip1559 {
+                    Ok(transaction.into_signed(signature).into())
+                } else {
+                    let transaction = TxEip1559 {
+                        chain_id,
+                        nonce,
+                        gas_limit,
                         max_fee_per_gas,
                         max_priority_fee_per_gas,
-                    },
-                ..
-            } => {
-                // EIP-1559
+                        value,
+                        to: if let Some(to) = to {
+                            TxKind::Call(to)
+                        } else {
+                            // EIP-3860
+                            check_contract_creation_size(Some(&input))?;
+                            TxKind::Create
+                        },
+                        access_list,
+                        input,
+                    };
 
-                // default signature as eth_call doesn't require it
-                let signature = Signature::new(U256::from(0), U256::from(0), false);
-                let transaction = TxEip1559 {
-                    chain_id: call_request
-                        .chain_id
-                        .unwrap_or_default()
-                        .try_into()
-                        .map_err(|_| JsonRpcError::invalid_params())?,
-                    nonce: call_request
-                        .nonce
-                        .unwrap_or_default()
-                        .try_into()
-                        .map_err(|_| JsonRpcError::invalid_params())?,
-                    max_fee_per_gas: max_fee_per_gas
-                        .unwrap_or_default()
-                        .try_into()
-                        .map_err(|_| JsonRpcError::invalid_params())?,
-                    max_priority_fee_per_gas: max_priority_fee_per_gas
-                        .unwrap_or_default()
-                        .try_into()
-                        .map_err(|_| JsonRpcError::invalid_params())?,
-                    gas_limit: call_request
-                        .gas
-                        .unwrap_or(Uint::from(u64::MAX))
-                        .try_into()
-                        .map_err(|_| JsonRpcError::invalid_params())?,
-                    to: if let Some(to) = call_request.to {
-                        TxKind::Call(to)
-                    } else {
-                        // EIP-3860
-                        check_contract_creation_size(&call_request)?;
-                        TxKind::Create
-                    },
-                    value: call_request.value.unwrap_or_default(),
-                    input: call_request.input.input.unwrap_or_default(),
-                    access_list: call_request.access_list.unwrap_or_default(),
-                };
-
-                Ok(transaction.into_signed(signature).into())
+                    Ok(transaction.into_signed(signature).into())
+                }
             }
         }
     }
 }
 
-pub fn check_contract_creation_size(call_request: &CallRequest) -> Result<(), JsonRpcError> {
-    // EIP-3860
+// EIP-3860
+pub fn check_contract_creation_size(input: Option<&Bytes>) -> Result<(), JsonRpcError> {
+    let Some(code) = input else {
+        return Ok(());
+    };
+
     let max_code_size = MonadExecutionRevision::LATEST
         .execution_chain_params()
         .max_code_size;
-    if let Some(code) = call_request.input.input.as_ref() {
-        if code.len() > 2 * max_code_size {
-            return Err(JsonRpcError::code_size_too_large(code.len()));
-        }
+
+    if code.len() > 2 * max_code_size {
+        return Err(JsonRpcError::code_size_too_large(code.len()));
     }
+
     Ok(())
 }
 
@@ -369,11 +353,11 @@ pub fn merge_access_lists(generated: AccessList, original: Option<AccessList>) -
 
     let mut access_map: HashMap<Address, HashSet<B256>> = HashMap::new();
 
-    for item in generated.0.into_iter().chain(original.0.into_iter()) {
+    for item in generated.0.into_iter().chain(original.0) {
         access_map
             .entry(item.address)
             .or_default()
-            .extend(item.storage_keys.into_iter());
+            .extend(item.storage_keys);
     }
 
     let merged_items: Vec<AccessListItem> = access_map
@@ -429,46 +413,46 @@ pub async fn fill_gas_params<T: Triedb>(
 pub async fn sender_gas_allowance<T: Triedb>(
     triedb_env: &T,
     block_key: BlockKey,
-    block: &Header,
+    header: &Header,
     request: &CallRequest,
     state_overrides: &StateOverrideSet,
 ) -> Result<u64, JsonRpcError> {
-    if let (Some(sender), Some(gas_price)) = (request.from, request.max_fee_per_gas()) {
-        if gas_price.is_zero() {
-            return Ok(block.gas_limit);
-        }
+    let (Some(sender), Some(gas_price)) = (request.from, request.max_fee_per_gas()) else {
+        return Ok(header.gas_limit);
+    };
 
-        let balance = match state_overrides
-            .get(&sender)
-            .and_then(|override_state| override_state.balance)
-        {
-            Some(balance) => balance,
-            None => {
-                let account = triedb_env
-                    .get_account(block_key, sender.into())
-                    .await
-                    .map_err(JsonRpcError::internal_error)?;
-                U256::from(account.balance)
-            }
-        };
-
-        if balance == U256::ZERO {
-            return Err(JsonRpcError::insufficient_funds());
-        }
-
-        let gas_limit = balance
-            .checked_sub(request.value.unwrap_or_default())
-            .ok_or_else(JsonRpcError::insufficient_funds)?
-            .checked_div(gas_price)
-            .ok_or_else(|| JsonRpcError::internal_error("zero gas price".into()))?;
-
-        Ok(min(
-            gas_limit.try_into().unwrap_or(block.gas_limit),
-            block.gas_limit,
-        ))
-    } else {
-        Ok(block.gas_limit)
+    if gas_price.is_zero() {
+        return Ok(header.gas_limit);
     }
+
+    let balance = match state_overrides
+        .get(&sender)
+        .and_then(|override_state| override_state.balance)
+    {
+        Some(balance) => balance,
+        None => {
+            let account = triedb_env
+                .get_account(block_key, sender.into())
+                .await
+                .map_err(JsonRpcError::internal_error)?;
+            U256::from(account.balance)
+        }
+    };
+
+    if balance == U256::ZERO {
+        return Err(JsonRpcError::insufficient_funds());
+    }
+
+    let gas_limit = balance
+        .checked_sub(request.value.unwrap_or_default())
+        .ok_or_else(JsonRpcError::insufficient_funds)?
+        .checked_div(gas_price)
+        .ok_or_else(|| JsonRpcError::internal_error("zero gas price".into()))?;
+
+    Ok(min(
+        gas_limit.try_into().unwrap_or(header.gas_limit),
+        header.gas_limit,
+    ))
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -514,66 +498,93 @@ pub enum CallParams {
 }
 
 impl CallParams {
-    /// Mutable handle to the embedded `CallRequest`.
-    fn tx(&mut self) -> &mut CallRequest {
+    /// Destructure into the component parts needed by `prepare_eth_call`.
+    fn into_execution_params(self) -> (EthCallExecutionParams, BlockTagOrHash) {
         match self {
-            CallParams::Call(p) => &mut p.transaction,
-            CallParams::Trace(p) => &mut p.transaction,
-            CallParams::AccessList(p) => &mut p.transaction,
-        }
-    }
-
-    fn block(&self) -> BlockTagOrHash {
-        match self {
-            CallParams::Call(p) => p.block.clone(),
-            CallParams::Trace(p) => p.block.clone(),
-            CallParams::AccessList(p) => p.block.clone(),
-        }
-    }
-
-    fn state_overrides(&self) -> StateOverrideSet {
-        match self {
-            CallParams::Call(p) => p.state_overrides.clone(),
-            CallParams::Trace(p) => p.tracer.state_overrides.clone(),
-            CallParams::AccessList(_) => StateOverrideSet::default(),
-        }
-    }
-
-    fn monad_tracer(&self) -> MonadTracer {
-        match self {
-            CallParams::Call(_) => MonadTracer::NoopTracer,
-            CallParams::Trace(p) => {
-                if p.tracer.tracer_params.tracer == Tracer::CallTracer {
-                    MonadTracer::CallTracer
-                } else if p.tracer.tracer_params.config.diff_mode {
-                    MonadTracer::StateDiffTracer
-                } else {
-                    MonadTracer::PreStateTracer
-                }
+            CallParams::Call(p) => {
+                let execution_params = EthCallExecutionParams {
+                    transaction: p.transaction,
+                    state_overrides: p.state_overrides,
+                    tracer: MonadTracer::NoopTracer,
+                };
+                (execution_params, p.block)
             }
-            CallParams::AccessList(_) => MonadTracer::AccessListTracer,
+            CallParams::Trace(p) => {
+                let execution_params = EthCallExecutionParams {
+                    transaction: p.transaction,
+                    state_overrides: p.tracer.state_overrides,
+                    tracer: p.tracer.tracer_params.into(),
+                };
+                (execution_params, p.block)
+            }
+            CallParams::AccessList(p) => {
+                let execution_params = EthCallExecutionParams {
+                    transaction: p.transaction,
+                    state_overrides: StateOverrideSet::default(),
+                    tracer: MonadTracer::AccessListTracer,
+                };
+                (execution_params, p.block)
+            }
         }
-    }
-
-    /// `true` only for the trace variant.
-    #[allow(dead_code)]
-    fn trace(&self) -> bool {
-        matches!(self, CallParams::Trace(_))
     }
 }
 
+struct EthCallExecutionParams {
+    transaction: CallRequest,
+    state_overrides: StateOverrideSet,
+    tracer: MonadTracer,
+}
+
+/// Controls response shaping for provider-cap and execution out-of-gas cases.
+/// Other call failures pass through and are handled by the RPC method.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutOfGasHandling {
+    RpcError,
+    ReturnAsCallFailure,
+}
+
 #[tracing::instrument(level = "debug")]
-pub async fn prepare_eth_call<T: Triedb + TriedbPath>(
+async fn prepare_eth_call<T: Triedb + TriedbPath>(
     triedb_env: &T,
+    eth_call_handler_config: &EthCallHandlerConfig,
     eth_call_executor: &EthCallExecutor,
     chain_id: u64,
-    eth_call_provider_gas_limit: u64,
-    mut params: CallParams,
-) -> Result<CallResult, JsonRpcError> {
-    params.tx().input.input = match (
-        params.tx().input.input.take(),
-        params.tx().input.data.take(),
-    ) {
+    params: CallParams,
+    out_of_gas_handling: OutOfGasHandling,
+) -> Result<(BlockKey, CallResult), JsonRpcError> {
+    let (execution_params, block_tag) = params.into_execution_params();
+    let block_key = get_block_key_from_tag_or_hash(triedb_env, block_tag)
+        .await
+        .ok_or_else(JsonRpcError::block_not_found)?;
+
+    prepare_eth_call_at_block(
+        triedb_env,
+        eth_call_handler_config,
+        eth_call_executor,
+        chain_id,
+        execution_params,
+        out_of_gas_handling,
+        block_key,
+    )
+    .await
+}
+
+async fn prepare_eth_call_at_block<T: Triedb + TriedbPath>(
+    triedb_env: &T,
+    eth_call_handler_config: &EthCallHandlerConfig,
+    eth_call_executor: &EthCallExecutor,
+    chain_id: u64,
+    params: EthCallExecutionParams,
+    out_of_gas_handling: OutOfGasHandling,
+    block_key: BlockKey,
+) -> Result<(BlockKey, CallResult), JsonRpcError> {
+    let EthCallExecutionParams {
+        transaction: mut tx,
+        state_overrides,
+        tracer,
+    } = params;
+
+    tx.input.input = match (tx.input.input.take(), tx.input.data.take()) {
         (Some(input), Some(data)) => {
             if input != data {
                 return Err(JsonRpcError::invalid_params());
@@ -583,18 +594,24 @@ pub async fn prepare_eth_call<T: Triedb + TriedbPath>(
         (None, data) | (data, None) => data,
     };
 
-    if params.tx().gas > Some(U256::from(eth_call_provider_gas_limit)) {
-        return Err(JsonRpcError::eth_call_error(
-            "user-specified gas exceeds provider limit".to_string(),
-            None,
-        ));
+    let provider_gas_limit = U256::from(eth_call_handler_config.provider_gas_limit_eth_call);
+    if tx.gas > Some(provider_gas_limit) {
+        match out_of_gas_handling {
+            OutOfGasHandling::RpcError => {
+                return Err(JsonRpcError::eth_call_error(
+                    "user-specified gas exceeds provider limit".to_string(),
+                    None,
+                ));
+            }
+            OutOfGasHandling::ReturnAsCallFailure => {
+                // Geth caps eth_createAccessList gas above RPCGasCap instead
+                // of rejecting it before execution.
+                tx.gas = Some(provider_gas_limit);
+            }
+        }
     }
 
     // TODO: check duplicate address, duplicate storage key, etc.
-
-    let block_key = get_block_key_from_tag_or_hash(triedb_env, params.block())
-        .await
-        .ok_or_else(JsonRpcError::block_not_found)?;
 
     let mut header = match triedb_env
         .get_block_header(block_key)
@@ -605,24 +622,22 @@ pub async fn prepare_eth_call<T: Triedb + TriedbPath>(
         None => return Err(JsonRpcError::block_not_found()),
     };
 
-    let state_overrides = params.state_overrides();
-    let gas_specified = params.tx().gas.is_some();
-    let original_tx_gas = params
-        .tx()
-        .gas
-        .unwrap_or(U256::from(header.header.gas_limit));
-    let eth_call_provider_gas_limit = eth_call_provider_gas_limit.min(header.header.gas_limit);
+    let gas_specified = tx.gas.is_some();
+    let original_tx_gas = tx.gas.unwrap_or(U256::from(header.header.gas_limit));
+    let eth_call_provider_gas_limit = eth_call_handler_config
+        .provider_gas_limit_eth_call
+        .min(header.header.gas_limit);
     fill_gas_params(
         triedb_env,
         block_key,
-        params.tx(),
+        &mut tx,
         &mut header.header,
         &state_overrides,
         U256::from(eth_call_provider_gas_limit),
     )
     .await?;
 
-    if let Some(tx_chain_id) = params.tx().chain_id {
+    if let Some(tx_chain_id) = tx.chain_id {
         if tx_chain_id != U64::from(chain_id) {
             return Err(JsonRpcError::invalid_chain_id(
                 chain_id,
@@ -630,79 +645,91 @@ pub async fn prepare_eth_call<T: Triedb + TriedbPath>(
             ));
         }
     } else {
-        params.tx().chain_id = Some(U64::from(chain_id));
+        tx.chain_id = Some(U64::from(chain_id));
     }
 
-    let sender = params.tx().from.unwrap_or_default();
-    let tx_chain_id = params
-        .tx()
-        .chain_id
-        .expect("chain id must be populated")
-        .to::<u64>();
-    let txn: TxEnvelope = params.tx().clone().try_into()?;
+    let sender = tx.from.unwrap_or_default();
+    let tx_chain_id = tx.chain_id.expect("chain_id was set above").to::<u64>();
+    let ethcall_chain_id = parse_ethcall_chain_id(tx_chain_id)?;
+    let txn: TxEnvelope = tx.try_into()?;
     let (block_number, block_id) = match block_key {
         BlockKey::Finalized(FinalizedBlockKey(SeqNum(n))) => (n, None),
         BlockKey::Proposed(ProposedBlockKey(SeqNum(n), BlockId(Hash(id)))) => (n, Some(id)),
     };
 
-    let state_overrides = params.state_overrides();
-    let tracer = params.monad_tracer();
     let header_gas_limit = header.header.gas_limit;
+
     match eth_call(
-        tx_chain_id,
-        txn,
-        header.header,
-        sender,
-        block_number,
-        block_id,
+        EthCallRequest {
+            chain_id: ethcall_chain_id,
+            transaction: &txn,
+            block_header: &header.header,
+            sender,
+            block_number,
+            block_id,
+            state_override_set: &state_overrides,
+            tracer,
+            gas_specified,
+        },
         eth_call_executor,
-        &state_overrides,
-        tracer,
-        gas_specified,
     )
     .await
     {
-        monad_ethcall::CallResult::Failure(error)
-            if matches!(error.error_code, monad_ethcall::EthCallResult::OutOfGas) =>
-        {
-            if eth_call_provider_gas_limit < header_gas_limit
-                && U256::from(eth_call_provider_gas_limit) < original_tx_gas
-            {
-                return Err(JsonRpcError::eth_call_error(
-                    "provider-specified max eth_call gas limit exceeded".to_string(),
+        CallResult::Failure(error) if matches!(error.error_code, EthCallResult::OutOfGas) => {
+            match out_of_gas_handling {
+                OutOfGasHandling::RpcError => Err(JsonRpcError::eth_call_error(
+                    if eth_call_provider_gas_limit < header_gas_limit
+                        && U256::from(eth_call_provider_gas_limit) < original_tx_gas
+                    {
+                        "provider-specified max eth_call gas limit exceeded".to_string()
+                    } else {
+                        "out of gas".to_string()
+                    },
                     None,
-                ));
+                )),
+                OutOfGasHandling::ReturnAsCallFailure => Ok((
+                    block_key,
+                    CallResult::Failure(FailureCallResult {
+                        error_code: error.error_code,
+                        gas_used: error.gas_used,
+                        gas_refund: error.gas_refund,
+                        message: "out of gas".to_string(),
+                        data: None,
+                    }),
+                )),
             }
-            return Err(JsonRpcError::eth_call_error("out of gas".to_string(), None));
         }
-        result => Ok(result),
+        result => Ok((block_key, result)),
     }
 }
 
 /// Executes a new message call immediately without creating a transaction on the block chain.
-#[tracing::instrument(level = "debug", skip(chain_state))]
+#[tracing::instrument(level = "debug", skip(data_provider))]
 #[rpc(
     method = "eth_call",
-    ignore = "eth_call_executor,chain_id,eth_call_provider_gas_limit"
+    ignore = "eth_call_handler_config",
+    ignore = "eth_call_executor",
+    ignore = "chain_id"
 )]
 pub async fn monad_eth_call<T: Triedb + TriedbPath>(
-    chain_state: &ChainState<T>,
+    data_provider: &DataProvider<T>,
+    eth_call_handler_config: &EthCallHandlerConfig,
     eth_call_executor: &EthCallExecutor,
     chain_id: u64,
-    eth_call_provider_gas_limit: u64,
     params: MonadEthCallParams,
 ) -> JsonRpcResult<String> {
     trace!("monad_eth_call: {params:?}");
 
-    match prepare_eth_call(
-        &chain_state.triedb_env,
+    let (_, result) = prepare_eth_call(
+        &data_provider.triedb_env,
+        eth_call_handler_config,
         eth_call_executor,
         chain_id,
-        eth_call_provider_gas_limit,
         CallParams::Call(params),
+        OutOfGasHandling::RpcError,
     )
-    .await?
-    {
+    .await?;
+    match result {
         CallResult::Success(monad_ethcall::SuccessCallResult { output_data, .. }) => {
             Ok(ethhex::encode_bytes(&output_data))
         }
@@ -713,38 +740,36 @@ pub async fn monad_eth_call<T: Triedb + TriedbPath>(
     }
 }
 
-/// Returns the tracing result result by executing an eth call.
+/// Returns the tracing result by executing an eth call.
 #[rpc(
     method = "debug_traceCall",
-    ignore = "chain_id",
+    ignore = "eth_call_handler_config",
     ignore = "eth_call_executor",
-    ignore = "eth_call_gas_limit"
+    ignore = "chain_id"
 )]
 #[allow(non_snake_case)]
 pub async fn monad_debug_traceCall<T: Triedb + TriedbPath>(
-    chain_state: &ChainState<T>,
+    data_provider: &DataProvider<T>,
+    eth_call_handler_config: &EthCallHandlerConfig,
     eth_call_executor: &EthCallExecutor,
     chain_id: u64,
-    eth_call_gas_limit: u64,
     params: MonadDebugTraceCallParams,
 ) -> JsonRpcResult<Box<RawValue>> {
     debug!(?params, "monad_debug_traceCall");
 
-    let block_key = get_block_key_from_tag_or_hash(&chain_state.triedb_env, params.block.clone())
-        .await
-        .ok_or_else(JsonRpcError::block_not_found)?;
+    let tracer_params = params.tracer.tracer_params;
+    let tracer: MonadTracer = tracer_params.into();
 
-    let tracer = CallParams::Trace(params.clone()).monad_tracer();
-
-    let raw_payload: Vec<u8> = match prepare_eth_call(
-        &chain_state.triedb_env,
+    let (block_key, call_result) = prepare_eth_call(
+        &data_provider.triedb_env,
+        eth_call_handler_config,
         eth_call_executor,
         chain_id,
-        eth_call_gas_limit,
-        CallParams::Trace(params.clone()),
+        CallParams::Trace(params),
+        OutOfGasHandling::RpcError,
     )
-    .await?
-    {
+    .await?;
+    let raw_payload: Vec<u8> = match call_result {
         CallResult::Success(monad_ethcall::SuccessCallResult { output_data, .. }) => output_data,
         CallResult::Failure(error) => {
             return Err(JsonRpcError::eth_call_error(error.message, error.data))
@@ -756,10 +781,10 @@ pub async fn monad_debug_traceCall<T: Triedb + TriedbPath>(
         MonadTracer::CallTracer => {
             let mut slice: &[u8] = raw_payload.as_slice();
             let frame = decode_call_frame(
-                &chain_state.triedb_env,
+                &data_provider.triedb_env,
                 &mut slice,
                 block_key,
-                &params.tracer.tracer_params,
+                &tracer_params,
             )
             .await?;
             serde_json::value::to_raw_value(&frame).map_err(|e| {
@@ -781,96 +806,133 @@ pub async fn monad_debug_traceCall<T: Triedb + TriedbPath>(
     }
 }
 
-/// Returns an access list containing all addresses and storage slots accessed during a simulated transaction.
+/// Returns the derived access list and gas used for a simulated transaction.
+///
+/// Execution failures and reverts are reported in the result object's optional
+/// `error` field so callers can still use the generated access list.
 #[rpc(
     method = "eth_createAccessList",
-    ignore = "chain_id",
+    ignore = "eth_call_handler_config",
     ignore = "eth_call_executor",
-    ignore = "eth_call_gas_limit"
+    ignore = "chain_id"
 )]
 #[allow(non_snake_case)]
 pub async fn monad_createAccessList<T: Triedb + TriedbPath>(
-    chain_state: &ChainState<T>,
+    data_provider: &DataProvider<T>,
+    eth_call_handler_config: &EthCallHandlerConfig,
     eth_call_executor: &EthCallExecutor,
     chain_id: u64,
-    eth_call_gas_limit: u64,
     params: MonadCreateAccessListParams,
-) -> JsonRpcResult<Box<RawValue>> {
+) -> JsonRpcResult<MonadCreateAccessListResult> {
     trace!("monad_createAccessList: {params:?}");
 
-    let raw_payload: Vec<u8> = match prepare_eth_call(
-        &chain_state.triedb_env,
+    let mut follow_up_tx = params.transaction.clone();
+    let original_access_list = params.transaction.access_list.clone();
+
+    let (block_key, call_result) = prepare_eth_call(
+        &data_provider.triedb_env,
+        eth_call_handler_config,
         eth_call_executor,
         chain_id,
-        eth_call_gas_limit,
-        CallParams::AccessList(params.clone()),
+        CallParams::AccessList(params),
+        OutOfGasHandling::ReturnAsCallFailure,
     )
-    .await?
-    {
-        CallResult::Success(monad_ethcall::SuccessCallResult { output_data, .. }) => output_data,
-        CallResult::Failure(error) => {
-            return Err(JsonRpcError::eth_call_error(error.message, error.data))
-        }
-        CallResult::Revert(_) => {
-            return Err(JsonRpcError::eth_call_error(
-                "execution reverted".to_string(),
-                None,
-            ));
-        }
-    };
+    .await?;
+    let access_list = access_list_from_trace_call_result(call_result)?;
 
-    let v: serde_cbor::Value = if raw_payload.is_empty() {
-        serde_cbor::Value::Array(vec![])
-    } else {
-        serde_cbor::from_slice(&raw_payload)
-            .map_err(|e| JsonRpcError::internal_error(format!("cbor decode error: {}", e)))?
-    };
-
-    let access_list: AccessList = serde_cbor::value::from_value(v).map_err(|e| {
-        JsonRpcError::internal_error(format!("failed to decode access list: {}", e))
-    })?;
-
-    let mut with_access_list_tx = params.transaction.clone();
-    with_access_list_tx.access_list = Some(merge_access_lists(
+    // Compatibility note: geth keeps rerunning access-list tracing until the
+    // generated access list stops changing. This only does one traced pass; the
+    // follow-up call is used to compute gasUsed and error for that access list.
+    follow_up_tx.access_list = Some(merge_access_lists(
         access_list.clone(),
-        params.transaction.access_list,
+        original_access_list,
     ));
 
-    let call_params = MonadEthCallParams {
-        transaction: with_access_list_tx,
-        block: params.block,
+    let call_params = EthCallExecutionParams {
+        transaction: follow_up_tx,
         state_overrides: StateOverrideSet::default(),
+        tracer: MonadTracer::NoopTracer,
     };
 
-    let result: AccessListResult = match prepare_eth_call(
-        &chain_state.triedb_env,
+    let (_, call_result) = prepare_eth_call_at_block(
+        &data_provider.triedb_env,
+        eth_call_handler_config,
         eth_call_executor,
         chain_id,
-        eth_call_gas_limit,
-        CallParams::Call(call_params),
+        call_params,
+        OutOfGasHandling::ReturnAsCallFailure,
+        block_key,
     )
-    .await?
-    {
-        CallResult::Success(monad_ethcall::SuccessCallResult { gas_used, .. }) => {
-            AccessListResult {
+    .await?;
+    MonadCreateAccessListResult::from_follow_up_call_result(access_list, call_result)
+}
+
+fn decode_access_list_trace(raw_payload: &[u8]) -> Result<AccessList, JsonRpcError> {
+    if raw_payload.is_empty() {
+        return Ok(AccessList::default());
+    }
+
+    serde_cbor::from_slice(raw_payload)
+        .map_err(|e| JsonRpcError::internal_error(format!("failed to decode access list: {}", e)))
+}
+
+fn access_list_from_trace_call_result(call_result: CallResult) -> Result<AccessList, JsonRpcError> {
+    match call_result {
+        CallResult::Success(monad_ethcall::SuccessCallResult { output_data, .. }) => {
+            decode_access_list_trace(&output_data)
+        }
+        CallResult::Failure(error) => Err(JsonRpcError::eth_call_error(error.message, error.data)),
+        CallResult::Revert(result) => decode_access_list_trace(&result.trace),
+    }
+}
+
+impl MonadCreateAccessListResult {
+    /// Builds the public `eth_createAccessList` result from the follow-up call.
+    ///
+    /// Execution failures that still produce gas usage are returned in the
+    /// result object so callers can use the generated access list.
+    fn from_follow_up_call_result(
+        access_list: AccessList,
+        call_result: CallResult,
+    ) -> Result<Self, JsonRpcError> {
+        match call_result {
+            CallResult::Success(monad_ethcall::SuccessCallResult { gas_used, .. }) => Ok(Self {
                 access_list,
                 gas_used: U256::from(gas_used),
                 error: None,
-            }
+            }),
+            CallResult::Failure(error) => match error.error_code {
+                EthCallResult::OutOfGas
+                | EthCallResult::ExecutionError
+                | EthCallResult::ReserveBalanceViolation => {
+                    // Geth's `eth_createAccessList` reports the VM error string for
+                    // execution reverts, without the decoded revert reason suffix.
+                    let message = if error.error_code == EthCallResult::ExecutionError
+                        && error.message.starts_with("execution reverted:")
+                    {
+                        "execution reverted".to_string()
+                    } else {
+                        error.message.clone()
+                    };
+                    Ok(Self {
+                        access_list,
+                        gas_used: U256::from(error.gas_used),
+                        error: Some(message),
+                    })
+                }
+                EthCallResult::OtherError => {
+                    Err(JsonRpcError::eth_call_error(error.message, error.data))
+                }
+                EthCallResult::Success => Err(JsonRpcError::internal_error(
+                    "unexpected successful eth_call failure".into(),
+                )),
+            },
+            CallResult::Revert(_) => Err(JsonRpcError::internal_error(
+                "unexpected traced revert from NoopTracer eth_createAccessList follow-up call"
+                    .into(),
+            )),
         }
-        CallResult::Failure(error) => {
-            return Err(JsonRpcError::eth_call_error(error.message, error.data))
-        }
-        CallResult::Revert(_) => {
-            return Err(JsonRpcError::eth_call_error(
-                "execution reverted".to_string(),
-                None,
-            ));
-        }
-    };
-
-    serde_json::value::to_raw_value(&result)
-        .map_err(|e| JsonRpcError::internal_error(format!("json serialization error: {}", e)))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -922,9 +984,13 @@ mod tests {
     use std::collections::HashMap;
 
     use alloy_consensus::{Header, TxEnvelope};
-    use alloy_primitives::{Address, Bytes, U256};
+    use alloy_primitives::{Address, Bytes, B256, U256};
+    use alloy_rpc_types::{AccessList, AccessListItem};
     use monad_chain_config::execution_revision::MonadExecutionRevision;
-    use monad_ethcall::{StateOverrideObject, StateOverrideSet};
+    use monad_ethcall::{
+        CallResult, EthCallResult, FailureCallResult, RevertCallResult, StateOverrideObject,
+        StateOverrideSet, SuccessCallResult,
+    };
     use monad_triedb_utils::{
         mock_triedb::MockTriedb,
         triedb_env::{BlockKey, FinalizedBlockKey},
@@ -936,10 +1002,210 @@ mod tests {
     use crate::{
         handlers::{
             debug::Tracer,
-            eth::call::{sender_gas_allowance, CallInput, MonadDebugTraceCallParams},
+            eth::call::{
+                access_list_from_trace_call_result, decode_access_list_trace, sender_gas_allowance,
+                CallInput, MonadDebugTraceCallParams,
+            },
         },
-        types::jsonrpc::JsonRpcError,
+        types::{eth_json::MonadCreateAccessListResult, jsonrpc::JsonRpcError},
     };
+
+    fn sample_access_list() -> AccessList {
+        AccessList(vec![AccessListItem {
+            address: Address::from([0x11; 20]),
+            storage_keys: vec![B256::from([0x22; 32])],
+        }])
+    }
+
+    fn cbor_access_list(access_list: &AccessList) -> Vec<u8> {
+        serde_cbor::to_vec(access_list).expect("access list encodes as CBOR")
+    }
+
+    fn failed_call_result(error_code: EthCallResult, gas_used: u64, message: &str) -> CallResult {
+        CallResult::Failure(FailureCallResult {
+            error_code,
+            gas_used,
+            gas_refund: 0,
+            message: message.into(),
+            data: None,
+        })
+    }
+
+    #[test]
+    fn decode_access_list_trace_empty_payload() {
+        let access_list = decode_access_list_trace(&[]).expect("empty trace decodes");
+        assert_eq!(access_list, AccessList::default());
+    }
+
+    #[test]
+    fn decode_access_list_trace_cbor_payload() {
+        let expected = sample_access_list();
+        let payload = cbor_access_list(&expected);
+
+        let access_list = decode_access_list_trace(&payload).expect("access list trace decodes");
+
+        assert_eq!(access_list, expected);
+    }
+
+    #[test]
+    fn access_list_from_successful_tracer_result() {
+        let expected = sample_access_list();
+        let payload = cbor_access_list(&expected);
+
+        let access_list =
+            access_list_from_trace_call_result(CallResult::Success(SuccessCallResult {
+                output_data: payload,
+                ..Default::default()
+            }))
+            .expect("successful tracer result decodes");
+
+        assert_eq!(access_list, expected);
+    }
+
+    #[test]
+    fn access_list_from_reverted_tracer_result() {
+        let expected = sample_access_list();
+        let payload = cbor_access_list(&expected);
+
+        let access_list =
+            access_list_from_trace_call_result(CallResult::Revert(RevertCallResult {
+                trace: payload,
+            }))
+            .expect("reverted tracer result decodes");
+
+        assert_eq!(access_list, expected);
+    }
+
+    #[test]
+    fn access_list_from_failed_tracer_result_stays_rpc_error() {
+        let err = access_list_from_trace_call_result(CallResult::Failure(FailureCallResult {
+            error_code: EthCallResult::OtherError,
+            gas_used: 0,
+            gas_refund: 0,
+            message: "failed to apply transaction".into(),
+            data: Some("0xdead".into()),
+        }))
+        .expect_err("access-list setup failures stay top-level RPC errors");
+
+        assert_eq!(
+            err,
+            JsonRpcError::eth_call_error(
+                "failed to apply transaction".into(),
+                Some("0xdead".into())
+            )
+        );
+    }
+
+    #[test]
+    fn access_list_result_records_follow_up_success() {
+        let access_list = sample_access_list();
+        let call_result = CallResult::Success(SuccessCallResult {
+            gas_used: 21_000,
+            ..Default::default()
+        });
+
+        let result = MonadCreateAccessListResult::from_follow_up_call_result(
+            access_list.clone(),
+            call_result,
+        )
+        .expect("successful follow-up call produces access-list result");
+
+        assert_eq!(result.access_list, access_list);
+        assert_eq!(result.gas_used, U256::from(21_000));
+        assert_eq!(result.error, None);
+    }
+
+    #[test]
+    fn access_list_result_records_follow_up_execution_failures() {
+        for (error_code, gas_used, message, expected_message) in [
+            (
+                EthCallResult::ExecutionError,
+                54_321,
+                "execution reverted: abi error",
+                "execution reverted",
+            ),
+            (EthCallResult::OutOfGas, 12_345, "out of gas", "out of gas"),
+            (
+                EthCallResult::ReserveBalanceViolation,
+                23_456,
+                "reserve balance violation",
+                "reserve balance violation",
+            ),
+        ] {
+            let access_list = sample_access_list();
+            let call_result = failed_call_result(error_code, gas_used, message);
+
+            let result = MonadCreateAccessListResult::from_follow_up_call_result(
+                access_list.clone(),
+                call_result,
+            )
+            .expect("execution failure is represented in access list result");
+
+            assert_eq!(result.access_list, access_list);
+            assert_eq!(result.gas_used, U256::from(gas_used));
+            assert_eq!(result.error.as_deref(), Some(expected_message));
+        }
+    }
+
+    #[test]
+    fn access_list_result_preserves_other_error_as_rpc_error() {
+        let access_list = sample_access_list();
+        let call_result = CallResult::Failure(FailureCallResult {
+            error_code: EthCallResult::OtherError,
+            gas_used: 1,
+            gas_refund: 0,
+            message: "internal eth_call error".into(),
+            data: Some("0xdead".into()),
+        });
+
+        let err = MonadCreateAccessListResult::from_follow_up_call_result(access_list, call_result)
+            .expect_err("non-execution failures stay top-level RPC errors");
+
+        assert_eq!(
+            err,
+            JsonRpcError::eth_call_error("internal eth_call error".into(), Some("0xdead".into()))
+        );
+    }
+
+    #[test]
+    fn create_access_list_revert_result_matches_execution_apis_shape() {
+        let expected_access_list = sample_access_list();
+        let trace_payload = cbor_access_list(&expected_access_list);
+
+        let access_list =
+            access_list_from_trace_call_result(CallResult::Revert(RevertCallResult {
+                trace: trace_payload,
+            }))
+            .expect("reverted access-list trace still decodes");
+
+        let result = MonadCreateAccessListResult::from_follow_up_call_result(
+            access_list.clone(),
+            CallResult::Failure(FailureCallResult {
+                error_code: EthCallResult::ExecutionError,
+                gas_used: 54_321,
+                gas_refund: 0,
+                message: "execution reverted: user error".into(),
+                data: Some("0x08c379a0".into()),
+            }),
+        )
+        .expect("reverting follow-up call is returned in the result object");
+
+        assert_eq!(access_list, expected_access_list);
+        assert_eq!(result.access_list, expected_access_list);
+        assert_eq!(result.gas_used, U256::from(54_321));
+        assert_eq!(result.error.as_deref(), Some("execution reverted"));
+
+        let value = serde_json::to_value(&result).expect("access-list result serializes");
+        let serialized_access_list = value["accessList"]
+            .as_array()
+            .expect("accessList is an array");
+        assert!(
+            !serialized_access_list.is_empty(),
+            "accessList must be present even when execution reverts"
+        );
+        assert_eq!(value["error"], json!("execution reverted"));
+        assert!(value.get("gasUsed").is_some(), "gasUsed must be present");
+    }
 
     #[test]
     fn parse_call_request_with_tracer() {

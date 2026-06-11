@@ -122,9 +122,17 @@ where
     fn eq(&self, other: &Self) -> bool {
         self.pending_block_tree.eq(&other.pending_block_tree)
             && self.vote_state.eq(&other.vote_state)
-            && self.pacemaker.eq(&other.pacemaker)
+            && self.no_endorsement_state.eq(&other.no_endorsement_state)
+            && self.scheduled_vote.eq(&other.scheduled_vote)
             && self.safety.eq(&other.safety)
             && self.pacemaker.eq(&other.pacemaker)
+            && self.block_sync_requests.eq(&other.block_sync_requests)
+            && self
+                .canonical_proposed_tip
+                .eq(&other.canonical_proposed_tip)
+            && self
+                .vote_delay_timer_start
+                .eq(&other.vote_delay_timer_start)
     }
 }
 
@@ -142,9 +150,13 @@ where
         f.debug_struct("ConsensusState")
             .field("pending_block_tree", &self.pending_block_tree)
             .field("vote_state", &self.vote_state)
-            .field("pacemaker", &self.pacemaker)
+            .field("no_endorsement_state", &self.no_endorsement_state)
+            .field("scheduled_vote", &self.scheduled_vote)
             .field("safety", &self.safety)
             .field("pacemaker", &self.pacemaker)
+            .field("block_sync_requests", &self.block_sync_requests)
+            .field("canonical_proposed_tip", &self.canonical_proposed_tip)
+            .field("vote_delay_timer_start", &self.vote_delay_timer_start)
             .finish()
     }
 }
@@ -152,13 +164,14 @@ where
 // The bound on future rounds/NEs that we'll buffer
 const FUTURE_VOTE_BOUND: Round = Round(10);
 
+#[derive(Debug, PartialEq, Eq)]
 struct BlockSyncRequestStatus {
     range: BlockRange,
     // once a block with round >= cancel_round is committed, this request will be canceled.
     cancel_round: Round,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum OutgoingVoteStatus {
     TimerFired,
     VoteReady(Vote),
@@ -727,6 +740,8 @@ where
             self.metrics.consensus_events.old_remote_timeout += 1;
             return cmds;
         }
+        // Note that last_round_certificate might have been mutated to None by
+        // TimeoutMessage::validate if timeout.round == current_round
 
         debug!(?author, ?timeout, "remote timeout message");
         self.metrics.consensus_events.remote_timeout_msg += 1;
@@ -800,6 +815,9 @@ where
             }
             None => {
                 // don't do anything
+
+                // Note that last_round_certificate might have been mutated to None by
+                // TimeoutMessage::validate if timeout.round == current_round
             }
         }
 
@@ -1836,7 +1854,10 @@ where
                 );
 
                 cmds.push(ConsensusCommand::Publish {
-                    target: RouterTarget::Raptorcast(self.consensus.pacemaker.get_current_epoch()),
+                    target: RouterTarget::Raptorcast {
+                        round: self.consensus.pacemaker.get_current_round(),
+                        epoch: self.consensus.pacemaker.get_current_epoch(),
+                    },
                     message: ConsensusMessage {
                         version: self.version,
                         message: ProtocolMessage::Proposal(ProposalMessage {
@@ -2776,7 +2797,7 @@ mod test {
     {
         cmds.iter().find_map(|c| match c {
             ConsensusCommand::Publish {
-                target: RouterTarget::Raptorcast(_),
+                target: RouterTarget::Raptorcast { .. },
                 message,
             } => match &message.deref().deref().message {
                 ProtocolMessage::Proposal(p) => Some(p.clone()),

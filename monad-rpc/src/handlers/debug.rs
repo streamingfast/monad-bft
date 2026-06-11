@@ -15,29 +15,28 @@
 
 use std::{cell::RefCell, rc::Rc};
 
-use alloy_consensus::{Block, BlockBody, Header, ReceiptEnvelope, TxEnvelope};
+use alloy_consensus::{Block, BlockBody, Header, TxEnvelope};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{
     aliases::{U256, U64, U8},
-    Address, Bytes, Log,
+    Address, Bytes, FixedBytes, Log,
 };
 use alloy_rlp::{Decodable, Encodable, RlpDecodable};
-use monad_archive::prelude::{BlockDataReader, IndexReader};
 use monad_rpc_docs::rpc;
-use monad_triedb_utils::triedb_env::{BlockKey, FinalizedBlockKey, Triedb};
-use monad_types::SeqNum;
+use monad_triedb_utils::triedb_env::{BlockKey, Triedb};
 use serde::{Deserialize, Serialize};
 use tracing::{error, trace};
 
 use crate::{
-    chainstate::{get_block_key_from_tag, get_latest_block_key, ChainState},
+    data::DataProvider,
     types::{
         eth_json::{
             BlockTagOrHash, BlockTags, EthAddress, EthHash, FixedData, MonadU256, Quantity,
             UnformattedData,
         },
         ethhex,
-        jsonrpc::{JsonRpcError, JsonRpcResult},
+        heuristic_size::HeuristicSize,
+        jsonrpc::{ChainStateResultExt, JsonRpcError, JsonRpcResult},
     },
 };
 
@@ -46,11 +45,12 @@ pub struct DebugBlockParams {
     block: BlockTags,
 }
 
-#[rpc(method = "debug_getRawBlock")]
+#[rpc(method = "debug_getRawBlock", ignore = "max_response_size")]
 #[allow(non_snake_case)]
 /// Returns an RLP-encoded block.
 pub async fn monad_debug_getRawBlock<T: Triedb>(
-    chain_state: &ChainState<T>,
+    data_provider: &DataProvider<T>,
+    max_response_size: usize,
     params: DebugBlockParams,
 ) -> JsonRpcResult<String> {
     trace!("monad_debug_getRawBlock: {params:?}");
@@ -61,22 +61,39 @@ pub async fn monad_debug_getRawBlock<T: Triedb>(
         Ok(ethhex::encode_bytes(&res))
     };
 
-    match chain_state
+    match data_provider
         .get_block(BlockTagOrHash::BlockTags(params.block), true)
         .await
     {
-        Ok(block) => encode_block(Block {
-            header: block.header.inner,
-            body: BlockBody {
-                transactions: block
-                    .transactions
-                    .into_transactions()
-                    .map(|tx| tx.into())
-                    .collect(),
-                ommers: vec![],
-                withdrawals: None,
-            },
-        }),
+        Ok(block) => {
+            let alloy_rpc_types::Block {
+                header,
+                transactions,
+                ..
+            } = block;
+            let header = header.inner;
+
+            let mut txs_heuristic_response_size = 0usize;
+            let mut raw_transactions = Vec::new();
+
+            for tx in transactions.into_transactions() {
+                let tx = tx.into_inner();
+                txs_heuristic_response_size += tx.heuristic_json_len();
+                if txs_heuristic_response_size > max_response_size {
+                    return Err(JsonRpcError::max_size_exceeded());
+                }
+                raw_transactions.push(tx);
+            }
+
+            encode_block(Block {
+                header,
+                body: BlockBody {
+                    transactions: raw_transactions,
+                    ommers: vec![],
+                    withdrawals: None,
+                },
+            })
+        }
         Err(_) => Err(JsonRpcError::internal_error("block data not found".into())),
     }
 }
@@ -85,7 +102,7 @@ pub async fn monad_debug_getRawBlock<T: Triedb>(
 #[allow(non_snake_case)]
 /// Returns an RLP-encoded header.
 pub async fn monad_debug_getRawHeader<T: Triedb>(
-    chain_state: &ChainState<T>,
+    data_provider: &DataProvider<T>,
     params: DebugBlockParams,
 ) -> JsonRpcResult<String> {
     trace!("monad_debug_getRawHeader: {params:?}");
@@ -96,7 +113,7 @@ pub async fn monad_debug_getRawHeader<T: Triedb>(
         Ok(ethhex::encode_bytes(&res))
     };
 
-    match chain_state
+    match data_provider
         .get_block_header(BlockTagOrHash::BlockTags(params.block))
         .await
     {
@@ -111,31 +128,36 @@ pub struct MonadDebugGetRawReceiptsResult {
     receipts: Vec<String>,
 }
 
-#[rpc(method = "debug_getRawReceipts")]
+#[rpc(method = "debug_getRawReceipts", ignore = "max_response_size")]
 #[allow(non_snake_case)]
 /// Returns an array of EIP-2718 binary-encoded receipts.
 pub async fn monad_debug_getRawReceipts<T: Triedb>(
-    chain_state: &ChainState<T>,
+    data_provider: &DataProvider<T>,
+    max_response_size: usize,
     params: DebugBlockParams,
 ) -> JsonRpcResult<MonadDebugGetRawReceiptsResult> {
     trace!("monad_debug_getRawReceipts: {params:?}");
 
-    let encode_receipts = |receipts: Vec<ReceiptEnvelope<alloy_primitives::Log>>| {
-        let receipts = receipts
-            .into_iter()
-            .map(|r| {
-                let mut res = Vec::new();
-                r.encode_2718(&mut res);
-                ethhex::encode_bytes(&res)
-            })
-            .collect();
-        Ok(MonadDebugGetRawReceiptsResult { receipts })
-    };
+    let raw_receipts = data_provider
+        .get_raw_receipts(params.block)
+        .await
+        .map_err(|_| JsonRpcError::internal_error("block data not found".into()))?;
 
-    match chain_state.get_raw_receipts(params.block).await {
-        Ok(receipts) => encode_receipts(receipts),
-        Err(_) => Err(JsonRpcError::internal_error("block data not found".into())),
+    let mut heuristic_response_size = 0usize;
+    let mut receipts = Vec::with_capacity(raw_receipts.len());
+
+    for r in raw_receipts {
+        let mut res = Vec::new();
+        r.encode_2718(&mut res);
+        let receipt = ethhex::encode_bytes(&res);
+        heuristic_response_size += receipt.heuristic_json_len();
+        if heuristic_response_size > max_response_size {
+            return Err(JsonRpcError::max_size_exceeded());
+        }
+        receipts.push(receipt);
     }
+
+    Ok(MonadDebugGetRawReceiptsResult { receipts })
 }
 
 #[derive(Deserialize, Debug, schemars::JsonSchema)]
@@ -147,12 +169,15 @@ pub struct MonadDebugGetRawTransactionParams {
 #[allow(non_snake_case)]
 /// Returns an array of EIP-2718 binary-encoded transactions.
 pub async fn monad_debug_getRawTransaction<T: Triedb>(
-    chain_state: &ChainState<T>,
+    data_provider: &DataProvider<T>,
     params: MonadDebugGetRawTransactionParams,
 ) -> JsonRpcResult<String> {
     trace!("monad_debug_getRawTransaction: {params:?}");
 
-    match chain_state.get_transaction(params.tx_hash.0).await {
+    match data_provider
+        .get_transaction(&FixedBytes(params.tx_hash.0))
+        .await
+    {
         Ok(tx) => {
             let mut res = Vec::new();
             let tx: TxEnvelope = tx.into();
@@ -294,10 +319,11 @@ pub struct MonadCallFrameLog {
     topics: Vec<FixedData<32>>,
     data: UnformattedData,
     position: Quantity,
+    index: Quantity,
 }
 
-impl From<CallFrameLog> for MonadCallFrameLog {
-    fn from(value: CallFrameLog) -> Self {
+impl MonadCallFrameLog {
+    fn from_call_frame_log(value: CallFrameLog, index: usize) -> Self {
         Self {
             address: value.log.address.into(),
             topics: value
@@ -308,6 +334,7 @@ impl From<CallFrameLog> for MonadCallFrameLog {
                 .collect(),
             data: value.log.data.data.into(),
             position: Quantity(value.position.to()),
+            index: Quantity(index as u64),
         }
     }
 }
@@ -343,7 +370,7 @@ pub struct MonadCallFrame {
 
 impl From<CallFrame> for MonadCallFrame {
     fn from(value: CallFrame) -> Self {
-        // the “value” argument is not included for STATICALL
+        // the "value" argument is not included for STATICALL
         let frame_value = if matches!(value.typ, CallKind::StaticCall) {
             None
         } else {
@@ -389,8 +416,11 @@ impl From<CallFrame> for MonadCallFrame {
             calls: Vec::new(),
             logs: value
                 .logs
-                .map(|logs| logs.into_iter().map(Into::into).collect())
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+                .map(|(i, log)| MonadCallFrameLog::from_call_frame_log(log, i))
+                .collect(),
         }
     }
 }
@@ -418,66 +448,25 @@ pub struct MonadDebugTraceBlockByHashParams {
 #[allow(non_snake_case)]
 /// Returns the tracing result by executing all transactions in the block specified by the block hash with a tracer.
 pub async fn monad_debug_traceBlockByHash<T: Triedb>(
-    chain_state: &ChainState<T>,
+    data_provider: &DataProvider<T>,
     params: MonadDebugTraceBlockByHashParams,
 ) -> JsonRpcResult<Vec<MonadDebugTraceBlockResult>> {
     trace!("monad_debugTraceBlockByHash: {params:?}");
 
-    let latest_block_key = get_latest_block_key(&chain_state.triedb_env);
-    if let Some(block_num) = chain_state
-        .triedb_env
-        .get_block_number_by_hash(latest_block_key, params.block_hash.0)
+    let (block_key, tx_hashes, call_frames) = data_provider
+        .get_block_call_frames(BlockTagOrHash::Hash(params.block_hash))
         .await
-        .map_err(JsonRpcError::internal_error)?
-    {
-        let block_key = chain_state
-            .triedb_env
-            .get_block_key(SeqNum(block_num))
-            .ok_or(JsonRpcError::block_not_found())?;
-        if let Ok(result) =
-            get_call_frames_from_triedb(&chain_state.triedb_env, block_key, &params.tracer).await
-        {
-            return Ok(result);
-        }
-    }
+        .to_jsonrpc_result()?
+        .ok_or(JsonRpcError::internal_error("block not found".into()))?;
 
-    // try archive if block hash not found and archive reader specified
-    let mut resp = Vec::new();
-    if let Some(archive_reader) = &chain_state.archive_reader {
-        if let Some(block) = archive_reader
-            .try_get_block_by_hash(&params.block_hash.0.into())
-            .await?
-        {
-            if let Some(call_frames) = archive_reader
-                .try_get_block_traces(block.header.number)
-                .await?
-            {
-                let tx_ids = block.body.transactions().map(|tx| *tx.tx.tx_hash());
-
-                for (call_frame, tx_id) in call_frames.into_iter().zip(tx_ids) {
-                    let rlp_call_frame = &mut call_frame.as_slice();
-                    let Some(traces) = decode_call_frame(
-                        &chain_state.triedb_env,
-                        rlp_call_frame,
-                        BlockKey::Finalized(FinalizedBlockKey(SeqNum(block.header.number))),
-                        &params.tracer,
-                    )
-                    .await?
-                    else {
-                        return Err(JsonRpcError::internal_error("traces not found".to_string()));
-                    };
-                    resp.push(MonadDebugTraceBlockResult {
-                        tx_hash: FixedData::<32>::from(tx_id),
-                        result: traces,
-                    });
-                }
-
-                return Ok(resp);
-            }
-        }
-    }
-
-    Err(JsonRpcError::internal_error("block not found".into()))
+    decode_block_call_frames(
+        &data_provider.triedb_env,
+        block_key,
+        tx_hashes,
+        call_frames,
+        &params.tracer,
+    )
+    .await
 }
 
 #[derive(Clone, Copy, Deserialize, Debug, schemars::JsonSchema)]
@@ -498,133 +487,65 @@ pub struct MonadDebugTraceBlockResult {
 #[allow(non_snake_case)]
 /// Returns the tracing result by executing all transactions in the block specified by the block number with a tracer.
 pub async fn monad_debug_traceBlockByNumber<T: Triedb>(
-    chain_state: &ChainState<T>,
+    data_provider: &DataProvider<T>,
     params: MonadDebugTraceBlockByNumberParams,
 ) -> JsonRpcResult<Vec<MonadDebugTraceBlockResult>> {
     trace!("monad_debugTraceBlockByNumber: {params:?}");
 
-    let block_key = get_block_key_from_tag(&chain_state.triedb_env, params.block_number)
+    let (block_key, tx_hashes, call_frames) = data_provider
+        .get_block_call_frames(BlockTagOrHash::BlockTags(params.block_number))
+        .await
+        .to_jsonrpc_result()?
         .ok_or(JsonRpcError::block_not_found())?;
-    if let Ok(result) =
-        get_call_frames_from_triedb(&chain_state.triedb_env, block_key, &params.tracer).await
-    {
-        return Ok(result);
-    }
 
-    // try archive if block number or transactions not found and archive reader specified
-    let mut resp = Vec::new();
-    if let (Some(archive_reader), BlockKey::Finalized(FinalizedBlockKey(block_num))) =
-        (&chain_state.archive_reader, block_key)
-    {
-        if let Some(block) = archive_reader.try_get_block_by_number(block_num.0).await? {
-            if let Some(call_frames) = archive_reader.try_get_block_traces(block_num.0).await? {
-                let tx_ids = block.body.transactions().map(|tx| *tx.tx.tx_hash());
-
-                // TODO: parallelize this with stream + buffered + try_collect
-                for (call_frame, tx_id) in call_frames.into_iter().zip(tx_ids) {
-                    let rlp_call_frame = &mut call_frame.as_slice();
-                    let Some(traces) = decode_call_frame(
-                        &chain_state.triedb_env,
-                        rlp_call_frame,
-                        block_key,
-                        &params.tracer,
-                    )
-                    .await?
-                    else {
-                        return Err(JsonRpcError::internal_error("traces not found".to_string()));
-                    };
-                    resp.push(MonadDebugTraceBlockResult {
-                        tx_hash: FixedData::<32>::from(tx_id),
-                        result: traces,
-                    });
-                }
-
-                return Ok(resp);
-            }
-        }
-    }
-
-    Err(JsonRpcError::block_not_found())
+    decode_block_call_frames(
+        &data_provider.triedb_env,
+        block_key,
+        tx_hashes,
+        call_frames,
+        &params.tracer,
+    )
+    .await
 }
 
 #[rpc(method = "debug_traceTransaction")]
 #[allow(non_snake_case)]
 /// Returns all traces of a given transaction.
 pub async fn monad_debug_traceTransaction<T: Triedb>(
-    chain_state: &ChainState<T>,
+    data_provider: &DataProvider<T>,
     params: MonadDebugTraceTransactionParams,
 ) -> JsonRpcResult<Option<MonadCallFrame>> {
     trace!("monad_eth_debugTraceTransaction: {params:?}");
 
-    let latest_block_key = get_latest_block_key(&chain_state.triedb_env);
-    if let Some(tx_loc) = chain_state
-        .triedb_env
-        .get_transaction_location_by_hash(latest_block_key, params.tx_hash.0)
+    let Some((block_key, call_frame)) = data_provider
+        .get_transaction_call_frame(params.tx_hash.0)
         .await
-        .map_err(JsonRpcError::internal_error)?
-    {
-        let block_key = chain_state
-            .triedb_env
-            .get_block_key(SeqNum(tx_loc.block_num))
-            .ok_or(JsonRpcError::block_not_found())?;
-        if let Some(rlp_call_frame) = chain_state
-            .triedb_env
-            .get_call_frame(block_key, tx_loc.tx_index)
-            .await
-            .map_err(JsonRpcError::internal_error)?
-        {
-            let rlp_call_frame = &mut rlp_call_frame.as_slice();
-            return decode_call_frame(
-                &chain_state.triedb_env,
-                rlp_call_frame,
-                block_key,
-                &params.tracer,
-            )
-            .await;
-        }
-    }
+        .to_jsonrpc_result()?
+        .flatten()
+    else {
+        return Ok(None);
+    };
 
-    // try archive if transaction hash not found and archive reader specified
-    if let Some(archive_reader) = &chain_state.archive_reader {
-        if let Some((trace, header_subset)) =
-            archive_reader.get_trace(&params.tx_hash.0.into()).await?
-        {
-            let rlp_call_frame = &mut trace.as_slice();
-            return decode_call_frame(
-                &chain_state.triedb_env,
-                rlp_call_frame,
-                BlockKey::Finalized(FinalizedBlockKey(SeqNum(header_subset.block_number))),
-                &params.tracer,
-            )
-            .await;
-        }
-    }
-
-    Ok(None)
+    let rlp_call_frame = &mut call_frame.as_slice();
+    decode_call_frame(
+        &data_provider.triedb_env,
+        rlp_call_frame,
+        block_key,
+        &params.tracer,
+    )
+    .await
 }
 
-async fn get_call_frames_from_triedb<T: Triedb>(
+async fn decode_block_call_frames<T: Triedb>(
     triedb_env: &T,
     block_key: BlockKey,
+    tx_hashes: Vec<alloy_primitives::TxHash>,
+    call_frames: Vec<Vec<u8>>,
     tracer: &TracerObject,
 ) -> JsonRpcResult<Vec<MonadDebugTraceBlockResult>> {
     let mut resp = Vec::new();
-    let transactions = triedb_env
-        .get_transactions(block_key)
-        .await
-        .map_err(JsonRpcError::internal_error)?;
 
-    let tx_ids = transactions
-        .into_iter()
-        .map(|tx| *tx.tx.tx_hash())
-        .collect::<Vec<_>>();
-
-    let call_frames = triedb_env
-        .get_call_frames(block_key)
-        .await
-        .map_err(JsonRpcError::internal_error)?;
-
-    for (call_frame, tx_id) in call_frames.into_iter().zip(tx_ids.into_iter()) {
+    for (call_frame, tx_id) in call_frames.into_iter().zip(tx_hashes.into_iter()) {
         let rlp_call_frame = &mut call_frame.as_slice();
         let Some(traces) = decode_call_frame(triedb_env, rlp_call_frame, block_key, tracer).await?
         else {
@@ -686,9 +607,17 @@ pub async fn decode_call_frame<T: Triedb>(
                 if call_frames.is_empty() {
                     Ok(None)
                 } else {
-                    let mut call_frame = call_frames.remove(0);
-                    include_code_output(&mut call_frame, triedb_env, block_key).await?;
-                    Ok(Some(MonadCallFrame::from(call_frame)))
+                    if let Some(root_frame) = call_frames.first_mut() {
+                        include_code_output(root_frame, triedb_env, block_key).await?;
+                    }
+
+                    let mut root = build_call_tree(call_frames)
+                        .await?
+                        .and_then(|rc| Rc::try_unwrap(rc).ok().map(|refcell| refcell.into_inner()));
+                    if let Some(root) = root.as_mut() {
+                        root.calls.clear();
+                    }
+                    Ok(root)
                 }
             } else {
                 let call_frames = futures::future::join_all(
@@ -747,10 +676,7 @@ async fn include_code_output<T: Triedb>(
                 .await
                 .map_err(JsonRpcError::internal_error)?;
 
-            let decoded_code = ethhex::decode_bytes(&code)
-                .map_err(|_| JsonRpcError::internal_error("could not decode code".to_string()))?;
-
-            decoded_code.into()
+            code.into()
         } else {
             Bytes::default()
         };
@@ -759,6 +685,7 @@ async fn include_code_output<T: Triedb>(
     Ok(())
 }
 
+/// Build a call tree from a flat list of call frames.
 async fn build_call_tree(
     nodes: Vec<CallFrame>,
 ) -> JsonRpcResult<Option<Rc<RefCell<MonadCallFrame>>>> {
@@ -769,6 +696,8 @@ async fn build_call_tree(
     };
 
     let root = Rc::new(RefCell::new(MonadCallFrame::from(root)));
+
+    // First, build the tree structure from the flat frame list.
     let mut stack = vec![Rc::clone(&root)];
 
     for value in nodes {
@@ -796,18 +725,126 @@ async fn build_call_tree(
         stack.push(new_node);
     }
 
+    // Then, assign log indices
+    assign_log_indices(&root);
+
     Ok(Some(root))
+}
+
+/// Assigns log indices across all frames in execution order.
+fn assign_log_indices(root: &Rc<RefCell<MonadCallFrame>>) {
+    let mut counter = 0u64;
+
+    // Stack is (node, next_position_to_process)
+    // Position N means: process logs at position N, then recurse into child N (if exists)
+    let mut stack: Vec<(Rc<RefCell<MonadCallFrame>>, usize)> = vec![(Rc::clone(root), 0)];
+
+    while let Some((node, position)) = stack.pop() {
+        // Assign all logs at this position
+        {
+            let mut borrowed = node.borrow_mut();
+            for log in borrowed.logs.iter_mut() {
+                if log.position.0 == position as u64 {
+                    log.index = Quantity(counter);
+                    counter += 1;
+                }
+            }
+        }
+
+        // If there's a child at index position, we must process it before we can move to the next position
+        if let Some(child) = node.borrow().calls.get(position) {
+            stack.push((Rc::clone(&node), position + 1));
+            stack.push((Rc::clone(child), 0));
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy_consensus::ReceiptWithBloom;
+    use std::sync::Arc;
+
+    use alloy_consensus::{BlockBody, ReceiptEnvelope, ReceiptWithBloom};
     use alloy_primitives::Bloom;
+    use alloy_rlp::{BufMut, Encodable};
+    use monad_archive::test_utils::mock_tx;
     use monad_eth_types::{EthTxHash, ReceiptWithLogIndex, TransactionLocation};
     use monad_triedb_utils::mock_triedb;
+    use monad_types::SeqNum;
 
     use super::*;
     use crate::types::ethhex;
+
+    impl Encodable for CallFrameLog {
+        fn encode(&self, out: &mut dyn BufMut) {
+            let fields: [&dyn Encodable; 2] = [&self.log, &self.position];
+            alloy_rlp::encode_list::<_, dyn Encodable>(&fields, out);
+        }
+    }
+
+    impl Encodable for CallFrame {
+        fn encode(&self, out: &mut dyn BufMut) {
+            let typ: u8 = match self.typ {
+                CallKind::Call => 0,
+                CallKind::StaticCall => 0,
+                CallKind::DelegateCall => 1,
+                CallKind::CallCode => 2,
+                CallKind::Create => 3,
+                CallKind::Create2 => 4,
+                CallKind::SelfDestruct => 5,
+            };
+            typ.encode(out);
+            self.flags.encode(out);
+            self.from.encode(out);
+            if let Some(to) = self.to {
+                to.encode(out);
+            } else {
+                out.put_u8(0x80);
+            }
+            self.value.encode(out);
+            self.gas.encode(out);
+            self.gas_used.encode(out);
+            self.input.encode(out);
+            self.output.encode(out);
+            self.status.encode(out);
+            self.depth.encode(out);
+            if let Some(logs) = &self.logs {
+                logs.encode(out);
+            }
+        }
+    }
+
+    fn make_frame_with_positions(depth: u64, positions: &[u64]) -> CallFrame {
+        let logs = Some(
+            positions
+                .iter()
+                .map(|&pos| CallFrameLog {
+                    log: Log::new_unchecked(Address::ZERO, vec![], Bytes::new()),
+                    position: U64::from(pos),
+                })
+                .collect(),
+        );
+
+        CallFrame {
+            typ: CallKind::Call,
+            flags: U64::ZERO,
+            from: Address::ZERO,
+            to: Some(Address::ZERO),
+            value: U256::ZERO,
+            gas: U64::from(100000u64),
+            gas_used: U64::from(21000u64),
+            input: Bytes::new(),
+            output: Bytes::new(),
+            status: U8::ZERO,
+            depth: U64::from(depth),
+            logs,
+        }
+    }
+
+    fn encode_trace(frames: Vec<CallFrame>) -> Vec<u8> {
+        let mut trace = Vec::new();
+        vec![frames].encode(&mut trace);
+        trace
+    }
 
     #[tokio::test]
     async fn test_build_call_tree() {
@@ -863,9 +900,9 @@ mod tests {
             frame,
         );
 
-        let chain_state = ChainState::new(None, mock_triedb, None);
+        let data_provider = DataProvider::new(None, Arc::new(mock_triedb), None);
         let resp = monad_debug_traceTransaction(
-            &chain_state,
+            &data_provider,
             MonadDebugTraceTransactionParams {
                 tx_hash: FixedData::<32>([0u8; 32]),
                 tracer: TracerObject::default(),
@@ -918,11 +955,11 @@ mod tests {
             frame,
         );
 
-        mock_triedb.set_code("0x608060405260043610603f5760003560e01c80635c60da1b146044575b600080fd5b605060048036036020811015605857600080fd5b5035606e565b005b6000548156fea2646970667358221220a0f2af6f9a7d2b0c8c3c32bd2d8a4f3d856c7f8a8888a1e0dc8b9a8a2a47e2ea64736f6c634300080000330000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000".to_string());
+        mock_triedb.set_code(hex::decode("608060405260043610603f5760003560e01c80635c60da1b146044575b600080fd5b605060048036036020811015605857600080fd5b5035606e565b005b6000548156fea2646970667358221220a0f2af6f9a7d2b0c8c3c32bd2d8a4f3d856c7f8a8888a1e0dc8b9a8a2a47e2ea64736f6c634300080000330000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000").unwrap());
 
-        let chain_state = ChainState::new(None, mock_triedb, None);
+        let data_provider = DataProvider::new(None, Arc::new(mock_triedb), None);
         let resp: Option<MonadCallFrame> = monad_debug_traceTransaction(
-            &chain_state,
+            &data_provider,
             MonadDebugTraceTransactionParams {
                 tx_hash: FixedData::<32>([0u8; 32]),
                 tracer: TracerObject::default(),
@@ -973,9 +1010,9 @@ mod tests {
             frame,
         );
 
-        let chain_state = ChainState::new(None, mock_triedb, None);
+        let data_provider = DataProvider::new(None, Arc::new(mock_triedb), None);
         let resp: Option<MonadCallFrame> = monad_debug_traceTransaction(
-            &chain_state,
+            &data_provider,
             MonadDebugTraceTransactionParams {
                 tx_hash: FixedData::<32>([0u8; 32]),
                 tracer: TracerObject {
@@ -1030,6 +1067,7 @@ mod tests {
         );
         assert_eq!(resp.logs[0].data.0, ethhex::decode_bytes("0xeffe").unwrap());
         assert_eq!(resp.logs[0].position.0, 0);
+        assert_eq!(resp.logs[0].index.0, 0);
 
         assert_eq!(
             ethhex::decode_bytes("0xbebebebebebebebebebebebebebebebebebebebe").unwrap(),
@@ -1052,6 +1090,57 @@ mod tests {
         );
         assert_eq!(resp.logs[1].data.0, ethhex::decode_bytes("0xabcd").unwrap());
         assert_eq!(resp.logs[1].position.0, 2);
+        assert_eq!(resp.logs[1].index.0, 1);
+    }
+
+    #[tokio::test]
+    async fn debug_trace_logs_only_top_call_uses_global_indices() {
+        let frame = encode_trace(vec![
+            make_frame_with_positions(1, &[0, 1]), // root emits before and after its child
+            make_frame_with_positions(2, &[0]),    // child emits between the two root logs
+        ]);
+        let mut mock_triedb = mock_triedb::MockTriedb::default();
+        mock_triedb.set_transaction_location_by_hash(
+            EthTxHash::default(),
+            TransactionLocation {
+                block_num: 1,
+                tx_index: 0,
+            },
+        );
+
+        mock_triedb.set_call_frame(
+            TransactionLocation {
+                block_num: 1,
+                tx_index: 0,
+            },
+            frame,
+        );
+
+        let data_provider = DataProvider::new(None, Arc::new(mock_triedb), None);
+        let resp: Option<MonadCallFrame> = monad_debug_traceTransaction(
+            &data_provider,
+            MonadDebugTraceTransactionParams {
+                tx_hash: FixedData::<32>([0u8; 32]),
+                tracer: TracerObject {
+                    tracer: Tracer::CallTracer,
+                    config: TracerConfig {
+                        with_log: true,
+                        diff_mode: false,
+                        only_top_call: true,
+                    },
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp = resp.expect("trace should exist");
+        assert!(resp.calls.is_empty());
+        assert_eq!(resp.logs.len(), 2);
+        assert_eq!(resp.logs[0].position.0, 0);
+        assert_eq!(resp.logs[0].index.0, 0);
+        assert_eq!(resp.logs[1].position.0, 1);
+        assert_eq!(resp.logs[1].index.0, 2);
     }
 
     // Tests the backwards compatible case where historical blocks do not have
@@ -1080,9 +1169,9 @@ mod tests {
             frame,
         );
 
-        let chain_state = ChainState::new(None, mock_triedb, None);
+        let data_provider = DataProvider::new(None, Arc::new(mock_triedb), None);
         let with_logs_resp = monad_debug_traceTransaction(
-            &chain_state,
+            &data_provider,
             MonadDebugTraceTransactionParams {
                 tx_hash: FixedData::<32>([0u8; 32]),
                 tracer: TracerObject {
@@ -1104,7 +1193,7 @@ mod tests {
         );
 
         let no_logs_resp = monad_debug_traceTransaction(
-            &chain_state,
+            &data_provider,
             MonadDebugTraceTransactionParams {
                 tx_hash: FixedData::<32>([0u8; 32]),
                 tracer: TracerObject {
@@ -1166,9 +1255,10 @@ mod tests {
             }],
         );
 
-        let chain_state = ChainState::new(None, mock_triedb, None);
+        let data_provider = DataProvider::new(None, Arc::new(mock_triedb), None);
         let result = monad_debug_getRawReceipts(
-            &chain_state,
+            &data_provider,
+            25_000_000,
             DebugBlockParams {
                 block: BlockTags::Number(Quantity(1)),
             },
@@ -1179,5 +1269,280 @@ mod tests {
         assert_eq!(result.receipts.len(), 1);
         let expected_receipt = "0x02f9010801825208b9010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c0";
         assert_eq!(result.receipts[0], expected_receipt);
+    }
+
+    #[tokio::test]
+    async fn debug_raw_block_max_size_exceeded() {
+        let mut mock_triedb = mock_triedb::MockTriedb::default();
+        mock_triedb.set_latest_block(1);
+
+        let tx = mock_tx(12345);
+        let txs_payload_limit = 2 * tx.tx.length() - 1;
+        let block = Block {
+            header: Header {
+                number: 1,
+                base_fee_per_gas: Some(100),
+                ..Default::default()
+            },
+            body: BlockBody {
+                transactions: vec![tx.tx.clone()],
+                ommers: vec![],
+                withdrawals: None,
+            },
+        };
+
+        mock_triedb.set_finalized_block(SeqNum(1), block.clone());
+
+        let data_provider = DataProvider::new(None, Arc::new(mock_triedb), None);
+        let error = monad_debug_getRawBlock(
+            &data_provider,
+            txs_payload_limit,
+            DebugBlockParams {
+                block: BlockTags::Number(Quantity(1)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, JsonRpcError::max_size_exceeded());
+    }
+
+    #[tokio::test]
+    async fn test_global_log_index_across_nested_calls() {
+        // Test interleaved log indexing based on execution order
+        // Frame order: [root(d1, 2 logs), child1(d2, 3 logs), grandchild(d3, 1 log), child2(d2, 2 logs)]
+        //
+        // Execution order:
+        // 1. Root emits first log (index 0)
+        // 2. Root calls Child1
+        // 3. Child1 emits first log (index 1)
+        // 4. Child1 calls Grandchild
+        // 5. Grandchild emits log (index 2)
+        // 6. Grandchild returns
+        // 7. Child1 emits remaining logs (index 3, 4)
+        // 8. Child1 returns
+        // 9. Root calls Child2
+        // 10. Child2 emits all logs (index 5, 6)
+        // 11. Child2 returns
+        // 12. Root emits remaining log (index 7)
+        let frames = vec![
+            make_frame_with_positions(1, &[0, 2]), // root: 1 log before children, 1 after both
+            make_frame_with_positions(2, &[0, 1, 1]), // child1: 1 log before grandchild, 2 after
+            make_frame_with_positions(3, &[0]),    // grandchild: 1 log (no children)
+            make_frame_with_positions(2, &[0, 0]), // child2: 2 logs (no children)
+        ];
+
+        let result = build_call_tree(frames).await.unwrap();
+        assert!(result.is_some());
+
+        let root = result.unwrap();
+        let root_borrowed = root.borrow();
+
+        assert_eq!(root_borrowed.logs.len(), 2);
+        assert_eq!(root_borrowed.logs[0].index.0, 0);
+        assert_eq!(root_borrowed.logs[1].index.0, 7);
+
+        let first_child = root_borrowed.calls[0].borrow();
+        assert_eq!(first_child.logs.len(), 3);
+        assert_eq!(first_child.logs[0].index.0, 1);
+        assert_eq!(first_child.logs[1].index.0, 3);
+        assert_eq!(first_child.logs[2].index.0, 4);
+
+        let grandchild = first_child.calls[0].borrow();
+        assert_eq!(grandchild.logs.len(), 1);
+        assert_eq!(grandchild.logs[0].index.0, 2);
+
+        let second_child = root_borrowed.calls[1].borrow();
+        assert_eq!(second_child.logs.len(), 2);
+        assert_eq!(second_child.logs[0].index.0, 5);
+        assert_eq!(second_child.logs[1].index.0, 6);
+    }
+
+    #[tokio::test]
+    async fn test_contract_a_scenario() {
+        // Test the user's contract scenario:
+        // contract A { emit A0(); new B().b(); new C().c(); emit A1(); }
+        // contract B { new D().d(); }
+        // contract C { emit C0(); }
+        // contract D {}
+
+        let frames = vec![
+            make_frame_with_positions(1, &[0, 4]), // A: A0 at pos 0, A1 at pos 4
+            make_frame_with_positions(2, &[]),     // B_CREATE: no logs
+            make_frame_with_positions(2, &[]),     // B.b: no logs
+            make_frame_with_positions(3, &[]),     // D_CREATE: no logs
+            make_frame_with_positions(3, &[]),     // D.d: no logs
+            make_frame_with_positions(2, &[]),     // C_CREATE: no logs
+            make_frame_with_positions(2, &[0]),    // C.c: C0 at pos 0
+        ];
+
+        let result = build_call_tree(frames).await.unwrap();
+        assert!(result.is_some());
+
+        let root = result.unwrap();
+        let root_borrowed = root.borrow();
+
+        assert_eq!(root_borrowed.logs.len(), 2);
+        assert_eq!(root_borrowed.logs[0].index.0, 0); // A0
+        assert_eq!(root_borrowed.logs[1].index.0, 2); // A1
+
+        let mut found_c0 = false;
+        for child in root_borrowed.calls.iter() {
+            let child_borrowed = child.borrow();
+            if !child_borrowed.logs.is_empty() {
+                assert_eq!(child_borrowed.logs[0].index.0, 1); // C0
+                found_c0 = true;
+            }
+        }
+        assert!(found_c0, "Should have found C0 log");
+    }
+
+    #[tokio::test]
+    async fn test_log_index_single_frame() {
+        // Test that a single frame correctly indexes its logs from build_call_tree
+        fn make_log(position: u64) -> CallFrameLog {
+            CallFrameLog {
+                log: Log::new_unchecked(Address::ZERO, vec![], Bytes::new()),
+                position: U64::from(position),
+            }
+        }
+
+        let frame = CallFrame {
+            typ: CallKind::Call,
+            flags: U64::ZERO,
+            from: Address::ZERO,
+            to: Some(Address::ZERO),
+            value: U256::ZERO,
+            gas: U64::from(100000u64),
+            gas_used: U64::from(21000u64),
+            input: Bytes::new(),
+            output: Bytes::new(),
+            status: U8::ZERO,
+            depth: U64::from(1u64),
+            logs: Some(vec![make_log(0), make_log(0), make_log(0)]),
+        };
+
+        let result = build_call_tree(vec![frame]).await.unwrap();
+        assert!(result.is_some());
+
+        let root = result.unwrap();
+        let root_borrowed = root.borrow();
+
+        // Single frame with no children should have all logs assigned sequentially
+        assert_eq!(root_borrowed.logs.len(), 3);
+        assert_eq!(root_borrowed.logs[0].index.0, 0);
+        assert_eq!(root_borrowed.logs[1].index.0, 1);
+        assert_eq!(root_borrowed.logs[2].index.0, 2);
+    }
+
+    #[tokio::test]
+    async fn test_many_logs_single_frame_with_child() {
+        // Parent has 5 logs all at position 0 (before the 1 child call),
+        // child has 1 log at position 0 (no children in child).
+        // Parent logs should have indices 0-4, child log should have index 5.
+
+        let frames = vec![
+            make_frame_with_positions(1, &[0, 0, 0, 0, 0]), // parent: 5 logs at pos 0
+            make_frame_with_positions(2, &[0]),             // child: 1 log at pos 0
+        ];
+
+        let result = build_call_tree(frames).await.unwrap().unwrap();
+        let root = result.borrow();
+
+        assert_eq!(root.logs[0].index.0, 0);
+        assert_eq!(root.logs[1].index.0, 1);
+        assert_eq!(root.logs[2].index.0, 2);
+        assert_eq!(root.logs[3].index.0, 3);
+        assert_eq!(root.logs[4].index.0, 4);
+
+        let child = root.calls[0].borrow();
+        assert_eq!(child.logs[0].index.0, 5);
+    }
+
+    #[tokio::test]
+    async fn test_interleaved_parent_child_logs() {
+        // Simulates:
+        //   function a() {
+        //       emit A0();        // position 0 (before any of A's 2 children)
+        //       new B().b();      // child 0, B has no logs
+        //       new C().c();      // child 1, C emits log at position 0 (no children in C)
+        //       emit A1();        // position 2 (after both children)
+        //   }
+        //
+        // Expected indices: A0=0, C0=1, A1=2
+
+        let frames = vec![
+            make_frame_with_positions(1, &[0, 2]), // A: A0 at pos 0, A1 at pos 2
+            make_frame_with_positions(2, &[]),     // B: no logs
+            make_frame_with_positions(2, &[0]),    // C: C0 at pos 0
+        ];
+
+        let result = build_call_tree(frames).await.unwrap().unwrap();
+        let root = result.borrow();
+
+        // A0 (pos 0) → index 0
+        assert_eq!(root.logs[0].index.0, 0);
+        // A1 (pos 2) → index 2
+        assert_eq!(root.logs[1].index.0, 2);
+
+        // B has no logs
+        let child_b = root.calls[0].borrow();
+        assert!(child_b.logs.is_empty());
+
+        // C0 (pos 0) → index 1
+        let child_c = root.calls[1].borrow();
+        assert_eq!(child_c.logs[0].index.0, 1);
+    }
+
+    #[tokio::test]
+    async fn test_nested_calls_with_interleaved_logs() {
+        // Test the e_then_a() scenario with nested calls:
+        //
+        // Main.e_then_a():
+        //     emit A0        // position 0 (before calling E)
+        //     E.e()          // child call
+        //     emit A0        // position 1 (after E returns)
+        //
+        // E.e():
+        //     emit E0        // position 0 (before calling C)
+        //     C.c()          // child call
+        //     emit E0        // position 1 (after C returns)
+        //
+        // C.c():
+        //     emit C0        // position 0 (no children)
+        //
+        // Expected execution order:
+        //   Main A0 (pos 0) → index 0
+        //   E0 (pos 0)      → index 1
+        //   C0 (pos 0)      → index 2
+        //   E0 (pos 1)      → index 3
+        //   Main A0 (pos 1) → index 4
+
+        let frames = vec![
+            make_frame_with_positions(1, &[0, 1]), // Main: logs at pos 0 and 1
+            make_frame_with_positions(2, &[0, 1]), // E: logs at pos 0 and 1
+            make_frame_with_positions(3, &[0]),    // C: log at pos 0
+        ];
+
+        let result = build_call_tree(frames).await.unwrap().unwrap();
+        let main_frame = result.borrow();
+
+        // Main frame has 2 logs
+        assert_eq!(main_frame.logs.len(), 2);
+        assert_eq!(main_frame.logs[0].index.0, 0); // First A0
+        assert_eq!(main_frame.logs[1].index.0, 4); // Second A0
+
+        // E frame (child of Main)
+        assert_eq!(main_frame.calls.len(), 1);
+        let e_frame = main_frame.calls[0].borrow();
+        assert_eq!(e_frame.logs.len(), 2);
+        assert_eq!(e_frame.logs[0].index.0, 1); // First E0
+        assert_eq!(e_frame.logs[1].index.0, 3); // Second E0
+
+        // C frame (child of E)
+        assert_eq!(e_frame.calls.len(), 1);
+        let c_frame = e_frame.calls[0].borrow();
+        assert_eq!(c_frame.logs.len(), 1);
+        assert_eq!(c_frame.logs[0].index.0, 2); // C0
     }
 }

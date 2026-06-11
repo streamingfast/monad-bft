@@ -22,16 +22,22 @@ use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey,
 };
 use monad_executor::ExecutorMetrics;
-use monad_types::{NodeId, Round, RoundSpan};
+use monad_types::{BoundedU64, NodeId, Round, RoundSpan};
 use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
 use tracing::{debug, error, info, trace, warn};
 
 use super::{
     super::config::{GroupSchedulingConfig, RaptorCastConfigSecondaryPublisher},
-    group_message::{ConfirmGroup, FullNodesGroupMessage, PrepareGroup},
+    group_message::{
+        ConfirmGroup, FullNodesGroupMessage, PeerParticipation, PeerParticipationReport,
+        PrepareGroup,
+    },
 };
-use crate::util::SecondaryGroup;
+use crate::{
+    raptorcast_secondary::group_message::{NoConfirm, NoConfirmReason, PrepareGroupResponse},
+    util::SecondaryGroup,
+};
 
 monad_executor::metric_consts! {
     pub PUBLISHER_CURRENT_GROUP_SIZE {
@@ -104,6 +110,80 @@ impl<PT: PubKey> CurrentGroup<PT> {
     }
 }
 
+/// Collects participation reports from full nodes for a single group round span
+/// Created when a group becomes active
+/// Accepts reports until being cleaned up
+struct PendingGroupScores<ST: CertificateSignatureRecoverable> {
+    members: SecondaryGroup<CertificateSignaturePubKey<ST>>,
+    /// Full nodes that have already submitted a report for this round span
+    reporters: BTreeSet<NodeId<CertificateSignaturePubKey<ST>>>,
+    /// Per-peer collected scores: each entry accumulates scores from different reporters
+    scores: BTreeMap<NodeId<CertificateSignaturePubKey<ST>>, Vec<BoundedU64<100>>>,
+}
+
+impl<ST: CertificateSignatureRecoverable> PendingGroupScores<ST> {
+    fn new(members: SecondaryGroup<CertificateSignaturePubKey<ST>>) -> Self {
+        Self {
+            members,
+            reporters: BTreeSet::new(),
+            scores: BTreeMap::new(),
+        }
+    }
+
+    fn validate_and_store(
+        &mut self,
+        reporter: NodeId<CertificateSignaturePubKey<ST>>,
+        peer_scores: Vec<PeerParticipation<CertificateSignaturePubKey<ST>>>,
+        round_span: RoundSpan,
+    ) {
+        if !self.members.is_member(&reporter) {
+            debug!(
+                ?reporter,
+                "Rejecting participation report: reporter is not a member of the group"
+            );
+            return;
+        }
+        if self.reporters.contains(&reporter) {
+            debug!(
+                ?reporter,
+                "Rejecting participation report: duplicate report from same full node"
+            );
+            return;
+        }
+        let mut seen_peers = BTreeSet::new();
+        for score in &peer_scores {
+            if score.peer == reporter {
+                debug!(
+                    ?reporter,
+                    "Rejecting participation report: reporter scored themselves"
+                );
+                return;
+            }
+            if !seen_peers.insert(score.peer) {
+                debug!(?score.peer, "Rejecting participation report: duplicate peer in report");
+                return;
+            }
+            if !self.members.is_member(&score.peer) {
+                debug!(?score.peer, "Rejecting participation report: peer scored is not a member of the group");
+                return;
+            }
+        }
+
+        self.reporters.insert(reporter);
+        debug!(
+            reporter = ?reporter,
+            ?round_span,
+            "Accepted participation report",
+        );
+        for score in peer_scores {
+            self.scores
+                .entry(score.peer)
+                .or_default()
+                .push(score.participation_score);
+        }
+    }
+}
+
 // This is for when the router is playing the role of a Publisher
 // That is, we are a validator sending group invites to random full-nodes for
 // raptor-casting messages to them
@@ -126,6 +206,11 @@ where
 
     // This is the group we are curr. broadcasting to, popped off group_schedule.
     curr_group: CurrentGroup<CertificateSignaturePubKey<ST>>,
+
+    // Collects participation reports keyed by the group's round span.
+    // An entry is created when a group becomes active and cleaned up after
+    // the next group rotation, giving full nodes time to submit reports.
+    pending_scores: BTreeMap<RoundSpan, PendingGroupScores<ST>>,
 
     // Metrics
     metrics: ExecutorMetrics,
@@ -180,6 +265,7 @@ where
             rng,
             curr_round: Round::MIN,
             curr_group: CurrentGroup::Init,
+            pending_scores: BTreeMap::new(),
             metrics: ExecutorMetrics::default(),
         }
     }
@@ -282,8 +368,21 @@ where
             CurrentGroup::Inactive { .. } => {
                 self.metrics[PUBLISHER_CURRENT_GROUP_SIZE] = 0;
             }
-            CurrentGroup::Active { members, .. } => {
+            CurrentGroup::Active {
+                members,
+                round_span,
+            } => {
                 self.metrics[PUBLISHER_CURRENT_GROUP_SIZE] = members.len().get() as u64;
+
+                // Register this group for participation report collection
+                self.pending_scores
+                    .insert(*round_span, PendingGroupScores::new(members.clone()));
+                // Clean up entries for groups older than the previous one.
+                // We keep at most two: the current and the one before it.
+                while self.pending_scores.len() > 2 {
+                    self.pending_scores.pop_first();
+                    // TODO: handle the collected scores
+                }
             }
             CurrentGroup::Init => unreachable!(),
         }
@@ -355,14 +454,21 @@ where
     // of our RaptorCast group scheduled for a future round.
     // We've received a response from the candidate but won't send any message
     // back right away, but when we have enough responses to form a group.
-    pub fn on_candidate_response(&mut self, msg: FullNodesGroupMessage<ST>) {
+    #[must_use]
+    pub fn on_candidate_response(
+        &mut self,
+        msg: FullNodesGroupMessage<ST>,
+    ) -> Option<(
+        FullNodesGroupMessage<ST>,
+        NodeId<CertificateSignaturePubKey<ST>>,
+    )> {
         trace!(?msg, "RaptorCastSecondary received candidate response");
         match msg {
             FullNodesGroupMessage::PrepareGroupResponse(response) => {
                 let candidate = response.node_id;
                 let start_round = response.req.start_round;
                 if let Some(group) = self.group_schedule.get_mut(&start_round) {
-                    group.on_candidate_response(candidate, response.accept);
+                    return group.on_candidate_response(candidate, response, &self.scheduling_cfg);
                 } else {
                     warn!(
                         ?candidate,
@@ -372,6 +478,9 @@ where
                     );
                 }
             }
+            FullNodesGroupMessage::ParticipationReport(report) => {
+                self.handle_participation_report(report);
+            }
             _ => {
                 debug!(
                     ?msg,
@@ -380,6 +489,7 @@ where
                 );
             }
         }
+        None
     }
 
     pub fn get_current_raptorcast_group(
@@ -392,6 +502,30 @@ where
             } if round_span.contains(self.curr_round) => Some(members),
             _ => None,
         }
+    }
+
+    fn handle_participation_report(
+        &mut self,
+        report: PeerParticipationReport<CertificateSignaturePubKey<ST>>,
+    ) {
+        if report.validator_id != self.validator_node_id {
+            debug!(
+                ?report,
+                "Rejecting participation report: validator_id mismatch"
+            );
+            return;
+        }
+
+        let Some(pending) = self.pending_scores.get_mut(&report.round_span) else {
+            debug!(?report.round_span, "Rejecting participation report: unknown round span");
+            return;
+        };
+
+        pending.validate_and_store(
+            report.reporter,
+            report.peer_scores.into_inner(),
+            report.round_span,
+        );
     }
 
     pub fn update_always_ask_full_nodes(
@@ -429,8 +563,10 @@ struct GroupAsPublisher<ST>
 where
     ST: CertificateSignatureRecoverable,
 {
+    // TODO: register prepare invite data to verify response against
     full_nodes_accepted: FullNodesST<ST>,
     full_nodes_rejected: FullNodesST<ST>,
+    full_nodes_overflowed: FullNodesST<ST>,
 
     // Pre-randomized permutation of always_ask_full_nodes[] + peer_disc_full_nodes[]
     // Stays const once created.
@@ -478,6 +614,7 @@ where
         let mut new_group = Self {
             full_nodes_accepted: Vec::default(),
             full_nodes_rejected: Vec::default(),
+            full_nodes_overflowed: Vec::default(),
             full_nodes_candidates: always_ask_full_nodes.clone(),
             num_invites_sent: 0,
             start_round,
@@ -563,24 +700,29 @@ where
         Some((invite_msg, next_invitees))
     }
 
+    #[must_use]
     pub fn on_candidate_response(
         &mut self,
         candidate: NodeId<CertificateSignaturePubKey<ST>>,
-        accepted: bool,
-    ) {
+        response: PrepareGroupResponse<CertificateSignaturePubKey<ST>>,
+        cfg: &GroupSchedulingConfig,
+    ) -> Option<(
+        FullNodesGroupMessage<ST>,
+        NodeId<CertificateSignaturePubKey<ST>>,
+    )> {
         trace!(
             ?candidate,
-            ?accepted,
+            ?response,
             "RaptorCastSecondary Publisher on_candidate_response",
         );
         if self.is_locked() {
             // Already formed the group
             trace!(
                 ?candidate,
-                ?accepted,
+                ?response,
                 "RaptorCastSecondary Publisher on_candidate_response - Already formed the group"
             );
-            return;
+            return None;
         }
         let end = self.full_nodes_candidates.len().min(self.num_invites_sent);
         let invited = &self.full_nodes_candidates[..end];
@@ -591,7 +733,7 @@ where
                 "Ignoring response from FullNode who was \
                 never invited to RaptorCastSecondary group",
             );
-            return;
+            return None;
         }
         if self.full_nodes_accepted.contains(&candidate) {
             warn!(
@@ -600,7 +742,7 @@ where
                 "Ignoring duplicate response from FullNode \
                 who was already accepted into RaptorCastSecondary group",
             );
-            return;
+            return None;
         }
         if self.full_nodes_rejected.contains(&candidate) {
             warn!(
@@ -609,23 +751,47 @@ where
                 "Ignoring duplicate response from FullNode who \
                 has already rejected an invite from RaptorCastSecondary group",
             );
-            return;
+            return None;
         }
-        if accepted {
+        if self.full_nodes_overflowed.contains(&candidate) {
+            warn!(
+                ?candidate,
+                ?self,
+                "Ignoring duplicate response from FullNode. Group is full.",
+            );
+            return None;
+        }
+        if response.accept {
+            // Immediately respond with a NoConfirm message if the group is full
+            if self.full_nodes_accepted.len() >= cfg.max_group_size {
+                debug!(
+                    ?candidate,
+                    "RaptorCastSecondary group is full. Sending NoConfirm message to candidate",
+                );
+                self.full_nodes_overflowed.push(candidate);
+                return Some((
+                    FullNodesGroupMessage::NoConfirm(NoConfirm {
+                        prepare: response.req,
+                        reason: NoConfirmReason::GroupFull,
+                    }),
+                    candidate,
+                ));
+            }
             self.full_nodes_accepted.push(candidate);
             debug!(
                 ?candidate,
-                ?self,
-                "RaptorCastSecondary group invite accepted by, for group",
+                invite = ?response.req,
+                "RaptorCastSecondary group invite accepted by candidate",
             );
         } else {
             self.full_nodes_rejected.push(candidate);
             debug!(
                 ?candidate,
-                ?self,
-                "RaptorCastSecondary group invite rejected by, for group",
+                invite = ?response.req,
+                "RaptorCastSecondary group invite rejected by candidate",
             );
         }
+        None
     }
 
     pub fn to_finalized_group(&self) -> CurrentGroup<CertificateSignaturePubKey<ST>> {
@@ -1233,7 +1399,7 @@ mod tests {
         // 1st group accept (only nid_11)
         //----------------------------------------------------------------------
         let accept_msg = make_invite_response(nid(0), nid(11), true, Round(8), &sched_cfg);
-        v0_fsm.on_candidate_response(accept_msg);
+        let _ = v0_fsm.on_candidate_response(accept_msg);
 
         //-------------------------------------------------------------------[3]
         // 1st group invites t1
@@ -1286,7 +1452,7 @@ mod tests {
         // Received response from an odd note which wasn't invited for the round
         // The FSM should ignore this response.
         let accept_msg = make_invite_response(nid(0), nid(22), true, Round(8), &sched_cfg);
-        v0_fsm.on_candidate_response(accept_msg);
+        let _ = v0_fsm.on_candidate_response(accept_msg);
 
         //-------------------------------------------------------------------[5]
         // 1st group timeout
@@ -2056,7 +2222,7 @@ mod tests {
 
         // ACCEPT [3, 6)
         let accept_msg = make_invite_response(nid(0), nid(10), true, Round(3), &sched_cfg);
-        v0_fsm.on_candidate_response(accept_msg);
+        let _ = v0_fsm.on_candidate_response(accept_msg);
 
         // CONFIRM [3, 6)
         let (group_msg, _invitees) = v0_fsm
@@ -2094,7 +2260,7 @@ mod tests {
 
         // ACCEPT [6, 9)
         let accept_msg = make_invite_response(nid(0), nid(10), true, Round(6), &sched_cfg);
-        v0_fsm.on_candidate_response(accept_msg);
+        let _ = v0_fsm.on_candidate_response(accept_msg);
 
         // CONFIRM [6, 9)
         let (group_msg, _invitees) = v0_fsm
@@ -2132,7 +2298,7 @@ mod tests {
 
         // ACCEPT [9, 12)
         let accept_msg = make_invite_response(nid(0), nid(10), true, Round(9), &sched_cfg);
-        v0_fsm.on_candidate_response(accept_msg);
+        let _ = v0_fsm.on_candidate_response(accept_msg);
 
         // CONFIRM [9, 12)
         let (group_msg, _invitees) = v0_fsm
@@ -2307,14 +2473,14 @@ mod tests {
         //----------------------------------------------------------------------
 
         let response = make_invite_response(nid(0), nid(10), true, Round(8), &sched_cfg);
-        v0_fsm.on_candidate_response(response);
+        let _ = v0_fsm.on_candidate_response(response);
 
         let response = make_invite_response(nid(0), nid(11), true, Round(8), &sched_cfg);
-        v0_fsm.on_candidate_response(response);
+        let _ = v0_fsm.on_candidate_response(response);
 
         // A reject from node 12
         let response = make_invite_response(nid(0), nid(12), false, Round(8), &sched_cfg);
-        v0_fsm.on_candidate_response(response);
+        let _ = v0_fsm.on_candidate_response(response);
 
         //----------------------------------------------------------------------
         // 1st group invites t1
@@ -2356,7 +2522,7 @@ mod tests {
         // Node 12 now sends an accept after already have sent a reject
         //----------------------------------------------------------------------
         let bogus_response = make_invite_response(nid(0), nid(12), true, Round(8), &sched_cfg);
-        v0_fsm.on_candidate_response(bogus_response);
+        let _ = v0_fsm.on_candidate_response(bogus_response);
 
         // Verify that the publisher does not change accept/reject states
         if let Some(group) = v0_fsm.group_schedule.get(&Round(8)) {
@@ -2452,6 +2618,546 @@ mod tests {
         assert!(
             v0_fsm.curr_group.unwrap_active().1.start == Round(26),
             "Group [26, 31) should be present and set as current group"
+        );
+    }
+
+    // Helper: create a publisher with one active group [3, 6).
+    // Returns the publisher advanced to round 3 (group is active).
+    fn make_publisher_with_active_group() -> Publisher<ST> {
+        let sched_cfg = GroupSchedulingConfig {
+            max_group_size: 3,
+            round_span: Round(3),
+            invite_lookahead: Round(100),
+            max_invite_wait: Round(1),
+            deadline_round_dist: Round(1),
+            init_empty_round_span: Round(2),
+        };
+
+        let mut fsm: Publisher<ST> = Publisher::new(
+            nid(0),
+            RaptorCastConfigSecondaryPublisher {
+                full_nodes_prioritized: vec![nid(10), nid(11), nid(12)],
+                group_scheduling: sched_cfg,
+            },
+            ChaCha8Rng::seed_from_u64(42),
+        );
+
+        // Trigger invite for group [3, 6)
+        fsm.enter_round_and_step_until(Round(1));
+
+        // Accept all three full nodes
+        let accept = make_invite_response(nid(0), nid(10), true, Round(3), &sched_cfg);
+        fsm.on_candidate_response(accept);
+        let accept = make_invite_response(nid(0), nid(11), true, Round(3), &sched_cfg);
+        fsm.on_candidate_response(accept);
+        let accept = make_invite_response(nid(0), nid(12), true, Round(3), &sched_cfg);
+        fsm.on_candidate_response(accept);
+
+        // Confirm group and advance to round 3 (group becomes active)
+        fsm.enter_round_and_step_until(Round(2));
+        fsm.enter_round_and_step_until(Round(3));
+
+        assert!(
+            matches!(&fsm.curr_group, CurrentGroup::Active { .. }),
+            "Expected active group"
+        );
+        fsm
+    }
+
+    #[test]
+    fn no_confirm_when_group_full() {
+        let sched_cfg = GroupSchedulingConfig {
+            max_group_size: 3,
+            round_span: Round(5),
+            invite_lookahead: Round(8),
+            max_invite_wait: Round(2),
+            deadline_round_dist: Round(3),
+            init_empty_round_span: Round(7),
+        };
+
+        let v0_node_id = nid(0);
+
+        let mut v0_fsm: Publisher<ST> = Publisher::new(
+            v0_node_id,
+            RaptorCastConfigSecondaryPublisher {
+                full_nodes_prioritized: vec![nid(10), nid(11), nid(12)],
+                group_scheduling: sched_cfg,
+            },
+            ChaCha8Rng::seed_from_u64(42),
+        );
+
+        // Peer discovery gives us one more full-node beyond the prioritized list
+        v0_fsm.upsert_peer_disc_full_nodes(vec![nid(13)]);
+
+        //----------------------------------------------------------------------
+        // Initial invites for the first group
+        //----------------------------------------------------------------------
+        let (group_msg, invitees) = v0_fsm
+            .enter_round_and_step_until(Round(1))
+            .expect("FSM should have returned invites to be sent");
+
+        let reference_prepare_group = PrepareGroup {
+            start_round: Round(8),
+            end_round: Round(13),
+            max_group_size: 3,
+            validator_id: nid(0),
+        };
+
+        if let FullNodesGroupMessage::PrepareGroup(invite_msg) = group_msg {
+            assert_eq!(invite_msg, reference_prepare_group);
+            assert!(equal_node_vec(&invitees, &node_ids_vec![10, 11, 12]));
+        } else {
+            panic!(
+                "Expected FullNodesGroupMessage::PrepareGroup, got: {:?}\n\
+                publisher v0: {}",
+                group_msg,
+                dump_pub_sched(&v0_fsm)
+            );
+        };
+
+        //----------------------------------------------------------------------
+        // First two nodes accept quickly
+        //----------------------------------------------------------------------
+        let response = make_invite_response(nid(0), nid(10), true, Round(8), &sched_cfg);
+        let result = v0_fsm.on_candidate_response(response);
+        assert!(
+            result.is_none(),
+            "Still has capacity. No NoConfirm message should be sent"
+        );
+
+        let response = make_invite_response(nid(0), nid(11), true, Round(8), &sched_cfg);
+        let result = v0_fsm.on_candidate_response(response);
+        assert!(
+            result.is_none(),
+            "Still has capacity. No NoConfirm message should be sent"
+        );
+
+        //----------------------------------------------------------------------
+        // Publisher sends more invites since we only have 2 acceptances
+        //----------------------------------------------------------------------
+        let (group_msg, invitees) = v0_fsm
+            .enter_round_and_step_until(Round(3))
+            .expect("FSM should have returned invites to be sent");
+
+        if let FullNodesGroupMessage::PrepareGroup(invite_msg) = group_msg {
+            assert_eq!(invite_msg, reference_prepare_group);
+            // Should send more invites to reach max_group_size
+            assert!(!invitees.is_empty());
+        } else {
+            panic!(
+                "Expected FullNodesGroupMessage::PrepareGroup, got: {:?}\n\
+                publisher v0: {}",
+                group_msg,
+                dump_pub_sched(&v0_fsm)
+            );
+        }
+
+        //----------------------------------------------------------------------
+        // Third node accepts - now we have reached max_group_size
+        //----------------------------------------------------------------------
+        let response = make_invite_response(nid(0), nid(12), true, Round(8), &sched_cfg);
+        let result = v0_fsm.on_candidate_response(response);
+
+        // The third acceptance should be accepted without NoConfirm (returns None)
+        assert!(
+            result.is_none(),
+            "Third acceptance should not trigger NoConfirm"
+        );
+
+        // Verify we now have 3 accepted nodes
+        if let Some(group) = v0_fsm.group_schedule.get(&Round(8)) {
+            assert_eq!(group.full_nodes_accepted.len(), 3);
+            assert!(equal_node_vec(
+                &group.full_nodes_accepted,
+                &node_ids_vec![10, 11, 12]
+            ));
+        } else {
+            panic!("Expected a group to be scheduled for round 8");
+        }
+
+        //----------------------------------------------------------------------
+        // Fourth node tries to accept - should receive NoConfirm message
+        //----------------------------------------------------------------------
+        let response = make_invite_response(nid(0), nid(13), true, Round(8), &sched_cfg);
+        let (msg, recipient) = v0_fsm
+            .on_candidate_response(response)
+            .expect("Should return NoConfirm message when group is full");
+
+        assert_eq!(recipient, nid(13));
+        assert_eq!(
+            msg,
+            FullNodesGroupMessage::NoConfirm(NoConfirm {
+                prepare: reference_prepare_group.clone(),
+                reason: NoConfirmReason::GroupFull,
+            })
+        );
+
+        // Verify accepted list still has only 3 nodes
+        if let Some(group) = v0_fsm.group_schedule.get(&Round(8)) {
+            assert_eq!(group.full_nodes_accepted.len(), 3);
+            assert!(equal_node_vec(
+                &group.full_nodes_accepted,
+                &node_ids_vec![10, 11, 12]
+            ));
+        } else {
+            panic!("Expected a group to be scheduled for round 8");
+        }
+
+        //----------------------------------------------------------------------
+        // Fourth node tries to accept again - should be ignored (already overflowed)
+        //----------------------------------------------------------------------
+        let response = make_invite_response(nid(0), nid(13), true, Round(8), &sched_cfg);
+        let result = v0_fsm.on_candidate_response(response);
+        assert!(
+            result.is_none(),
+            "Should return None when receiving duplicate response"
+        );
+
+        // Final verification: still only 3 nodes in the group
+        if let Some(group) = v0_fsm.group_schedule.get(&Round(8)) {
+            assert_eq!(group.full_nodes_accepted.len(), 3);
+            assert!(equal_node_vec(
+                &group.full_nodes_accepted,
+                &node_ids_vec![10, 11, 12]
+            ));
+        } else {
+            panic!("Expected a group to be scheduled for round 8");
+        }
+
+        //----------------------------------------------------------------------
+        // Advance time to trigger group confirmation
+        //----------------------------------------------------------------------
+        let (group_msg, members) = v0_fsm
+            .enter_round_and_step_until(Round(5))
+            .expect("FSM should have returned group confirmation");
+
+        // Verify that the group is confirmed with exactly 3 members
+        if let FullNodesGroupMessage::ConfirmGroup(confirm_msg) = group_msg {
+            assert_eq!(confirm_msg.prepare, reference_prepare_group);
+            assert!(equal_node_vec(&members, &node_ids_vec![10, 11, 12]));
+            assert!(equal_node_vec(
+                &confirm_msg.peers,
+                &node_ids_vec![10, 11, 12]
+            ));
+        } else {
+            panic!(
+                "Expected FullNodesGroupMessage::ConfirmGroup, got: {:?}\n\
+                publisher v0: {}",
+                group_msg,
+                dump_pub_sched(&v0_fsm)
+            );
+        }
+    }
+
+    fn make_report(
+        reporter: NodeId<PubKeyType>,
+        validator_id: NodeId<PubKeyType>,
+        start: Round,
+        end: Round,
+        peer_scores: Vec<(NodeId<PubKeyType>, u64)>,
+    ) -> PeerParticipationReport<PubKeyType> {
+        PeerParticipationReport {
+            reporter,
+            validator_id,
+            round_span: RoundSpan::new(start, end).unwrap(),
+            peer_scores: peer_scores
+                .into_iter()
+                .map(|(peer, score)| PeerParticipation {
+                    peer,
+                    participation_score: BoundedU64::new(score).unwrap(),
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        }
+    }
+
+    #[test]
+    fn participation_report_valid() {
+        enable_tracer();
+        let mut fsm = make_publisher_with_active_group();
+        let round_span = *fsm.curr_group.unwrap_active().1;
+
+        let report = make_report(
+            nid(10),
+            nid(0),
+            round_span.start,
+            round_span.end,
+            vec![(nid(11), 80), (nid(12), 100)],
+        );
+        fsm.on_candidate_response(FullNodesGroupMessage::ParticipationReport(report));
+
+        let pending = fsm.pending_scores.get(&round_span).unwrap();
+        assert_eq!(pending.reporters.len(), 1);
+        assert!(pending.reporters.contains(&nid(10)));
+        assert_eq!(
+            *pending.scores.get(&nid(11)).unwrap(),
+            vec![BoundedU64::new(80).unwrap()]
+        );
+        assert_eq!(
+            *pending.scores.get(&nid(12)).unwrap(),
+            vec![BoundedU64::new(100).unwrap()]
+        );
+    }
+
+    #[test]
+    fn participation_report_wrong_validator() {
+        enable_tracer();
+        let mut fsm = make_publisher_with_active_group();
+        let round_span = *fsm.curr_group.unwrap_active().1;
+
+        // Report addressed to nid(99) instead of nid(0)
+        let report = make_report(
+            nid(10),
+            nid(99),
+            round_span.start,
+            round_span.end,
+            vec![(nid(11), 80)],
+        );
+        fsm.on_candidate_response(FullNodesGroupMessage::ParticipationReport(report));
+
+        let pending = fsm.pending_scores.get(&round_span).unwrap();
+        assert!(pending.reporters.is_empty());
+        assert!(pending.scores.is_empty());
+    }
+
+    #[test]
+    fn participation_report_unknown_round_span() {
+        enable_tracer();
+        let mut fsm = make_publisher_with_active_group();
+
+        // Report for a round span that doesn't exist
+        let report = make_report(nid(10), nid(0), Round(100), Round(200), vec![(nid(11), 80)]);
+        fsm.on_candidate_response(FullNodesGroupMessage::ParticipationReport(report));
+
+        // Nothing stored anywhere
+        for pending in fsm.pending_scores.values() {
+            assert!(pending.reporters.is_empty());
+        }
+    }
+
+    #[test]
+    fn participation_report_reporter_not_in_group() {
+        enable_tracer();
+        let mut fsm = make_publisher_with_active_group();
+        let round_span = *fsm.curr_group.unwrap_active().1;
+
+        // nid(99) is not a group member
+        let report = make_report(
+            nid(99),
+            nid(0),
+            round_span.start,
+            round_span.end,
+            vec![(nid(11), 80)],
+        );
+        fsm.on_candidate_response(FullNodesGroupMessage::ParticipationReport(report));
+
+        let pending = fsm.pending_scores.get(&round_span).unwrap();
+        assert!(pending.reporters.is_empty());
+        assert!(pending.scores.is_empty());
+    }
+
+    #[test]
+    fn participation_report_reported_peer_not_in_group() {
+        enable_tracer();
+        let mut fsm = make_publisher_with_active_group();
+        let round_span = *fsm.curr_group.unwrap_active().1;
+
+        // nid(10) is a member, but reports on nid(99) who isn't
+        let report = make_report(
+            nid(10),
+            nid(0),
+            round_span.start,
+            round_span.end,
+            vec![(nid(99), 50)],
+        );
+        fsm.on_candidate_response(FullNodesGroupMessage::ParticipationReport(report));
+
+        let pending = fsm.pending_scores.get(&round_span).unwrap();
+        assert!(pending.scores.is_empty());
+    }
+
+    #[test]
+    fn participation_report_duplicate_reporter_rejected() {
+        enable_tracer();
+        let mut fsm = make_publisher_with_active_group();
+        let round_span = *fsm.curr_group.unwrap_active().1;
+
+        // First report from nid(10) - accepted
+        let report = make_report(
+            nid(10),
+            nid(0),
+            round_span.start,
+            round_span.end,
+            vec![(nid(11), 80)],
+        );
+        fsm.on_candidate_response(FullNodesGroupMessage::ParticipationReport(report));
+
+        // Second report from nid(10) - rejected as duplicate
+        let report = make_report(
+            nid(10),
+            nid(0),
+            round_span.start,
+            round_span.end,
+            vec![(nid(11), 50)],
+        );
+        fsm.on_candidate_response(FullNodesGroupMessage::ParticipationReport(report));
+
+        let pending = fsm.pending_scores.get(&round_span).unwrap();
+        assert_eq!(pending.reporters.len(), 1);
+        // Only the first score was recorded
+        assert_eq!(
+            *pending.scores.get(&nid(11)).unwrap(),
+            vec![BoundedU64::new(80).unwrap()]
+        );
+    }
+
+    #[test]
+    fn participation_report_multiple_reporters_aggregate() {
+        enable_tracer();
+        let mut fsm = make_publisher_with_active_group();
+        let round_span = *fsm.curr_group.unwrap_active().1;
+
+        // Report from nid(10)
+        let report = make_report(
+            nid(10),
+            nid(0),
+            round_span.start,
+            round_span.end,
+            vec![(nid(11), 80), (nid(12), 60)],
+        );
+        fsm.on_candidate_response(FullNodesGroupMessage::ParticipationReport(report));
+
+        // Report from nid(11)
+        let report = make_report(
+            nid(11),
+            nid(0),
+            round_span.start,
+            round_span.end,
+            vec![(nid(10), 90), (nid(12), 70)],
+        );
+        fsm.on_candidate_response(FullNodesGroupMessage::ParticipationReport(report));
+
+        let pending = fsm.pending_scores.get(&round_span).unwrap();
+        assert_eq!(pending.reporters.len(), 2);
+        assert_eq!(
+            *pending.scores.get(&nid(11)).unwrap(),
+            vec![BoundedU64::new(80).unwrap()]
+        );
+        assert_eq!(
+            *pending.scores.get(&nid(12)).unwrap(),
+            vec![BoundedU64::new(60).unwrap(), BoundedU64::new(70).unwrap()]
+        );
+        assert_eq!(
+            *pending.scores.get(&nid(10)).unwrap(),
+            vec![BoundedU64::new(90).unwrap()]
+        );
+    }
+
+    #[test]
+    fn participation_report_self_scoring_rejected() {
+        enable_tracer();
+        let mut fsm = make_publisher_with_active_group();
+        let round_span = *fsm.curr_group.unwrap_active().1;
+
+        // nid(10) scores themselves — should reject the entire report
+        let report = make_report(
+            nid(10),
+            nid(0),
+            round_span.start,
+            round_span.end,
+            vec![(nid(10), 80), (nid(11), 90)],
+        );
+        fsm.on_candidate_response(FullNodesGroupMessage::ParticipationReport(report));
+
+        let pending = fsm.pending_scores.get(&round_span).unwrap();
+        assert!(pending.reporters.is_empty());
+        assert!(pending.scores.is_empty());
+    }
+
+    #[test]
+    fn participation_report_duplicate_peer_entry_rejected() {
+        enable_tracer();
+        let mut fsm = make_publisher_with_active_group();
+        let round_span = *fsm.curr_group.unwrap_active().1;
+
+        // nid(11) appears twice in the same report
+        let report = make_report(
+            nid(10),
+            nid(0),
+            round_span.start,
+            round_span.end,
+            vec![(nid(11), 80), (nid(11), 90)],
+        );
+        fsm.on_candidate_response(FullNodesGroupMessage::ParticipationReport(report));
+
+        let pending = fsm.pending_scores.get(&round_span).unwrap();
+        assert!(pending.reporters.is_empty());
+        assert!(pending.scores.is_empty());
+    }
+
+    #[test]
+    fn participation_report_accepted_for_previous_group() {
+        enable_tracer();
+        let sched_cfg = GroupSchedulingConfig {
+            max_group_size: 2,
+            round_span: Round(3),
+            invite_lookahead: Round(100),
+            max_invite_wait: Round(1),
+            deadline_round_dist: Round(1),
+            init_empty_round_span: Round(2),
+        };
+
+        let mut fsm: Publisher<ST> = Publisher::new(
+            nid(0),
+            RaptorCastConfigSecondaryPublisher {
+                full_nodes_prioritized: vec![nid(10), nid(11)],
+                group_scheduling: sched_cfg,
+            },
+            ChaCha8Rng::seed_from_u64(42),
+        );
+
+        // Build first group [3, 6) with two members
+        fsm.enter_round_and_step_until(Round(1));
+        let accept = make_invite_response(nid(0), nid(10), true, Round(3), &sched_cfg);
+        fsm.on_candidate_response(accept);
+        let accept = make_invite_response(nid(0), nid(11), true, Round(3), &sched_cfg);
+        fsm.on_candidate_response(accept);
+        fsm.enter_round_and_step_until(Round(2));
+        fsm.enter_round_and_step_until(Round(3));
+
+        let first_span = *fsm.curr_group.unwrap_active().1;
+        assert_eq!(first_span.start, Round(3));
+
+        // Build second group [6, 9) — rotates out the first
+        let accept = make_invite_response(nid(0), nid(10), true, Round(6), &sched_cfg);
+        fsm.on_candidate_response(accept);
+        let accept = make_invite_response(nid(0), nid(11), true, Round(6), &sched_cfg);
+        fsm.on_candidate_response(accept);
+        fsm.enter_round_and_step_until(Round(5));
+        fsm.enter_round_and_step_until(Round(6));
+
+        let second_span = *fsm.curr_group.unwrap_active().1;
+        assert_eq!(second_span.start, Round(6));
+
+        // The previous group's pending_scores entry should still exist
+        assert!(fsm.pending_scores.contains_key(&first_span));
+        assert!(fsm.pending_scores.contains_key(&second_span));
+
+        // A late report for the first group should be accepted
+        let report = make_report(
+            nid(10),
+            nid(0),
+            first_span.start,
+            first_span.end,
+            vec![(nid(11), 95)],
+        );
+        fsm.on_candidate_response(FullNodesGroupMessage::ParticipationReport(report));
+
+        let pending = fsm.pending_scores.get(&first_span).unwrap();
+        assert_eq!(pending.reporters.len(), 1);
+        assert_eq!(
+            *pending.scores.get(&nid(11)).unwrap(),
+            vec![BoundedU64::new(95).unwrap()]
         );
     }
 }

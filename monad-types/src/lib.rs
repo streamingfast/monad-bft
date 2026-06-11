@@ -71,6 +71,21 @@ impl Round {
     pub fn as_u64(&self) -> u64 {
         self.0
     }
+
+    pub fn immediately_follows(self, previous_round: Self) -> bool {
+        previous_round
+            .as_u64()
+            .checked_add(1)
+            .is_some_and(|next_round| next_round == self.as_u64())
+    }
+
+    pub fn checked_sub(self, count: Round) -> Option<Self> {
+        self.0.checked_sub(count.0).map(Round)
+    }
+
+    pub fn checked_add(self, count: Round) -> Option<Self> {
+        self.0.checked_add(count.0).map(Round)
+    }
 }
 
 pub type Balance = U256;
@@ -133,11 +148,23 @@ impl FromStr for Round {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, RlpEncodable)]
 // A non-empty span of rounds
 pub struct RoundSpan {
     pub start: Round, // inclusive
     pub end: Round,   // exclusive
+}
+
+impl Decodable for RoundSpan {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let b = &mut alloy_rlp::Header::decode_bytes(buf, true)?;
+        let start = Round::decode(b)?;
+        let end = Round::decode(b)?;
+        if start >= end {
+            return Err(alloy_rlp::Error::Custom("RoundSpan requires start < end"));
+        }
+        Ok(Self { start, end })
+    }
 }
 
 impl RoundSpan {
@@ -432,6 +459,12 @@ impl<P: PubKey> NodeId<P> {
     }
 }
 
+impl<P: PubKey> From<P> for NodeId<P> {
+    fn from(pubkey: P) -> Self {
+        Self::new(pubkey)
+    }
+}
+
 impl<P: PubKey> Debug for NodeId<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         Debug::fmt(&self.0, f)
@@ -657,7 +690,10 @@ impl<S: Clone> Deserializable<S> for S {
 #[derive(Debug)]
 pub enum RouterTarget<P: PubKey> {
     Broadcast(Epoch),
-    Raptorcast(Epoch), // sharded raptor-aware broadcast
+    Raptorcast {
+        round: Round,
+        epoch: Epoch,
+    },
     PointToPoint(NodeId<P>),
     DirectPointToPoint(NodeId<P>),
     TcpPointToPoint {
@@ -904,6 +940,40 @@ impl<T, const N: usize> IntoIterator for LimitedVec<T, N> {
     }
 }
 
+/// A `u64` that enforces a maximum value during construction and RLP deserialization.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BoundedU64<const MAX: u64>(u64);
+
+impl<const MAX: u64> BoundedU64<MAX> {
+    pub fn new(value: u64) -> Option<Self> {
+        if value > MAX {
+            return None;
+        }
+        Some(Self(value))
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl<const MAX: u64> Encodable for BoundedU64<MAX> {
+    fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
+        self.0.encode(out);
+    }
+
+    fn length(&self) -> usize {
+        self.0.length()
+    }
+}
+
+impl<const MAX: u64> Decodable for BoundedU64<MAX> {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let value = u64::decode(buf)?;
+        Self::new(value).ok_or(alloy_rlp::Error::Custom("BoundedU64 value exceeds maximum"))
+    }
+}
+
 #[cfg(test)]
 mod test {
     use alloy_rlp::{Decodable, Encodable};
@@ -922,9 +992,16 @@ mod test {
     #[test_case(SeqNum(100), Epoch(2), SeqNum(100); "sn_100_epoch_2")]
     #[test_case(SeqNum(199), Epoch(2), SeqNum(100); "sn_199_epoch_2")]
     #[test_case(SeqNum(200), Epoch(3), SeqNum(100); "sn_200_epoch_3")]
-
     fn test_epoch_conversion(seq_num: SeqNum, expected_epoch: Epoch, epoch_length: SeqNum) {
         assert_eq!(seq_num.to_epoch(epoch_length), expected_epoch);
+    }
+
+    #[test_case(Round(11), Round(10) => true; "normal_successor")]
+    #[test_case(Round(10), Round(10) => false; "same_round")]
+    #[test_case(Round(12), Round(10) => false; "not_immediate")]
+    #[test_case(Round::MAX, Round::MAX => false; "max_round_no_overflow")]
+    fn test_round_immediately_follows(round: Round, previous_round: Round) -> bool {
+        round.immediately_follows(previous_round)
     }
 
     #[test]
@@ -1028,5 +1105,37 @@ mod test {
 
         let decoded = LimitedVec::<u32, 0>::decode(&mut buf.as_slice()).unwrap();
         assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn test_round_span_rlp_roundtrip() {
+        let span = RoundSpan::new(Round(10), Round(20)).unwrap();
+        let mut buf = Vec::new();
+        span.encode(&mut buf);
+
+        let decoded = RoundSpan::decode(&mut buf.as_slice()).unwrap();
+        assert_eq!(span, decoded);
+    }
+
+    #[test]
+    fn test_round_span_rlp_rejects_start_eq_end() {
+        let invalid = RoundSpan {
+            start: Round(10),
+            end: Round(10),
+        };
+        let mut buf = Vec::new();
+        invalid.encode(&mut buf);
+        assert!(RoundSpan::decode(&mut buf.as_slice()).is_err());
+    }
+
+    #[test]
+    fn test_round_span_rlp_rejects_start_gt_end() {
+        let invalid = RoundSpan {
+            start: Round(20),
+            end: Round(10),
+        };
+        let mut buf = Vec::new();
+        invalid.encode(&mut buf);
+        assert!(RoundSpan::decode(&mut buf.as_slice()).is_err());
     }
 }

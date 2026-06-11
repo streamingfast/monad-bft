@@ -18,6 +18,7 @@ use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
 use monad_eth_types::{serde::deserialize_eth_address_from_str, EthExecutionProtocol};
+use monad_peer_score::ema;
 use serde::Deserialize;
 
 pub use self::{
@@ -35,6 +36,9 @@ mod peers;
 
 pub mod fullnode_raptorcast;
 pub use fullnode_raptorcast::FullNodeRaptorCastConfig;
+
+pub mod raptorcast;
+pub use raptorcast::DeterministicProtocolRolloutStage;
 
 mod sync_peers;
 
@@ -66,8 +70,13 @@ pub struct NodeConfig<ST: CertificateSignatureRecoverable> {
     pub network: NodeNetworkConfig,
 
     pub peer_discovery: PeerDiscoveryConfig<ST>,
+    #[serde(default)]
+    pub txpool_peer_score: ema::ScoreConfig,
 
     pub fullnode_raptorcast: FullNodeRaptorCastConfig<CertificateSignaturePubKey<ST>>,
+
+    #[serde(default)]
+    pub deterministic_raptorcast_rollout: DeterministicProtocolRolloutStage,
 
     // TODO split network-wide configuration into separate file
     ////////////////////////////////

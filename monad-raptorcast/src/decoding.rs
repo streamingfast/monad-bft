@@ -16,7 +16,7 @@
 #![allow(clippy::manual_range_contains)]
 #![allow(clippy::identity_op)]
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     hash::Hash,
     num::NonZero,
     sync::Arc,
@@ -29,14 +29,14 @@ use indexmap::IndexMap;
 use lru::LruCache;
 use monad_crypto::certificate_signature::PubKey;
 use monad_executor::{ExecutorMetrics, ExecutorMetricsChain};
-use monad_raptor::{ManagedDecoder, SOURCE_SYMBOLS_MIN};
+use monad_raptor::ManagedDecoder;
 use monad_types::{NodeId, Stake};
 use monad_validator::validator_set::{ValidatorSet, ValidatorSetType as _};
 use rand::Rng as _;
 
 use crate::{
-    udp::{ValidatedMessage, MAX_REDUNDANCY},
-    util::{compute_hash, AppMessageHash, BroadcastMode, NodeIdHash},
+    udp::ValidatedChunk,
+    util::{compute_hash, AppMessageHash, BroadcastMode, GlobalMerkleRoot, NodeIdHash},
 };
 
 pub const DECODING_CACHE_METRIC_PREFIX: &str = "monad.raptorcast.decoding_cache";
@@ -96,6 +96,12 @@ pub const MAX_TOTAL_SIZE_LIMIT: usize = 20 * 1024 * 1024 * 1024; // 20 GB
 //
 // Required properties: (Copy, Add, Sub, Eq, Ord)
 type MessageSize = usize;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum MessageIdentifier {
+    AppMessageHash(AppMessageHash),
+    GlobalMerkleRoot(GlobalMerkleRoot),
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct DecoderCacheConfig {
@@ -172,7 +178,7 @@ where
 
     pub fn try_decode(
         &mut self,
-        message: &ValidatedMessage<PT>,
+        message: &ValidatedChunk<PT>,
         context: &DecodingContext<'_, PT>,
     ) -> Result<TryDecodeStatus<PT>, TryDecodeError> {
         let cache_key = CacheKey::from_message(message);
@@ -199,7 +205,7 @@ where
 
             None => {
                 // the decoder state is not in cache, try create a new one
-                let decoder_state = DecoderState::from_initial_message(message, context)
+                let decoder_state = DecoderState::from_initial_message(message)
                     .map_err(TryDecodeError::InvalidSymbol)?;
 
                 let Some(decoder_state) =
@@ -248,7 +254,7 @@ where
         })
     }
 
-    pub fn mark_tainted(&mut self, message: &ValidatedMessage<PT>) {
+    pub fn mark_tainted(&mut self, message: &ValidatedChunk<PT>) {
         let cache_key = CacheKey::from_message(message);
         if let Some(recently_decoded) = self.recently_decoded.get_mut(&cache_key) {
             recently_decoded.mark_tainted();
@@ -258,7 +264,7 @@ where
     fn decoder_state_entry(
         &mut self,
         cache_key: &CacheKey,
-        message: &ValidatedMessage<PT>,
+        message: &ValidatedChunk<PT>,
         context: &DecodingContext<'_, PT>,
     ) -> Option<MessageCacheEntry<'_>> {
         if let Some(recently_decoded) = self.recently_decoded.get_mut(cache_key) {
@@ -277,7 +283,7 @@ where
     fn insert_decoder_state(
         &mut self,
         cache_key: &CacheKey,
-        message: &ValidatedMessage<PT>,
+        message: &ValidatedChunk<PT>,
         decoder_state: DecoderState,
         context: &DecodingContext<'_, PT>,
     ) -> Option<&mut DecoderState> {
@@ -289,7 +295,7 @@ where
     fn remove_decoder_state(
         &mut self,
         cache_key: &CacheKey,
-        message: &ValidatedMessage<PT>,
+        message: &ValidatedChunk<PT>,
         context: &DecodingContext<'_, PT>,
     ) -> Option<DecoderState> {
         let cache = self.pending_messages.get_cache_tier(message, context);
@@ -352,7 +358,7 @@ enum MessageTier {
 }
 
 impl MessageTier {
-    fn from_message<PT>(message: &ValidatedMessage<PT>, context: &DecodingContext<'_, PT>) -> Self
+    fn from_message<PT>(message: &ValidatedChunk<PT>, context: &DecodingContext<'_, PT>) -> Self
     where
         PT: PubKey,
     {
@@ -404,7 +410,7 @@ where
 
     fn get_cache_tier<'a>(
         &'a mut self,
-        message: &ValidatedMessage<PT>,
+        message: &ValidatedChunk<PT>,
         context: &DecodingContext<'_, PT>,
     ) -> &'a mut SoftQuotaCache<PT> {
         match MessageTier::from_message(message, context) {
@@ -430,10 +436,20 @@ struct CacheKey {
 }
 
 impl CacheKey {
-    fn from_message<PT: PubKey>(message: &ValidatedMessage<PT>) -> Self {
+    fn from_message<PT: PubKey>(message: &ValidatedChunk<PT>) -> Self {
+        let message_id = if let Some(root) = message.global_merkle_root() {
+            MessageIdentifier::GlobalMerkleRoot(*root)
+        } else {
+            MessageIdentifier::AppMessageHash(
+                message
+                    .app_message_hash()
+                    .copied()
+                    .expect("V0 chunks must have app_message_hash"),
+            )
+        };
         let inner = CacheKeyInner {
             author_hash: compute_hash(&message.author),
-            app_message_hash: message.app_message_hash,
+            message_id,
             unix_ts_ms: message.unix_ts_ms,
         };
         Self {
@@ -447,7 +463,7 @@ type UnixTimestamp = u64;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct CacheKeyInner {
     author_hash: NodeIdHash,
-    app_message_hash: AppMessageHash,
+    message_id: MessageIdentifier,
     unix_ts_ms: UnixTimestamp,
 }
 
@@ -462,7 +478,7 @@ struct Quota {
 trait QuotaPolicy<PT: PubKey>: Send + Sync {
     fn calc_quota(
         &self,
-        message: &ValidatedMessage<PT>,
+        message: &ValidatedChunk<PT>,
         context: &DecodingContext<PT>,
         total_slots: usize,
     ) -> Quota;
@@ -597,7 +613,7 @@ impl<PT: PubKey> SoftQuotaCache<PT> {
     pub fn insert(
         &mut self,
         cache_key: &CacheKey,
-        message: &ValidatedMessage<PT>,
+        message: &ValidatedChunk<PT>,
         decoder_state: DecoderState,
         context: &DecodingContext<PT>,
     ) {
@@ -730,7 +746,7 @@ impl<PT: PubKey> SoftQuotaCache<PT> {
     fn insert_unchecked(
         &mut self,
         cache_key: &CacheKey,
-        message: &ValidatedMessage<PT>,
+        message: &ValidatedChunk<PT>,
         decoder_state: DecoderState,
         quota: Quota,
     ) {
@@ -911,7 +927,7 @@ impl<PT: PubKey> AuthorIndex<PT> {
         &mut self,
         author: NodeId<PT>,
         cache_key: &CacheKey,
-        message: &ValidatedMessage<PT>,
+        message: &ValidatedChunk<PT>,
         quota: Quota,
     ) {
         let index = self
@@ -1301,7 +1317,7 @@ impl FixedQuota {
 impl<PT: PubKey> QuotaPolicy<PT> for FixedQuota {
     fn calc_quota(
         &self,
-        _message: &ValidatedMessage<PT>,
+        _message: &ValidatedChunk<PT>,
         _context: &DecodingContext<PT>,
         total_slots: usize,
     ) -> Quota {
@@ -1338,7 +1354,7 @@ impl QuotaByStake {
 impl<PT: PubKey> QuotaPolicy<PT> for QuotaByStake {
     fn calc_quota(
         &self,
-        message: &ValidatedMessage<PT>,
+        message: &ValidatedChunk<PT>,
         context: &DecodingContext<PT>,
         total_slots: usize,
     ) -> Quota {
@@ -1423,7 +1439,7 @@ pub(crate) enum InvalidSymbol {
 }
 
 impl InvalidSymbol {
-    pub fn log<PT: PubKey>(&self, symbol: &ValidatedMessage<PT>, self_id: &NodeId<PT>) {
+    pub fn log<PT: PubKey>(&self, symbol: &ValidatedChunk<PT>, self_id: &NodeId<PT>) {
         match self {
             InvalidSymbol::InvalidSymbolLength {
                 expected_len,
@@ -1500,16 +1516,12 @@ impl InvalidSymbol {
 
 struct DecoderState {
     decoder: ManagedDecoder,
-    recipient_chunks: BTreeMap<NodeIdHash, usize>,
     app_message_len: usize,
     seen_esis: BitVec<usize, Lsb0>,
 }
 
 impl DecoderState {
-    pub fn from_initial_message<PT>(
-        message: &ValidatedMessage<PT>,
-        context: &DecodingContext<PT>,
-    ) -> Result<Self, InvalidSymbol>
+    pub fn from_initial_message<PT>(message: &ValidatedChunk<PT>) -> Result<Self, InvalidSymbol>
     where
         PT: PubKey,
     {
@@ -1518,31 +1530,13 @@ impl DecoderState {
             .app_message_len
             .try_into()
             .expect("usize smaller than u32");
-
-        // symbol_len is always greater than zero, so this division is safe
-        let num_source_symbols = app_message_len.div_ceil(symbol_len).max(SOURCE_SYMBOLS_MIN);
-        let mut encoded_symbol_capacity = MAX_REDUNDANCY
-            .scale(num_source_symbols)
-            .expect("redundancy-scaled num_source_symbols doesn't fit in usize");
-
-        if matches!(message.broadcast_mode, BroadcastMode::Primary) {
-            // Validator-to-validator raptorcast can include up to |valset| round-up chunks.
-            encoded_symbol_capacity += context.validator_set_size().unwrap_or_else(|| {
-                tracing::warn!(
-                    ?message,
-                    ?context,
-                    "Decoding raptorcast primary without specifying validator set"
-                );
-                0
-            });
-        };
-
+        let num_source_symbols = message.num_source_symbols;
+        let encoded_symbol_capacity = message.encoded_symbol_capacity;
         let decoder = ManagedDecoder::new(num_source_symbols, encoded_symbol_capacity, symbol_len)
             .map_err(InvalidSymbol::InvalidDecoderParameter)?;
 
         let mut decoder_state = DecoderState {
             decoder,
-            recipient_chunks: BTreeMap::new(),
             app_message_len,
             seen_esis: bitvec![usize, Lsb0; 0; encoded_symbol_capacity],
         };
@@ -1552,10 +1546,7 @@ impl DecoderState {
         Ok(decoder_state)
     }
 
-    pub fn handle_message<PT>(
-        &mut self,
-        message: &ValidatedMessage<PT>,
-    ) -> Result<(), InvalidSymbol>
+    pub fn handle_message<PT>(&mut self, message: &ValidatedChunk<PT>) -> Result<(), InvalidSymbol>
     where
         PT: PubKey,
     {
@@ -1565,15 +1556,11 @@ impl DecoderState {
         self.seen_esis.set(symbol_id, true);
         self.decoder
             .received_encoded_symbol(&message.chunk, symbol_id);
-        *self
-            .recipient_chunks
-            .entry(message.recipient_hash)
-            .or_insert(0) += 1;
 
         Ok(())
     }
 
-    pub fn validate_symbol<PT>(&self, message: &ValidatedMessage<PT>) -> Result<(), InvalidSymbol>
+    pub fn validate_symbol<PT>(&self, message: &ValidatedChunk<PT>) -> Result<(), InvalidSymbol>
     where
         PT: PubKey,
     {
@@ -1598,10 +1585,7 @@ struct RecentlyDecodedState {
 }
 
 impl RecentlyDecodedState {
-    pub fn handle_message<PT>(
-        &mut self,
-        message: &ValidatedMessage<PT>,
-    ) -> Result<(), TryDecodeError>
+    pub fn handle_message<PT>(&mut self, message: &ValidatedChunk<PT>) -> Result<(), TryDecodeError>
     where
         PT: PubKey,
     {
@@ -1644,17 +1628,17 @@ impl From<DecoderState> for RecentlyDecodedState {
 }
 
 fn validate_symbol<PT: PubKey>(
-    parsed_message: &ValidatedMessage<PT>,
+    chunk: &ValidatedChunk<PT>,
     symbol_len: usize,
     app_message_len: usize,
     seen_esis: &BitVec,
 ) -> Result<(), InvalidSymbol> {
-    let encoding_symbol_id: usize = parsed_message.chunk_id.into();
+    let encoding_symbol_id: usize = chunk.chunk_id.into();
 
-    if symbol_len != parsed_message.chunk.len() {
+    if symbol_len != chunk.chunk.len() {
         return Err(InvalidSymbol::InvalidSymbolLength {
             expected_len: symbol_len,
-            received_len: parsed_message.chunk.len(),
+            received_len: chunk.chunk.len(),
         });
     }
 
@@ -1665,10 +1649,10 @@ fn validate_symbol<PT: PubKey>(
         });
     }
 
-    if parsed_message.app_message_len as usize != app_message_len {
+    if chunk.app_message_len as usize != app_message_len {
         return Err(InvalidSymbol::InvalidAppMessageLength {
             expected_len: app_message_len,
-            received_len: parsed_message.app_message_len as usize,
+            received_len: chunk.app_message_len as usize,
         });
     }
 
@@ -1714,16 +1698,17 @@ fn quota_policy_from_config<PT: PubKey>(config: &SoftQuotaCacheConfig) -> Box<dy
 
 #[cfg(test)]
 mod test {
+    use std::collections::BTreeMap;
+
     use bytes::BytesMut;
     use itertools::Itertools;
-    use monad_crypto::hasher::{Hasher as _, HasherType};
     use monad_types::{Epoch, Stake};
     use rand::seq::SliceRandom as _;
 
     use super::*;
     use crate::{
-        udp::GroupId,
-        util::{BroadcastMode, HexBytes},
+        udp::{ChunkVersion, GroupId},
+        util::{compute_app_message_hash, BroadcastMode, EncodingScheme, HexBytes},
     };
     type PT = monad_crypto::NopPubKey;
 
@@ -1767,38 +1752,41 @@ mod test {
         app_message: &Bytes,
         author: NodeId<PT>,
         unix_ts_ms: u64,
-    ) -> Vec<ValidatedMessage<PT>> {
+    ) -> Vec<ValidatedChunk<PT>> {
         let data_size = DATA_SIZE;
-        let num_symbols = app_message.len().div_ceil(data_size) * REDUNDANCY;
+        let num_source_symbols = app_message.len().div_ceil(data_size);
+        let num_symbols = num_source_symbols * REDUNDANCY;
 
         assert!(num_symbols >= app_message.len() / data_size);
-        let app_message_hash = {
-            let mut hasher = HasherType::new();
-            hasher.update(app_message);
-            HexBytes((hasher.hash().0[..20]).try_into().unwrap())
-        };
+        let app_message_hash = compute_app_message_hash(app_message);
         let encoder = monad_raptor::Encoder::new(app_message, data_size).unwrap();
 
-        let mut messages = Vec::with_capacity(num_symbols);
+        let mut chunks = Vec::with_capacity(num_symbols);
         for symbol_id in 0..num_symbols {
             let mut chunk = BytesMut::zeroed(data_size);
             encoder.encode_symbol(&mut chunk, symbol_id);
-            let message = ValidatedMessage {
+            let chunk = ValidatedChunk {
                 chunk_id: symbol_id as u16,
                 author,
-                app_message_hash,
+                app_message_hash: Some(app_message_hash),
+                merkle_root: HexBytes([0; 20]),
                 app_message_len: app_message.len() as u32,
+                version: ChunkVersion::V0,
+                encoding_scheme: EncodingScheme::Unspecified,
                 broadcast_mode: BroadcastMode::Unspecified,
                 chunk: chunk.freeze(),
                 // these fields are never touched in this module
-                recipient_hash: HexBytes([0; 20]),
+                signature: Bytes::new(),
+                recipient_hash: None,
                 message: Bytes::new(),
                 group_id: GroupId::Primary(EPOCH),
                 unix_ts_ms,
+                num_source_symbols,
+                encoded_symbol_capacity: num_symbols,
             };
-            messages.push(message);
+            chunks.push(chunk);
         }
-        messages
+        chunks
     }
 
     #[test]
@@ -2462,7 +2450,7 @@ mod test {
 
         let wrong_hash = HexBytes([0xAA; 20]);
         for symbol in &mut symbols {
-            symbol.app_message_hash = wrong_hash;
+            symbol.app_message_hash = Some(wrong_hash);
         }
 
         let context = DecodingContext::new(None, UNIX_TS_MS);
@@ -2501,7 +2489,7 @@ mod test {
     fn try_decode_all<'a>(
         cache: &mut DecoderCache<PT>,
         context: &DecodingContext<PT>,
-        symbols: impl Iterator<Item = &'a ValidatedMessage<PT>>,
+        symbols: impl Iterator<Item = &'a ValidatedChunk<PT>>,
     ) -> Result<Vec<(NodeId<PT>, Bytes)>, TryDecodeError> {
         let mut decoded = Vec::new();
         for symbol in symbols {

@@ -17,9 +17,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     marker::PhantomData,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
+    num::NonZeroU16,
     path::PathBuf,
     process,
-    sync::Arc,
+    sync::{mpsc::TrySendError, Arc},
     time::{Duration, Instant},
 };
 
@@ -49,13 +50,17 @@ use monad_peer_discovery::{
     discovery::{PeerDiscovery, PeerDiscoveryBuilder},
     MonadNameRecord, NameRecord,
 };
+use monad_peer_score::{ema, IdentityScore, StdClock};
 use monad_pprof::start_pprof_server;
-use monad_raptorcast::config::{RaptorCastConfig, RaptorCastConfigPrimary};
+use monad_raptorcast::{
+    auth::WireAuthProtocol,
+    config::{RaptorCastConfig, RaptorCastConfigPrimary},
+};
 use monad_router_multi::MultiRouter;
 use monad_state::{MonadMessage, MonadStateBuilder, VerifiedMonadMessage};
 use monad_state_backend::StateBackendThreadClient;
 use monad_state_backend_cache::StateBackendCache;
-use monad_statesync::StateSync;
+use monad_statesync_executor::StateSyncExecutor;
 use monad_triedb_utils::TriedbReader;
 use monad_types::{DropTimer, Epoch, NodeId, Round, SeqNum, GENESIS_SEQ_NUM};
 use monad_updaters::{
@@ -67,7 +72,7 @@ use monad_validator::{
     signature_collection::SignatureCollection, validator_set::ValidatorSetFactory,
     weighted_round_robin::WeightedRoundRobin,
 };
-use monad_wal::wal::WALoggerConfig;
+use monad_wal::wal::{WALLog, WALoggerConfig};
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_otlp::{MetricExporter, WithExportConfig};
 use rand_chacha::{rand_core::SeedableRng, ChaCha8Rng};
@@ -93,6 +98,7 @@ const MONAD_NODE_VERSION: Option<&str> = option_env!("MONAD_VERSION");
 const STATESYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 const EXECUTION_DELAY: u64 = 3;
+const WALTRACE_CHANNEL_CAPACITY: usize = 1024;
 
 fn main() {
     let mut cmd = Cli::command();
@@ -155,11 +161,17 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         .qc()
         .get_round()
         + Round(1);
+    let (score_provider, score_reader) =
+        ema::create::<NodeId<CertificateSignaturePubKey<SignatureType>>, StdClock>(
+            node_state.node_config.txpool_peer_score.clone(),
+            StdClock,
+        );
     let router = build_raptorcast_router::<
         SignatureType,
         SignatureCollectionType,
         MonadMessage<SignatureType, SignatureCollectionType, ExecutionProtocolType>,
         VerifiedMonadMessage<SignatureType, SignatureCollectionType, ExecutionProtocolType>,
+        _,
     >(
         node_state.node_config.clone(),
         node_state.node_config.peer_discovery,
@@ -170,6 +182,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         current_epoch,
         current_round,
         node_state.persisted_peers_path,
+        score_reader.clone(),
     );
 
     let statesync_threshold: usize = node_state.node_config.statesync_threshold.into();
@@ -261,6 +274,8 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                 .get_round(),
             // TODO(andr-dev): Use timestamp from last commit in ledger
             0,
+            score_provider,
+            score_reader,
         )
         .expect("txpool ipc succeeds"),
         control_panel: ControlPanelIpcReceiver::new(
@@ -270,7 +285,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         )
         .expect("uds bind failed"),
         loopback: LoopbackExecutor::default(),
-        state_sync: StateSync::<SignatureType, SignatureCollectionType>::new(
+        state_sync: StateSyncExecutor::<SignatureType, SignatureCollectionType>::new(
             vec![statesync_triedb_path.to_string_lossy().to_string()],
             node_state.statesync_sq_thread_cpu,
             state_sync_init_peers,
@@ -289,17 +304,39 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         config_loader: ConfigLoader::new(node_state.node_config_path),
     };
 
-    let logger_config: WALoggerConfig<LogFriendlyMonadEvent<_, _, _>> = WALoggerConfig::new(
-        node_state.wal_path.clone(), // output wal path
-        false,                       // flush on every write
-    );
-    let Ok(mut wal) = logger_config.build() else {
-        event!(
-            Level::ERROR,
-            path = node_state.wal_path.as_path().display().to_string(),
-            "failed to initialize wal",
-        );
-        return Err(());
+    let waltrace_tx = if node_state.wal_chunks == 0 {
+        info!("wal is disabled");
+        None
+    } else {
+        let logger_config: WALoggerConfig<
+            LogFriendlyMonadEvent<SignatureType, SignatureCollectionType, ExecutionProtocolType>,
+        > = WALoggerConfig::new(
+            node_state.wal_path.clone(), // output wal directory
+            false,                       // flush on every write
+        )
+        .with_chunks(node_state.wal_chunks)
+        .with_chunk_size(node_state.wal_chunk_size_bytes);
+        let (waltrace_tx, waltrace_rx) = std::sync::mpsc::sync_channel(WALTRACE_CHANNEL_CAPACITY);
+        let _waltrace_thread = std::thread::Builder::new()
+            .name("monad_bft_waltrace".to_string())
+            .spawn(move || {
+                let mut wal = match logger_config.build() {
+                    Ok(wal) => wal,
+                    Err(err) => {
+                        error!(?err, "failed to initialize wal");
+                        return;
+                    }
+                };
+                while let Ok(event) = waltrace_rx.recv() {
+                    let _wal_event_span = tracing::trace_span!("wal_event_span").entered();
+                    if let Err(err) = wal.push(&event) {
+                        event!(Level::ERROR, ?err, "failed to push to wal");
+                        return;
+                    }
+                }
+            })
+            .expect("failed to spawn waltrace thread");
+        Some(waltrace_tx)
     };
 
     let block_sync_override_peers = node_state
@@ -439,19 +476,26 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                     format!("{:?}", event)
                 };
 
-                let event = LogFriendlyMonadEvent {
-                    timestamp: Utc::now(),
-                    event,
-                };
-
                 {
                     let _ledger_span = ledger_span.enter();
-                    let _wal_event_span = tracing::trace_span!("wal_event_span").entered();
-                    if let Err(err) = wal.push(&event) {
-                        event!(Level::ERROR, ?err, "failed to push to wal",);
-                        return Err(());
+                    if event.is_wal_logged() {
+                        if let Some(waltrace_tx) = waltrace_tx.as_ref() {
+                            let wal_event = LogFriendlyMonadEvent {
+                                timestamp: Utc::now(),
+                                event: event.lossy_clone(),
+                            };
+                            match waltrace_tx.try_send(wal_event) {
+                                Ok(()) => {}
+                                Err(TrySendError::Full(_)) => {
+                                    warn!("waltrace is lagging; dropping wal event");
+                                }
+                                Err(TrySendError::Disconnected(_)) => {
+                                    event!(Level::ERROR, "waltrace thread stopped");
+                                }
+                            }
+                        }
                     }
-                };
+                }
 
                 let commands = {
                     let _timer = DropTimer::start(Duration::from_millis(50), |elapsed| {
@@ -462,9 +506,9 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                         )
                     });
                     let _ledger_span = ledger_span.enter();
-                    let _event_span = tracing::trace_span!("event_span", ?event.event).entered();
+                    let _event_span = tracing::trace_span!("event_span", ?event).entered();
                     let start = Instant::now();
-                    let cmds = state.update(event.event);
+                    let cmds = state.update(event);
                     total_state_update_elapsed += start.elapsed();
                     cmds
                 };
@@ -497,7 +541,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
     Ok(())
 }
 
-fn build_raptorcast_router<ST, SCT, M, OM>(
+fn build_raptorcast_router<ST, SCT, M, OM, DS>(
     node_config: NodeConfig<ST>,
     peer_discovery_config: PeerDiscoveryConfig<ST>,
     identity: ST::KeyPairType,
@@ -507,13 +551,15 @@ fn build_raptorcast_router<ST, SCT, M, OM>(
     current_epoch: Epoch,
     current_round: Round,
     persisted_peers_path: PathBuf,
+    direct_udp_peer_score_reader: DS,
 ) -> MultiRouter<
     ST,
     M,
     OM,
     MonadEvent<ST, SCT, ExecutionProtocolType>,
     PeerDiscovery<ST>,
-    monad_raptorcast::auth::WireAuthProtocol,
+    WireAuthProtocol,
+    DS,
 >
 where
     ST: CertificateSignatureRecoverable<KeyPairType = monad_secp::KeyPair>,
@@ -525,6 +571,7 @@ where
         + Sync
         + 'static,
     OM: Encodable + Clone + Send + Sync + 'static,
+    DS: IdentityScore<Identity = NodeId<CertificateSignaturePubKey<ST>>>,
 {
     let bind_address = SocketAddr::new(
         IpAddr::V4(node_config.network.bind_address_host),
@@ -534,6 +581,10 @@ where
         IpAddr::V4(node_config.network.bind_address_host),
         node_config.network.authenticated_bind_address_port,
     );
+    let direct_udp_bind_address = node_config
+        .network
+        .direct_udp_bind_address_port
+        .map(|port| SocketAddr::new(IpAddr::V4(node_config.network.bind_address_host), port));
     let Some(SocketAddr::V4(name_record_address)) = resolve_domain_v4(
         &NodeId::new(identity.pubkey()),
         &peer_discovery_config.self_address,
@@ -547,6 +598,7 @@ where
     tracing::debug!(
         ?bind_address,
         ?authenticated_bind_address,
+        ?direct_udp_bind_address,
         ?name_record_address,
         "Monad-node starting, pid: {}",
         process::id()
@@ -569,14 +621,18 @@ where
             network_config.tcp_rate_limit_burst,
         );
 
+    let mut udp_sockets: Vec<(UdpSocketId, std::net::SocketAddr)> = vec![
+        (UdpSocketId::Raptorcast, bind_address),
+        (
+            UdpSocketId::AuthenticatedRaptorcast,
+            authenticated_bind_address,
+        ),
+    ];
+    if let Some(direct_addr) = direct_udp_bind_address {
+        udp_sockets.push((UdpSocketId::DirectUdp, direct_addr));
+    }
     dp_builder = dp_builder
-        .with_udp_sockets([
-            (UdpSocketId::Raptorcast, bind_address),
-            (
-                UdpSocketId::AuthenticatedRaptorcast,
-                authenticated_bind_address,
-            ),
-        ])
+        .with_udp_sockets(udp_sockets)
         .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_address)]);
 
     assert_eq!(
@@ -589,8 +645,10 @@ where
         *name_record_address.ip(),
         name_record_address.port(),
         name_record_address.port(),
-        Some(peer_discovery_config.self_auth_port),
-        peer_discovery_config.self_direct_udp_port,
+        peer_discovery_config.self_auth_port.get(),
+        peer_discovery_config
+            .self_direct_udp_port
+            .map(NonZeroU16::get),
         peer_discovery_config.self_record_seq_num,
     );
     let self_record = MonadNameRecord::new(self_record, &identity);
@@ -691,11 +749,18 @@ where
 
     let shared_key = Arc::new(identity);
     let wireauth_config = monad_wireauth::Config::default();
-    let auth_protocol = monad_raptorcast::auth::WireAuthProtocol::new(
+    let auth_protocol = WireAuthProtocol::new(
         &monad_raptorcast::auth::metrics::UDP_METRICS,
-        wireauth_config,
+        wireauth_config.clone(),
         shared_key.clone(),
     );
+    let direct_udp_auth_protocol = direct_udp_bind_address.map(|_| {
+        WireAuthProtocol::new(
+            &monad_raptorcast::auth::metrics::DIRECT_UDP_METRICS,
+            wireauth_config.clone(),
+            shared_key.clone(),
+        )
+    });
 
     MultiRouter::new(
         self_id,
@@ -712,12 +777,15 @@ where
                     .collect(),
             },
             secondary_instance: node_config.fullnode_raptorcast,
+            deterministic_protocol_rollout: node_config.deterministic_raptorcast_rollout,
         },
         dp_builder,
         peer_discovery_builder,
         current_epoch,
         epoch_validators,
         auth_protocol,
+        direct_udp_auth_protocol,
+        direct_udp_peer_score_reader,
     )
 }
 

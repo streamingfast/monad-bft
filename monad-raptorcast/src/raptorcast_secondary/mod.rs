@@ -35,7 +35,7 @@ use monad_crypto::certificate_signature::{
 use monad_executor::{Executor, ExecutorMetrics, ExecutorMetricsChain};
 use monad_executor_glue::{Message, PeerEntry, RouterCommand};
 use monad_peer_discovery::{driver::PeerDiscoveryDriver, PeerDiscoveryAlgo, PeerDiscoveryEvent};
-use monad_types::{Epoch, NodeId};
+use monad_types::{Epoch, NodeId, Round};
 use publisher::Publisher;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -45,7 +45,6 @@ use tracing::{debug, error, trace, warn};
 use crate::{
     config::{RaptorCastConfig, SecondaryRaptorCastMode},
     message::OutboundRouterMessage,
-    udp::GroupId,
     util::{SecondaryGroup, SecondaryGroupAssignment},
     RaptorCastEvent,
 };
@@ -62,12 +61,13 @@ pub enum SecondaryOutboundMessage<PT: PubKey> {
     SendSingle {
         msg_bytes: bytes::Bytes,
         dest: NodeId<PT>,
-        group_id: GroupId,
+        epoch: Epoch,
     },
     SendToGroup {
         msg_bytes: bytes::Bytes,
+        epoch: Epoch,
+        round: Round,
         group: SecondaryGroup<PT>,
-        group_id: GroupId,
     },
 }
 
@@ -180,7 +180,7 @@ where
         let outbound = SecondaryOutboundMessage::SendSingle {
             msg_bytes,
             dest: dest_node,
-            group_id: GroupId::Primary(self.curr_epoch),
+            epoch: self.curr_epoch,
         };
         if let Err(err) = self.channel_to_primary_outbound.send(outbound) {
             error!(?err, "failed to send message to primary");
@@ -336,7 +336,7 @@ where
                 },
 
                 Self::Command::PublishToFullNodes {
-                    epoch: _,
+                    epoch,
                     round,
                     message,
                 } => {
@@ -373,8 +373,9 @@ where
 
                     let outbound = SecondaryOutboundMessage::SendToGroup {
                         msg_bytes: outbound_message,
+                        epoch,
+                        round,
                         group,
-                        group_id: GroupId::Secondary(round),
                     };
                     if let Err(err) = self.channel_to_primary_outbound.send(outbound) {
                         error!(?err, "failed to send message to primary");
@@ -425,7 +426,9 @@ where
 
         match &mut this.role {
             Role::Publisher(publisher) => {
-                publisher.on_candidate_response(inbound_grp_msg);
+                if let Some((msg, node_id)) = publisher.on_candidate_response(inbound_grp_msg) {
+                    this.send_single_msg(msg, node_id);
+                }
             }
 
             Role::Client(client) => {
@@ -445,9 +448,11 @@ where
                     }
                     FullNodesGroupMessage::PrepareGroupResponse(_) => {
                         error!(
-                            "RaptorCastSecondary client received a \
-                                PrepareGroupResponse message"
+                            "RaptorCastSecondary client received a PrepareGroupResponse message"
                         );
+                    }
+                    FullNodesGroupMessage::ParticipationReport(_) => {
+                        error!("RaptorCastSecondary client received a ParticipationReport message");
                     }
                     FullNodesGroupMessage::ConfirmGroup(confirm_msg) => {
                         let is_valid = client.handle_confirm_group_message(confirm_msg.clone());
@@ -487,13 +492,16 @@ where
                                     .into(),
                                 ));
                             } else if num_mappings > 0 {
-                                warn!( ?confirm_msg, num_peers =? confirm_msg.peers.len(), num_name_recs =? confirm_msg.name_records.len(),
+                                warn!(?confirm_msg, num_peers =? confirm_msg.peers.len(), num_name_recs =? confirm_msg.name_records.len(),
                                     "Number of peers does not match the number \
                                     of name records in ConfirmGroup message. \
                                     Skipping PeerDiscovery update"
                                 );
                             }
                         }
+                    }
+                    FullNodesGroupMessage::NoConfirm(no_confirm) => {
+                        client.handle_no_confirm_message(no_confirm);
                     }
                 }
             }

@@ -45,12 +45,13 @@ use monad_peer_discovery::{
     MonadNameRecord, NameRecord,
 };
 use monad_raptorcast::{
+    auth::{NopScore, WireAuthProtocol},
     config::{RaptorCastConfig, RaptorCastConfigPrimary},
     raptorcast_secondary::SecondaryRaptorCastModeConfig,
     RaptorCast, RaptorCastEvent,
 };
 use monad_secp::{KeyPair, SecpSignature};
-use monad_types::{Deserializable, Epoch, NodeId, RouterTarget, Serializable, Stake};
+use monad_types::{Deserializable, Epoch, NodeId, Round, RouterTarget, Serializable, Stake};
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_otlp::{MetricExporter, WithExportConfig};
 use rand::{thread_rng, Rng};
@@ -290,6 +291,7 @@ fn create_raptorcast_config(keypair: Arc<KeyPair>) -> RaptorCastConfig<Signature
             invite_future_dist_max: monad_types::Round(5),
             invite_accept_heartbeat_ms: 100,
         },
+        deterministic_protocol_rollout: monad_raptorcast::v1_rollout::CURRENT_STAGE,
     }
 }
 
@@ -526,6 +528,7 @@ struct NodeSetup {
         <MockMessage as Message>::Event,
         NopDiscovery<SignatureType>,
         monad_raptorcast::auth::WireAuthProtocol,
+        monad_raptorcast::auth::NopScore<NodeId<CertificateSignaturePubKey<SignatureType>>>,
     >,
     node_id: NodeId<CertificateSignaturePubKey<SignatureType>>,
     tcp_addr: SocketAddrV4,
@@ -581,11 +584,12 @@ fn setup_node(
         let participant_pubkey = participant_keypair.pubkey();
         let node_id = NodeId::new(participant_pubkey);
 
-        let name_record = NameRecord::new_with_authentication(
+        let name_record = NameRecord::new(
             *participant.tcp_addr.ip(),
             participant.tcp_addr.port(),
             participant.udp_addr.port(),
             participant.authenticated_udp_addr.port(),
+            0,
             0,
         );
         let monad_name_record =
@@ -660,17 +664,18 @@ fn setup_node(
         MockMessage,
         <MockMessage as Message>::Event,
         NopDiscovery<SignatureType>,
-        monad_raptorcast::auth::WireAuthProtocol,
+        WireAuthProtocol,
+        NopScore<NodeId<PubKeyType>>,
     >::new(
         create_raptorcast_config(keypair_arc),
         SecondaryRaptorCastModeConfig::None,
         tcp_socket,
-        Some(authenticated_socket),
+        (authenticated_socket, auth_protocol),
+        None,
         non_authenticated_socket,
         dataplane_control,
         Arc::new(std::sync::Mutex::new(pd)),
         Epoch(0),
-        auth_protocol,
     );
 
     raptorcast.exec(vec![RouterCommand::AddEpochValidatorSet {
@@ -765,7 +770,7 @@ async fn run_producer(
             _ = interval_timer.tick() => {
                 let message = MockMessage::new_with_timestamp(size);
                 raptorcast.exec(vec![RouterCommand::Publish {
-                    target: RouterTarget::Raptorcast(Epoch(0)),
+                    target: RouterTarget::Raptorcast { round: Round(0), epoch: Epoch(0) },
                     message,
                 }]);
 

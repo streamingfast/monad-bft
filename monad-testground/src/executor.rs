@@ -39,8 +39,10 @@ use monad_peer_discovery::{
     mock::{NopDiscovery, NopDiscoveryBuilder},
 };
 use monad_raptorcast::{
-    auth::NoopAuthProtocol, config::RaptorCastConfig,
-    raptorcast_secondary::SecondaryRaptorCastModeConfig, RaptorCast,
+    auth::{NoopAuthProtocol, NopScore},
+    config::RaptorCastConfig,
+    raptorcast_secondary::SecondaryRaptorCastModeConfig,
+    RaptorCast,
 };
 use monad_state::{Forkpoint, MonadMessage, MonadState, MonadStateBuilder, VerifiedMonadMessage};
 use monad_state_backend::InMemoryState;
@@ -172,15 +174,17 @@ where
                     .tcp_sockets
                     .take(TcpSocketId::Raptorcast)
                     .expect("tcp raptorcast socket");
-                let authenticated_socket =
-                    dp.udp_sockets.take(UdpSocketId::AuthenticatedRaptorcast);
+                let authenticated_socket = dp
+                    .udp_sockets
+                    .take(UdpSocketId::AuthenticatedRaptorcast)
+                    .expect("authenticated raptorcast socket");
                 let non_authenticated_socket = dp
                     .udp_sockets
                     .take(UdpSocketId::Raptorcast)
                     .expect("raptorcast socket");
                 let control = dp.control;
 
-                let auth_protocol = NoopAuthProtocol::new();
+                let authenticated = (authenticated_socket, NoopAuthProtocol::new());
                 Updater::boxed(RaptorCast::<
                     ST,
                     MonadMessage<ST, SCT, MockExecutionProtocol>,
@@ -188,16 +192,17 @@ where
                     MonadEvent<ST, SCT, MockExecutionProtocol>,
                     NopDiscovery<ST>,
                     NoopAuthProtocol<CertificateSignaturePubKey<ST>>,
+                    NopScore<NodeId<CertificateSignaturePubKey<ST>>>,
                 >::new(
                     cfg,
                     SecondaryRaptorCastModeConfig::None,
                     tcp_socket,
-                    authenticated_socket,
+                    authenticated,
+                    None,
                     non_authenticated_socket,
                     control,
                     shared_peer_discovery_driver,
                     Epoch(0),
-                    auth_protocol,
                 ))
             }
         },

@@ -100,6 +100,10 @@ fn build_regular(config: Config) -> (Encoder, Decoder<u64, AllRegular, FixedCloc
     (encoder, decoder, clock)
 }
 
+fn two_fragment_payload(max_fragment_payload: usize, fill: u8) -> Bytes {
+    Bytes::from(vec![fill; max_fragment_payload - LEANUDP_HEADER_SIZE + 1])
+}
+
 fn packet_with_seq(packet: &Bytes, seq: u16) -> Bytes {
     let mut raw = packet.to_vec();
     raw[SEQ_NUM_OFFSET] = (seq & 0x00FF) as u8;
@@ -439,9 +443,10 @@ fn test_identity_limit_is_independent_per_pool() {
 }
 
 #[test]
-fn test_regular_dynamic_cap_applies_under_pressure() {
+fn test_regular_per_identity_limit_applies_under_pressure() {
+    let max_messages_per_identity = 200;
     let config = Config {
-        max_messages_per_identity: 200,
+        max_messages_per_identity,
         max_regular_messages: 1_000,
         ..Config::default()
     };
@@ -452,7 +457,7 @@ fn test_regular_dynamic_cap_applies_under_pressure() {
         assert_pending!(decoder, id, first);
     }
 
-    for i in 0..10u64 {
+    for i in 0..max_messages_per_identity as u64 {
         let first = first_packet(&mut encoder, Bytes::from(vec![i as u8; 3_000]));
         assert_pending!(decoder, 9_999, first);
     }
@@ -460,7 +465,9 @@ fn test_regular_dynamic_cap_applies_under_pressure() {
     let over = first_packet(&mut encoder, Bytes::from(vec![0u8; 3_000]));
     assert_eq!(
         decoder.decode(9_999, over),
-        Err(DecodeError::IdentityLimitExceeded { max: 10 })
+        Err(DecodeError::IdentityLimitExceeded {
+            max: max_messages_per_identity,
+        })
     );
 }
 
@@ -482,6 +489,44 @@ fn test_identity_stale_messages_are_evicted_first() {
 
     assert_eq!(decoder.metrics()[COUNTER_LEANUDP_DECODE_EVICTED_TIMEOUT], 1);
     assert_eq!(decoder.metrics()[COUNTER_LEANUDP_DECODE_EVICTED_RANDOM], 0);
+}
+
+#[test]
+fn test_late_fragment_after_timeout_does_not_complete_message() {
+    let config = Config {
+        message_timeout: Duration::from_millis(100),
+        ..Config::default()
+    };
+    let payload = two_fragment_payload(config.max_fragment_payload, b'T');
+    let (mut encoder, mut decoder, clock) = build_regular(config);
+    let packets = fragment_packets(&mut encoder, payload);
+    assert_eq!(packets.len(), 2);
+
+    assert_pending!(decoder, 9, packets[0].clone());
+    clock.advance_ms(5_000);
+
+    assert_eq!(
+        decoder.decode(9, packets[1].clone()),
+        Ok(DecodeOutcome::Pending)
+    );
+    assert_eq!(decoder.metrics()[COUNTER_LEANUDP_DECODE_EVICTED_TIMEOUT], 1);
+}
+
+#[test]
+fn test_same_key_retry_evicts_timed_out_message_immediately() {
+    let config = Config {
+        message_timeout: Duration::from_millis(100),
+        ..Config::default()
+    };
+    let payload = two_fragment_payload(config.max_fragment_payload, b'R');
+    let (mut encoder, mut decoder, clock) = build_regular(config);
+    let first = first_packet(&mut encoder, payload);
+
+    assert_pending!(decoder, 7, first.clone());
+    clock.advance_ms(5_000);
+
+    assert_eq!(decoder.decode(7, first), Ok(DecodeOutcome::Pending));
+    assert_eq!(decoder.metrics()[COUNTER_LEANUDP_DECODE_EVICTED_TIMEOUT], 1);
 }
 
 #[test]

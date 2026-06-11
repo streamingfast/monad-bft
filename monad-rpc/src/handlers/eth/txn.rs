@@ -13,12 +13,13 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::time::Duration;
+use std::{pin::pin, time::Duration};
 
 use alloy_consensus::{Transaction as _, TxEnvelope};
 use alloy_eips::Decodable2718;
 use alloy_primitives::{Address, FixedBytes};
-use alloy_rpc_types::{Filter, TransactionReceipt};
+use alloy_rpc_types::Filter;
+use monad_exec_events::BlockCommitState;
 use monad_rpc_docs::rpc;
 use monad_triedb_utils::triedb_env::Triedb;
 use schemars::JsonSchema;
@@ -26,7 +27,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, trace, warn};
 
 use crate::{
-    chainstate::{ChainState, ChainStateError},
+    data::DataProvider,
+    event::{EventServerClient, EventServerEvent},
     txpool::{EthTxPoolBridgeClient, TxStatus},
     types::{
         eth_json::{
@@ -82,7 +84,7 @@ fn schema_for_filter(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema
 /// Returns an array of all logs matching filter with given id.
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn monad_eth_getLogs<T: Triedb>(
-    chain_state: &ChainState<T>,
+    data_provider: &DataProvider<T>,
     max_response_size: u32,
     max_block_range: u64,
     p: MonadEthGetLogsParams,
@@ -94,7 +96,7 @@ pub async fn monad_eth_getLogs<T: Triedb>(
 
     let MonadEthGetLogsParams { filters } = p;
 
-    let logs = chain_state
+    let logs = data_provider
         .get_logs(
             filters,
             max_response_size,
@@ -241,52 +243,15 @@ pub struct MonadEthSendRawTransactionSyncParams {
     timeout_ms: Option<u64>,
 }
 
-/// Poll interval in milliseconds for checking receipt availability
-const RECEIPT_POLL_INTERVAL_MS: u64 = 100;
-/// Polls for transaction receipt with timeout
-async fn poll_for_receipt<T: Triedb>(
-    chain_state: &ChainState<T>,
-    tx_hash: FixedBytes<32>,
-    timeout_ms: u64,
-) -> Result<TransactionReceipt, JsonRpcError> {
-    let start_time = tokio::time::Instant::now();
-    let timeout = Duration::from_millis(timeout_ms);
-    let poll_interval = Duration::from_millis(RECEIPT_POLL_INTERVAL_MS);
-
-    loop {
-        match chain_state.get_transaction_receipt(*tx_hash).await {
-            Ok(receipt) => return Ok(receipt),
-            Err(ChainStateError::ResourceNotFound) => {
-                // Not found yet, check timeout
-                if start_time.elapsed() >= timeout {
-                    // EIP-7966: Error code 4 with tx hash in data
-                    return Err(JsonRpcError::tx_sync_timeout(
-                        tx_hash.to_string(),
-                        timeout_ms,
-                    ));
-                }
-
-                tokio::time::sleep(poll_interval).await;
-            }
-            Err(ChainStateError::Archive(e)) => {
-                return Err(JsonRpcError::internal_error(format!("Archive error: {e}")));
-            }
-            Err(ChainStateError::Triedb(e)) => {
-                return Err(JsonRpcError::internal_error(format!("Triedb error: {e}")));
-            }
-        }
-    }
-}
-
 #[rpc(
     method = "eth_sendRawTransactionSync",
-    ignore = "txpool_bridge_client,chain_state,chain_id,allow_unprotected_txs,eth_send_raw_transaction_sync_default_timeout_ms,eth_send_raw_transaction_sync_max_timeout_ms"
+    ignore = "txpool_bridge_client,event_server_client,chain_id,allow_unprotected_txs,eth_send_raw_transaction_sync_default_timeout_ms,eth_send_raw_transaction_sync_max_timeout_ms"
 )]
 #[allow(non_snake_case)]
 #[tracing::instrument(level = "debug", skip_all)]
-pub async fn monad_eth_sendRawTransactionSync<T: Triedb>(
+pub async fn monad_eth_sendRawTransactionSync(
     txpool_bridge_client: &EthTxPoolBridgeClient,
-    chain_state: &ChainState<T>,
+    event_server_client: &EventServerClient,
     params: MonadEthSendRawTransactionSyncParams,
     chain_id: u64,
     allow_unprotected_txs: bool,
@@ -307,13 +272,56 @@ pub async fn monad_eth_sendRawTransactionSync<T: Triedb>(
         JsonRpcError::tx_sync_unready,
     )?;
 
+    let Ok(mut event_server_subscription) = event_server_client.subscribe() else {
+        return Err(JsonRpcError::overloaded());
+    };
+
     let tx_hash = *tx.tx_hash();
     debug!(name = "sendRawTransactionSync", txn_hash = ?tx_hash);
     submit_to_txpool(txpool_bridge_client, tx).await?;
 
-    let receipt = poll_for_receipt(chain_state, tx_hash, timeout_ms).await?;
+    let mut timeout = pin!(tokio::time::sleep(Duration::from_millis(timeout_ms)));
 
-    Ok(MonadTransactionReceipt(receipt))
+    loop {
+        let result = tokio::select! {
+            result = event_server_subscription.recv() => result,
+
+            () = &mut timeout => {
+                // EIP-7966: Error code 4 with tx hash in data
+                return Err(JsonRpcError::tx_sync_timeout(
+                    tx_hash.to_string(),
+                    timeout_ms,
+                ));
+            }
+        };
+
+        let Ok(event) = result else {
+            return Err(JsonRpcError::overloaded());
+        };
+
+        match event {
+            EventServerEvent::Gap => {
+                return Err(JsonRpcError::overloaded());
+            }
+            EventServerEvent::Block {
+                commit_state,
+                header: _,
+                transactions,
+            } => {
+                if commit_state != BlockCommitState::Proposed {
+                    continue;
+                }
+
+                for (tx, tx_receipt, _) in transactions.iter() {
+                    if tx.value().inner.tx_hash() != &tx_hash {
+                        continue;
+                    }
+
+                    return Ok(MonadTransactionReceipt(tx_receipt.value().clone()));
+                }
+            }
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, schemars::JsonSchema)]
@@ -326,13 +334,13 @@ pub struct MonadEthGetTransactionReceiptParams {
 /// Returns the receipt of a transaction by transaction hash.
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn monad_eth_getTransactionReceipt<T: Triedb>(
-    chain_state: &ChainState<T>,
+    data_provider: &DataProvider<T>,
     params: MonadEthGetTransactionReceiptParams,
 ) -> JsonRpcResult<Option<MonadTransactionReceipt>> {
     trace!("monad_eth_getTransactionReceipt: {params:?}");
 
-    chain_state
-        .get_transaction_receipt(params.tx_hash.0)
+    data_provider
+        .get_transaction_receipt(&FixedBytes(params.tx_hash.0))
         .await
         .map_present_and_no_err(MonadTransactionReceipt)
 }
@@ -347,13 +355,13 @@ pub struct MonadEthGetTransactionByHashParams {
 /// Returns the information about a transaction requested by transaction hash.
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn monad_eth_getTransactionByHash<T: Triedb>(
-    chain_state: &ChainState<T>,
+    data_provider: &DataProvider<T>,
     params: MonadEthGetTransactionByHashParams,
 ) -> JsonRpcResult<Option<MonadTransaction>> {
     trace!("monad_eth_getTransactionByHash: {params:?}");
 
-    chain_state
-        .get_transaction(params.tx_hash.0)
+    data_provider
+        .get_transaction(&FixedBytes(params.tx_hash.0))
         .await
         .map_present_and_no_err(MonadTransaction)
 }
@@ -369,12 +377,12 @@ pub struct MonadEthGetTransactionByBlockHashAndIndexParams {
 #[tracing::instrument(level = "debug", skip_all)]
 /// Returns information about a transaction by block hash and transaction index position.
 pub async fn monad_eth_getTransactionByBlockHashAndIndex<T: Triedb>(
-    chain_state: &ChainState<T>,
+    data_provider: &DataProvider<T>,
     params: MonadEthGetTransactionByBlockHashAndIndexParams,
 ) -> JsonRpcResult<Option<MonadTransaction>> {
     trace!("monad_eth_getTransactionByBlockHashAndIndex: {params:?}");
 
-    chain_state
+    data_provider
         .get_transaction_with_block_and_index(
             BlockTagOrHash::Hash(params.block_hash),
             params.index.0,
@@ -394,12 +402,12 @@ pub struct MonadEthGetTransactionByBlockNumberAndIndexParams {
 #[tracing::instrument(level = "debug", skip_all)]
 /// Returns information about a transaction by block number and transaction index position.
 pub async fn monad_eth_getTransactionByBlockNumberAndIndex<T: Triedb>(
-    chain_state: &ChainState<T>,
+    data_provider: &DataProvider<T>,
     params: MonadEthGetTransactionByBlockNumberAndIndexParams,
 ) -> JsonRpcResult<Option<MonadTransaction>> {
     trace!("monad_eth_getTransactionByBlockNumberAndIndex: {params:?}");
 
-    chain_state
+    data_provider
         .get_transaction_with_block_and_index(
             crate::types::eth_json::BlockTagOrHash::BlockTags(params.block_tag),
             params.index.0,
@@ -417,6 +425,7 @@ mod tests {
     use alloy_signer::SignerSync;
     use alloy_signer_local::PrivateKeySigner;
     use monad_eth_types::EthAccount;
+    use monad_event_ring::SnapshotEventRing;
     use monad_triedb_utils::mock_triedb::MockTriedb;
 
     use super::{
@@ -424,7 +433,7 @@ mod tests {
         MonadEthSendRawTransactionParams, MonadEthSendRawTransactionSyncParams,
     };
     use crate::{
-        chainstate::ChainState, txpool::EthTxPoolBridgeClient, types::eth_json::UnformattedData,
+        event::EventServer, txpool::EthTxPoolBridgeClient, types::eth_json::UnformattedData,
     };
 
     fn serialize_tx(tx: impl Encodable + Encodable2718) -> UnformattedData {
@@ -517,8 +526,16 @@ mod tests {
             },
         );
 
-        // Create a mock ChainState (needed for the sync method)
-        let chain_state = ChainState::new(None, triedb, None);
+        let snapshot_event_ring = SnapshotEventRing::new_from_zstd_bytes(
+            "TEST",
+            include_bytes!(
+                "../../../../monad-execution/rust/crates/monad-exec-events/test/data/exec-events-emn-30b-15m/snapshot.zst"
+            ),
+            None,
+        )
+        .unwrap();
+
+        let event_server_client = EventServer::start_for_testing(snapshot_event_ring);
 
         // Test the same validation failures as eth_sendRawTransaction
         // to ensure both methods have consistent validation
@@ -549,7 +566,7 @@ mod tests {
             assert!(
                 monad_eth_sendRawTransactionSync(
                     &EthTxPoolBridgeClient::for_testing(),
-                    &chain_state,
+                    &event_server_client,
                     case,
                     1,
                     true,
