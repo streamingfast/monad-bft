@@ -69,7 +69,6 @@ async fn estimate_gas(
     original_tx_gas: U256,
     provider_gas_limit: u64,
     protocol_gas_limit: u64,
-    mode: EstimateGasMode,
 ) -> Result<Quantity, JsonRpcError> {
     estimate_gas_with_builder(
         eth_call_fn,
@@ -98,9 +97,6 @@ async fn estimate_gas_with_builder(
             gas_refund,
             ..
         }) => (gas_used, gas_refund),
-        monad_ethcall::CallResult::Failure(error) if is_terminal_estimate_result(mode, &error) => {
-            (error.gas_used, error.gas_refund)
-        }
         monad_ethcall::CallResult::Failure(error) => match error.error_code {
             monad_ethcall::EthCallResult::OutOfGas => {
                 if provider_gas_limit < protocol_gas_limit
@@ -413,7 +409,6 @@ pub async fn monad_eth_estimateGas<T: Triedb>(
         original_tx_gas,
         provider_gas_limit,
         protocol_gas_limit,
-        EstimateGasMode::RequireSuccess,
     )
     .await
 }
@@ -561,92 +556,6 @@ async fn fill_transaction_with_provider<T: Triedb>(
     let (raw, filled_tx) = build_unsigned_transaction(&tx, chain_id)?;
 
     Ok(FillTransactionResult { raw, tx: filled_tx })
-}
-
-fn normalize_fill_transaction_request(tx: &mut CallRequest) -> Result<(), JsonRpcError> {
-    tx.input.input = match (tx.input.input.take(), tx.input.data.take()) {
-        (Some(input), Some(data)) => {
-            if input != data {
-                return Err(JsonRpcError::invalid_params());
-            }
-            Some(input)
-        }
-        (None, data) | (data, None) => data,
-    };
-
-    if tx.transaction_type == Some(U8::from(EIP4844_TX_TYPE_ID))
-        || tx.max_fee_per_blob_gas.is_some()
-        || tx.blob_versioned_hashes.is_some()
-    {
-        return Err(JsonRpcError::invalid_params());
-    }
-
-    if matches!(tx.gas, Some(gas) if gas.is_zero()) {
-        tx.gas = None;
-    }
-
-    if matches!(tx.gas_price_details, GasPriceDetails::Legacy { .. })
-        && tx.authorization_list.is_some()
-    {
-        return Err(JsonRpcError::invalid_params());
-    }
-
-    validate_fill_transaction_type(tx)?;
-
-    Ok(())
-}
-
-/// Fill fee fields for `eth_fillTransaction` without clamping a user cap down.
-///
-/// For EIP-1559 transactions:
-/// - preserve a nonzero user `maxFeePerGas` when it is already high enough
-/// - fill a missing `maxPriorityFeePerGas`
-/// - raise `maxFeePerGas` to at least the current base fee and priority fee so the tx is signable now
-///
-/// Missing or zero `maxFeePerGas` follows the existing default-fill path.
-fn fill_transaction_gas_price_details(
-    tx: &mut CallRequest,
-    current_base_fee: U256,
-    default_fill_base_fee: U256,
-    suggested_priority_fee: Option<U256>,
-) -> Result<(), JsonRpcError> {
-    match &tx.gas_price_details {
-        GasPriceDetails::Legacy { .. } => tx.fill_gas_prices(default_fill_base_fee),
-        GasPriceDetails::Eip1559 {
-            max_fee_per_gas: Some(max_fee_per_gas),
-            max_priority_fee_per_gas,
-        } if *max_fee_per_gas != U256::ZERO => {
-            let max_priority_fee_per_gas =
-                (*max_priority_fee_per_gas).unwrap_or(suggested_priority_fee.unwrap_or_default());
-            let max_fee_per_gas = max_fee_per_gas
-                .to_owned()
-                .max(current_base_fee)
-                .max(max_priority_fee_per_gas);
-
-            tx.gas_price_details = GasPriceDetails::Eip1559 {
-                max_fee_per_gas: Some(max_fee_per_gas),
-                max_priority_fee_per_gas: Some(max_priority_fee_per_gas),
-            };
-            Ok(())
-        }
-        GasPriceDetails::Eip1559 {
-            max_fee_per_gas,
-            max_priority_fee_per_gas,
-        } => {
-            let max_fee_per_gas = match max_fee_per_gas {
-                Some(max_fee_per_gas) if max_fee_per_gas.is_zero() => None,
-                other => *other,
-            };
-            tx.gas_price_details = GasPriceDetails::Eip1559 {
-                max_fee_per_gas,
-                max_priority_fee_per_gas: Some(
-                    (*max_priority_fee_per_gas)
-                        .unwrap_or(suggested_priority_fee.unwrap_or_default()),
-                ),
-            };
-            tx.fill_gas_prices(default_fill_base_fee)
-        }
-    }
 }
 
 fn normalize_fill_transaction_request(tx: &mut CallRequest) -> Result<(), JsonRpcError> {
@@ -1245,7 +1154,6 @@ mod tests {
             U256::from(30_000),
             u64::MAX,
             u64::MAX,
-            EstimateGasMode::RequireSuccess,
         )
         .await;
         assert!(result.is_err());
@@ -1264,7 +1172,6 @@ mod tests {
             U256::MAX,
             u64::MAX,
             u64::MAX,
-            EstimateGasMode::RequireSuccess,
         )
         .await;
         assert!(result.is_ok());
@@ -1287,7 +1194,6 @@ mod tests {
             U256::from(70_000),
             u64::MAX,
             u64::MAX,
-            EstimateGasMode::RequireSuccess,
         )
         .await;
         assert!(result.is_ok());
@@ -1310,7 +1216,6 @@ mod tests {
             U256::from(60_000),
             u64::MAX,
             u64::MAX,
-            EstimateGasMode::RequireSuccess,
         )
         .await;
         assert!(result.is_ok());
