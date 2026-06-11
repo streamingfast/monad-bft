@@ -288,11 +288,7 @@ where
         block_policy: &EthBlockPolicy<ST, SCT, CCT, CRT>,
         state_backend: &SBT,
         chain_config: &CCT,
-<<<<<<< HEAD
-    ) -> Result<(ProposedExecutionInputs<EthExecutionProtocol>, [u8; 32]), BlockPolicyError> {
-=======
     ) -> Result<ProposalWithSenderGas<ST>, BlockPolicyError> {
->>>>>>> v0.14.5
         info!(
             ?proposed_seq_num,
             ?tx_limit,
@@ -431,14 +427,10 @@ where
 
         self.update_aggregate_metrics(event_tracker);
 
-<<<<<<< HEAD
-        Ok((ProposedExecutionInputs { header, body }, parent_hash))
-=======
         Ok(ProposalWithSenderGas {
             proposed_execution_inputs: ProposedExecutionInputs { header, body },
             sender_gas,
         })
->>>>>>> v0.14.5
     }
 
     pub fn enter_round(
