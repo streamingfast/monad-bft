@@ -50,6 +50,7 @@ use monad_raptorcast::{
     RaptorCast, RaptorCastEvent,
 };
 use monad_types::{Epoch, NodeId};
+use monad_validator::proposer_schedule::BoxedProposerSchedule;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 pub use tracing::{debug, error, info, warn, Level};
 
@@ -86,6 +87,7 @@ where
     AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
     DS: IdentityScore<Identity = NodeId<CertificateSignaturePubKey<ST>>>,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new<B>(
         self_node_id: NodeId<CertificateSignaturePubKey<ST>>,
         cfg: RaptorCastConfig<ST>,
@@ -96,6 +98,7 @@ where
         auth_protocol: AP,
         direct_udp_auth_protocol: Option<AP>,
         direct_udp_peer_score: DS,
+        proposer_schedule: BoxedProposerSchedule<CertificateSignaturePubKey<ST>>,
     ) -> Self
     where
         B: PeerDiscoveryAlgoBuilder<PeerDiscoveryAlgoType = PD>,
@@ -163,7 +166,6 @@ where
             recv_group_messages,
             send_group_infos,
             send_outbound_to_primary,
-            current_epoch,
         );
 
         let mut rc_primary = RaptorCast::new(
@@ -176,6 +178,7 @@ where
             control,
             shared_pdd.clone(),
             current_epoch,
+            proposer_schedule,
         );
         rc_primary.bind_channel_to_secondary_raptorcast(
             secondary_mode,
@@ -222,7 +225,6 @@ where
             recv_group_messages,
             send_group_infos,
             send_outbound_to_primary,
-            current_epoch,
         );
         self.rc_secondary = rc_secondary;
     }
@@ -236,7 +238,6 @@ where
         channel_to_primary_outbound: UnboundedSender<
             SecondaryOutboundMessage<CertificateSignaturePubKey<ST>>,
         >,
-        current_epoch: Epoch,
     ) -> Option<RaptorCastSecondary<ST, M, OM, SE, PD>> {
         let secondary_instance: RaptorCastConfigSecondary<CertificateSignaturePubKey<ST>> =
             match mode {
@@ -303,7 +304,6 @@ where
                 recv_group_messages,
                 send_group_infos,
                 channel_to_primary_outbound,
-                current_epoch,
             )),
         }
     }
@@ -331,10 +331,12 @@ where
                 RouterCommand::PublishWithPriority { .. } => validator_cmds.push(cmd),
                 RouterCommand::AddEpochValidatorSet {
                     epoch,
+                    epoch_start,
                     validator_set,
                 } => {
                     let cmd_cpy = RouterCommand::AddEpochValidatorSet {
                         epoch,
+                        epoch_start,
                         validator_set: validator_set.clone(),
                     };
                     debug!(?validator_set, "Updating validator set in multi router");

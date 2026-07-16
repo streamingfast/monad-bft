@@ -16,7 +16,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
     marker::PhantomData,
-    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -26,7 +25,7 @@ use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
 use monad_eth_types::{EthAccount, EthHeader};
-use monad_state_backend::{StateBackend, StateBackendError};
+use monad_execution_state_read::{ExecutionStateRead, ExecutionStateReadError};
 use monad_types::{BlockId, DropTimer, Epoch, SeqNum, Stake};
 use monad_validator::signature_collection::{SignatureCollection, SignatureCollectionPubKeyType};
 use tracing::warn;
@@ -39,61 +38,59 @@ struct BlockCache {
 }
 
 #[derive(Debug)]
-pub struct StateBackendCache<ST, SCT, SBT>
+pub struct ExecutionStateReadCache<ST, SCT, ESRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
 {
-    // used so that StateBackendCache can maintain a logically immutable interface
-    cache: Arc<Mutex<HashMap<BlockId, BlockCache>>>,
-    state_backend: SBT,
+    cache: HashMap<BlockId, BlockCache>,
+    state_read: ESRT,
     execution_delay: SeqNum,
 
     _phantom: PhantomData<(ST, SCT)>,
 }
 
-impl<ST, SCT, SBT> StateBackendCache<ST, SCT, SBT>
+impl<ST, SCT, ESRT> ExecutionStateReadCache<ST, SCT, ESRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
 {
-    pub fn new(state_backend: SBT, execution_delay: SeqNum) -> Self {
+    pub fn new(state_read: ESRT, execution_delay: SeqNum) -> Self {
         Self {
             cache: Default::default(),
-            state_backend,
+            state_read,
             execution_delay,
+
             _phantom: PhantomData,
         }
     }
 }
 
-impl<ST, SCT, SBT> StateBackend<ST, SCT> for StateBackendCache<ST, SCT, SBT>
+impl<ST, SCT, ESRT> ExecutionStateRead<ST, SCT> for ExecutionStateReadCache<ST, SCT, ESRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
 {
     fn get_account_statuses<'a>(
-        &self,
+        &mut self,
         block_id: &BlockId,
         seq_num: &SeqNum,
         is_finalized: bool,
         addresses: impl Iterator<Item = &'a Address>,
-    ) -> Result<Vec<Option<EthAccount>>, StateBackendError> {
+    ) -> Result<Vec<Option<EthAccount>>, ExecutionStateReadError> {
         let addresses = addresses.collect_vec();
         if addresses.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut cache = self.cache.lock().unwrap();
-
         // TODO consider removing this uniqueness filter... the callers we have so far already only
         // pass in a unique set of accounts
         let unique_addresses = addresses.iter().unique().copied();
         // find accounts that are missing from cache
-        let cache_misses: Vec<_> = match cache.get(block_id) {
+        let cache_misses: Vec<_> = match self.cache.get(block_id) {
             None => unique_addresses.collect(),
             Some(block_cache) => unique_addresses
                 .filter(|&address| !block_cache.accounts.contains_key(address))
@@ -110,14 +107,14 @@ where
                         "long get_account_statuses"
                     )
                 });
-                self.state_backend.get_account_statuses(
+                self.state_read.get_account_statuses(
                     block_id,
                     seq_num,
                     is_finalized,
                     cache_misses.iter().copied(),
                 )?
             };
-            cache
+            self.cache
                 .entry(*block_id)
                 .or_insert_with(|| BlockCache {
                     seq_num: *seq_num,
@@ -133,7 +130,8 @@ where
                 )
         }
 
-        let block_cache = cache
+        let block_cache = self
+            .cache
             .get(block_id)
             .expect("cache must be populated... we asserted nonzero addresses at the start");
 
@@ -152,30 +150,29 @@ where
             .raw_read_latest_finalized_block()
             .unwrap_or(SeqNum::MAX);
 
-        cache.retain(|_, block| block.seq_num + self.execution_delay >= last_finalized_block);
+        self.cache
+            .retain(|_, block| block.seq_num + self.execution_delay >= last_finalized_block);
 
         Ok(accounts_data)
     }
 
     fn get_execution_result(
-        &self,
+        &mut self,
         block_id: &BlockId,
         seq_num: &SeqNum,
         is_finalized: bool,
-    ) -> Result<EthHeader, StateBackendError> {
-        let mut cache = self.cache.lock().unwrap();
-
-        if let Some(block_cache) = cache.get(block_id) {
+    ) -> Result<EthHeader, ExecutionStateReadError> {
+        if let Some(block_cache) = self.cache.get(block_id) {
             if let Some(execution_result) = &block_cache.execution_result {
                 return Ok(execution_result.clone());
             }
         }
 
         let execution_result =
-            self.state_backend
+            self.state_read
                 .get_execution_result(block_id, seq_num, is_finalized)?;
 
-        cache
+        self.cache
             .entry(*block_id)
             .or_insert_with(|| BlockCache {
                 seq_num: *seq_num,
@@ -188,23 +185,23 @@ where
     }
 
     fn raw_read_earliest_finalized_block(&self) -> Option<SeqNum> {
-        self.state_backend.raw_read_earliest_finalized_block()
+        self.state_read.raw_read_earliest_finalized_block()
     }
 
     fn raw_read_latest_finalized_block(&self) -> Option<SeqNum> {
-        self.state_backend.raw_read_latest_finalized_block()
+        self.state_read.raw_read_latest_finalized_block()
     }
 
     fn read_valset_at_block(
-        &self,
+        &mut self,
         block_num: SeqNum,
         requested_epoch: Epoch,
     ) -> Vec<(SCT::NodeIdPubKey, SignatureCollectionPubKeyType<SCT>, Stake)> {
-        self.state_backend
+        self.state_read
             .read_valset_at_block(block_num, requested_epoch)
     }
 
     fn total_db_lookups(&self) -> u64 {
-        self.state_backend.total_db_lookups()
+        self.state_read.total_db_lookups()
     }
 }

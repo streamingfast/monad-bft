@@ -26,8 +26,8 @@ use monad_validator::signature_collection::{SignatureCollection, SignatureCollec
 
 pub use self::{
     in_memory::{AccountState, InMemoryBlockState, InMemoryState, InMemoryStateInner},
-    mock::NopStateBackend,
-    thread::StateBackendThreadClient,
+    mock::NopExecutionStateRead,
+    thread::ExecutionStateReadThreadClient,
 };
 
 mod in_memory;
@@ -35,33 +35,33 @@ mod mock;
 mod thread;
 
 #[derive(Debug, PartialEq)]
-pub enum StateBackendError {
+pub enum ExecutionStateReadError {
     /// not available yet
     NotAvailableYet,
     /// will never be available
     NeverAvailable,
 }
 
-/// Backend provider of account data: balance and nonce
-pub trait StateBackend<ST, SCT>
+/// A read-only view of block state.
+pub trait ExecutionStateRead<ST, SCT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
 {
     fn get_account_statuses<'a>(
-        &self,
+        &mut self,
         block_id: &BlockId,
         seq_num: &SeqNum,
         is_finalized: bool,
         addresses: impl Iterator<Item = &'a Address>,
-    ) -> Result<Vec<Option<EthAccount>>, StateBackendError>;
+    ) -> Result<Vec<Option<EthAccount>>, ExecutionStateReadError>;
 
     fn get_execution_result(
-        &self,
+        &mut self,
         block_id: &BlockId,
         seq_num: &SeqNum,
         is_finalized: bool,
-    ) -> Result<EthHeader, StateBackendError>;
+    ) -> Result<EthHeader, ExecutionStateReadError>;
 
     /// Fetches earliest block from storage backend
     fn raw_read_earliest_finalized_block(&self) -> Option<SeqNum>;
@@ -69,7 +69,7 @@ where
     fn raw_read_latest_finalized_block(&self) -> Option<SeqNum>;
 
     fn read_valset_at_block(
-        &self,
+        &mut self,
         block_num: SeqNum,
         requested_epoch: Epoch,
     ) -> Vec<(SCT::NodeIdPubKey, SignatureCollectionPubKeyType<SCT>, Stake)>;
@@ -94,30 +94,30 @@ where
     fn ledger_commit(&mut self, block_id: &BlockId, seq_num: &SeqNum);
 }
 
-impl<ST, SCT, T> StateBackend<ST, SCT> for Arc<Mutex<T>>
+impl<ST, SCT, T> ExecutionStateRead<ST, SCT> for Arc<Mutex<T>>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    T: StateBackend<ST, SCT>,
+    T: ExecutionStateRead<ST, SCT>,
 {
     fn get_account_statuses<'a>(
-        &self,
+        &mut self,
         block_id: &BlockId,
         seq_num: &SeqNum,
         is_finalized: bool,
         addresses: impl Iterator<Item = &'a Address>,
-    ) -> Result<Vec<Option<EthAccount>>, StateBackendError> {
-        let state = self.lock().unwrap();
+    ) -> Result<Vec<Option<EthAccount>>, ExecutionStateReadError> {
+        let mut state = self.lock().unwrap();
         state.get_account_statuses(block_id, seq_num, is_finalized, addresses)
     }
 
     fn get_execution_result(
-        &self,
+        &mut self,
         block_id: &BlockId,
         seq_num: &SeqNum,
         is_finalized: bool,
-    ) -> Result<EthHeader, StateBackendError> {
-        let state = self.lock().unwrap();
+    ) -> Result<EthHeader, ExecutionStateReadError> {
+        let mut state = self.lock().unwrap();
         state.get_execution_result(block_id, seq_num, is_finalized)
     }
 
@@ -132,7 +132,7 @@ where
     }
 
     fn read_valset_at_block(
-        &self,
+        &mut self,
         block_num: SeqNum,
         requested_epoch: Epoch,
     ) -> Vec<(
@@ -140,7 +140,7 @@ where
         SignatureCollectionPubKeyType<SCT>,
         Stake,
     )> {
-        let state = self.lock().unwrap();
+        let mut state = self.lock().unwrap();
         state.read_valset_at_block(block_num, requested_epoch)
     }
 

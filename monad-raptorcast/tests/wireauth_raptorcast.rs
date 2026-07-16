@@ -154,7 +154,7 @@ impl ValidatorInfo {
         let name_record = NameRecord::new_with_ports(
             Ipv4Addr::new(127, 0, 0, 1),
             tcp_addr.port(),
-            non_auth_addr.port(),
+            Some(non_auth_addr.port()),
             auth_addr.port(),
             direct_udp_addr.map(|addr| addr.port()),
             1,
@@ -256,7 +256,8 @@ fn spawn_noop_validator(
             dataplane.non_authenticated_socket,
             dataplane.control,
             shared_pd,
-            Epoch(0),
+            monad_types::Epoch(0),
+            monad_raptorcast::dummy_proposer_schedule(),
         );
 
         let mut cmd_rx = cmd_rx;
@@ -345,7 +346,8 @@ fn spawn_wireauth_validator(
             dataplane.non_authenticated_socket,
             dataplane.control,
             shared_pd,
-            Epoch(0),
+            monad_types::Epoch(0),
+            monad_raptorcast::dummy_proposer_schedule(),
         );
 
         let mut cmd_rx = cmd_rx;
@@ -407,6 +409,7 @@ async fn establish_connections(
         cmd_tx
             .send(RouterCommand::AddEpochValidatorSet {
                 epoch,
+                epoch_start: monad_types::Round(0),
                 validator_set: validator_set.clone(),
             })
             .unwrap();
@@ -908,6 +911,7 @@ async fn run_send_with_record_uses_name_record_address() {
     bob2.cmd_tx
         .send(RouterCommand::AddEpochValidatorSet {
             epoch,
+            epoch_start: monad_types::Round(0),
             validator_set,
         })
         .unwrap();
@@ -921,7 +925,7 @@ async fn run_send_with_record_uses_name_record_address() {
     let bob2_name_record = NameRecord::new(
         Ipv4Addr::new(127, 0, 0, 1),
         bob2_tcp_addr.port(),
-        bob2_non_auth_addr.port(),
+        Some(bob2_non_auth_addr.port()),
         bob2_auth_addr.port(),
         0,
         1,

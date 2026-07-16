@@ -37,6 +37,7 @@ pub struct MonadRpcResources {
     pub data_provider: Option<DataProvider<TriedbEnv>>,
     pub event_server_client: Option<EventServerClient>,
     pub batch_request_limit: u16,
+    pub batch_concurrent_limit: u16,
     pub max_response_size: u32,
     pub allow_unprotected_txs: bool,
     pub logs_max_block_range: u64,
@@ -45,6 +46,7 @@ pub struct MonadRpcResources {
     pub dry_run_get_logs_index: bool,
     pub use_eth_get_logs_index: bool,
     pub max_finalized_block_cache_len: u64,
+    pub enable_eth_simulate_v1: bool,
     pub metrics: Option<Metrics>,
     pub rpc_comparator: Option<RpcComparator>,
 }
@@ -58,6 +60,7 @@ impl MonadRpcResources {
         data_provider: Option<DataProvider<TriedbEnv>>,
         event_server_client: Option<EventServerClient>,
         batch_request_limit: u16,
+        batch_concurrent_limit: u16,
         max_response_size: u32,
         allow_unprotected_txs: bool,
         logs_max_block_range: u64,
@@ -66,6 +69,7 @@ impl MonadRpcResources {
         dry_run_get_logs_index: bool,
         use_eth_get_logs_index: bool,
         max_finalized_block_cache_len: u64,
+        enable_eth_simulate_v1: bool,
         metrics: Option<Metrics>,
         rpc_comparator: Option<RpcComparator>,
     ) -> Self {
@@ -76,6 +80,7 @@ impl MonadRpcResources {
             data_provider,
             event_server_client,
             batch_request_limit,
+            batch_concurrent_limit,
             max_response_size,
             allow_unprotected_txs,
             logs_max_block_range,
@@ -84,6 +89,7 @@ impl MonadRpcResources {
             dry_run_get_logs_index,
             use_eth_get_logs_index,
             max_finalized_block_cache_len,
+            enable_eth_simulate_v1,
             metrics,
             rpc_comparator,
         }

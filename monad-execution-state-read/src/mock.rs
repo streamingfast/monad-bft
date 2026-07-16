@@ -24,26 +24,26 @@ use monad_eth_types::{EthAccount, EthHeader};
 use monad_types::{Balance, BlockId, Nonce, SeqNum, Stake};
 use monad_validator::signature_collection::{SignatureCollection, SignatureCollectionPubKeyType};
 
-use crate::{StateBackend, StateBackendError};
+use crate::{ExecutionStateRead, ExecutionStateReadError};
 
 #[derive(Debug, Default, Clone)]
-pub struct NopStateBackend {
+pub struct NopExecutionStateRead {
     pub nonces: BTreeMap<Address, Nonce>,
     pub balances: BTreeMap<Address, Balance>,
 }
 
-impl<ST, SCT> StateBackend<ST, SCT> for NopStateBackend
+impl<ST, SCT> ExecutionStateRead<ST, SCT> for NopExecutionStateRead
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
 {
     fn get_account_statuses<'a>(
-        &self,
+        &mut self,
         _block_id: &BlockId,
         _seq_num: &SeqNum,
         _is_finalized: bool,
         addresses: impl Iterator<Item = &'a Address>,
-    ) -> Result<Vec<Option<EthAccount>>, StateBackendError> {
+    ) -> Result<Vec<Option<EthAccount>>, ExecutionStateReadError> {
         Ok(addresses
             .map(|address| {
                 Some(EthAccount {
@@ -57,11 +57,11 @@ where
     }
 
     fn get_execution_result(
-        &self,
+        &mut self,
         _block_id: &BlockId,
         _seq_num: &SeqNum,
         _is_finalized: bool,
-    ) -> Result<EthHeader, StateBackendError> {
+    ) -> Result<EthHeader, ExecutionStateReadError> {
         Ok(EthHeader(Header::default()))
     }
 
@@ -76,7 +76,7 @@ where
     }
 
     fn read_valset_at_block(
-        &self,
+        &mut self,
         block_num: SeqNum,
         requested_epoch: monad_types::Epoch,
     ) -> Vec<(

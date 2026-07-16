@@ -310,8 +310,8 @@ mod test {
 
         {
             let (_id, node) = swarm.states().iter().nth(bad_node_idx).unwrap();
-            let sbt = node.state.state_backend();
-            sbt.lock().unwrap().extra_data = 1;
+            let state_read = node.state.state_read();
+            state_read.lock().unwrap().extra_data = 1;
         }
 
         let mut seen_tc_with_tip = false;
@@ -362,8 +362,8 @@ mod test {
 
         {
             let (_id, node) = swarm.states().iter().nth(bad_node_idx).unwrap();
-            let sbt = node.state.state_backend();
-            sbt.lock().unwrap().extra_data = 1;
+            let state_read = node.state.state_read();
+            state_read.lock().unwrap().extra_data = 1;
         }
 
         while swarm
@@ -377,7 +377,7 @@ mod test {
             swarm
                 .states()
                 .values()
-                .map(|state| state.state.metrics().consensus_events.created_nec)
+                .map(|state| state.state.metrics().consensus_events.created_nec.get())
                 .max()
                 .unwrap(),
             1

@@ -53,6 +53,7 @@ use monad_consensus_types::{
 use monad_crypto::certificate_signature::{
     CertificateKeyPair, CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
+use monad_execution_state_read::ExecutionStateRead;
 use monad_executor_glue::{
     BlockSyncEvent, ClearMetrics, Command, ConfigEvent, ConfigFileCommand, ConfigReloadCommand,
     ConsensusEvent, ControlPanelCommand, ControlPanelEvent, GetFullNodes, GetMetrics, GetPeers,
@@ -60,7 +61,6 @@ use monad_executor_glue::{
     StateSyncCommand, StateSyncEvent, StateSyncNetworkMessage, StateSyncRequest, TxPoolCommand,
     ValSetCommand, ValidatorEvent, WriteCommand,
 };
-use monad_state_backend::StateBackend;
 use monad_types::{
     Epoch, ExecutionProtocol, MonadVersion, NodeId, Round, RouterTarget, SeqNum, Stake,
     GENESIS_BLOCK_ID, GENESIS_ROUND, GENESIS_SEQ_NUM,
@@ -90,51 +90,51 @@ const STATESYNC_BLOCK_THRESHOLD: SeqNum = SeqNum(30_000);
 pub(crate) fn handle_validation_error(e: validation::Error, metrics: &mut Metrics) {
     match e {
         validation::Error::InvalidAuthor => {
-            metrics.validation_errors.invalid_author += 1;
+            metrics.validation_errors.invalid_author.inc();
         }
         validation::Error::NotWellFormed => {
-            metrics.validation_errors.not_well_formed_sig += 1;
+            metrics.validation_errors.not_well_formed_sig.inc();
         }
         validation::Error::InvalidSignature => {
-            metrics.validation_errors.invalid_signature += 1;
+            metrics.validation_errors.invalid_signature.inc();
         }
         validation::Error::InvalidTcRound => {
-            metrics.validation_errors.invalid_tc_round += 1;
+            metrics.validation_errors.invalid_tc_round.inc();
         }
         validation::Error::DuplicateTcTipRound => {
-            metrics.validation_errors.duplicate_tc_tip_round += 1;
+            metrics.validation_errors.duplicate_tc_tip_round.inc();
         }
         validation::Error::EmptySignersTcTipRound => {
-            metrics.validation_errors.empty_signers_tc_tip_round += 1;
+            metrics.validation_errors.empty_signers_tc_tip_round.inc();
         }
         validation::Error::TooManyTcTipRound => {
-            metrics.validation_errors.too_many_tc_tip_round += 1;
+            metrics.validation_errors.too_many_tc_tip_round.inc();
         }
         validation::Error::InsufficientStake => {
-            metrics.validation_errors.insufficient_stake += 1;
+            metrics.validation_errors.insufficient_stake.inc();
         }
         validation::Error::ValidatorSetDataUnavailable => {
             // This error occurs when the node knows when the next epoch starts,
             // but didn't get enough execution deltas to build the next
             // validator set.
             // TODO: This should trigger statesync
-            metrics.validation_errors.val_data_unavailable += 1;
+            metrics.validation_errors.val_data_unavailable.inc();
         }
         validation::Error::SignaturesDuplicateNode => {
-            metrics.validation_errors.signatures_duplicate_node += 1;
+            metrics.validation_errors.signatures_duplicate_node.inc();
         }
         validation::Error::InvalidVote => {
-            metrics.validation_errors.invalid_vote_message += 1;
+            metrics.validation_errors.invalid_vote_message.inc();
         }
         validation::Error::InvalidVersion => {
-            metrics.validation_errors.invalid_version += 1;
+            metrics.validation_errors.invalid_version.inc();
         }
         validation::Error::InvalidEpoch => {
             // TODO: If the node is not actively participating, getting this
             // error can indicate that the node is behind by more than an epoch
             // and needs state sync. Else if actively participating, this is
             // spam
-            metrics.validation_errors.invalid_epoch += 1;
+            metrics.validation_errors.invalid_epoch.inc();
         }
     };
 }
@@ -300,13 +300,13 @@ enum DbSyncStatus {
     Done,
 }
 
-enum ConsensusMode<ST, SCT, EPT, BPT, SBT, CCT, CRT>
+enum ConsensusMode<ST, SCT, EPT, BPT, ESRT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
-    BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    BPT: BlockPolicy<ST, SCT, EPT, ESRT, CCT, CRT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -324,16 +324,16 @@ where
 
         locked_epoch_validators: Vec<ValidatorSetDataWithEpoch<SCT>>,
     },
-    Live(ConsensusState<ST, SCT, EPT, BPT, SBT, CCT, CRT>),
+    Live(ConsensusState<ST, SCT, EPT, BPT, ESRT, CCT, CRT>),
 }
 
-impl<ST, SCT, EPT, BPT, SBT, CCT, CRT> ConsensusMode<ST, SCT, EPT, BPT, SBT, CCT, CRT>
+impl<ST, SCT, EPT, BPT, ESRT, CCT, CRT> ConsensusMode<ST, SCT, EPT, BPT, ESRT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
-    BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    BPT: BlockPolicy<ST, SCT, EPT, ESRT, CCT, CRT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -386,14 +386,14 @@ pub enum Role {
     Validator,
 }
 
-pub struct MonadState<ST, SCT, EPT, BPT, SBT, VTF, LT, BVT, CCT, CRT>
+pub struct MonadState<ST, SCT, EPT, BPT, ESRT, VTF, LT, BVT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
-    BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
-    BVT: BlockValidator<ST, SCT, EPT, BPT, SBT, CCT, CRT>,
+    BPT: BlockPolicy<ST, SCT, EPT, ESRT, CCT, CRT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
+    BVT: BlockValidator<ST, SCT, EPT, BPT, ESRT, CCT, CRT>,
     VTF: ValidatorSetTypeFactory<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
@@ -405,7 +405,7 @@ where
     consensus_config: ConsensusConfig<CCT, CRT>,
 
     /// Core consensus algorithm state machine
-    consensus: ConsensusMode<ST, SCT, EPT, BPT, SBT, CCT, CRT>,
+    consensus: ConsensusMode<ST, SCT, EPT, BPT, ESRT, CCT, CRT>,
     /// Cache used for quorum certificates (QC, TC, NEC)
     certificate_cache: CertificateCache<ST, SCT, EPT>,
     /// Handles blocksync servicing
@@ -424,7 +424,7 @@ where
     block_timestamp: BlockTimestamp,
     block_validator: BVT,
     block_policy: BPT,
-    state_backend: SBT,
+    state_read: ESRT,
     beneficiary: [u8; 20],
 
     /// Metrics counters for events and errors
@@ -441,21 +441,21 @@ where
     statesync_expand_to_group: bool,
 }
 
-impl<ST, SCT, EPT, BPT, SBT, VTF, LT, BVT, CCT, CRT>
-    MonadState<ST, SCT, EPT, BPT, SBT, VTF, LT, BVT, CCT, CRT>
+impl<ST, SCT, EPT, BPT, ESRT, VTF, LT, BVT, CCT, CRT>
+    MonadState<ST, SCT, EPT, BPT, ESRT, VTF, LT, BVT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
-    BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    BPT: BlockPolicy<ST, SCT, EPT, ESRT, CCT, CRT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     LT: LeaderElection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     VTF: ValidatorSetTypeFactory<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    BVT: BlockValidator<ST, SCT, EPT, BPT, SBT, CCT, CRT>,
+    BVT: BlockValidator<ST, SCT, EPT, BPT, ESRT, CCT, CRT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
-    pub fn consensus(&self) -> Option<&ConsensusState<ST, SCT, EPT, BPT, SBT, CCT, CRT>> {
+    pub fn consensus(&self) -> Option<&ConsensusState<ST, SCT, EPT, BPT, ESRT, CCT, CRT>> {
         match &self.consensus {
             ConsensusMode::Sync { .. } => None,
             ConsensusMode::Live(consensus) => Some(consensus),
@@ -466,8 +466,8 @@ where
         self.consensus().is_none()
     }
 
-    pub fn state_backend(&self) -> &SBT {
-        &self.state_backend
+    pub fn state_read(&self) -> &ESRT {
+        &self.state_read
     }
 
     pub fn epoch_manager(&self) -> &EpochManager {
@@ -486,7 +486,7 @@ where
         self.nodeid.pubkey()
     }
 
-    pub fn blocktree(&self) -> Option<&BlockTree<ST, SCT, EPT, BPT, SBT, CCT, CRT>> {
+    pub fn blocktree(&self) -> Option<&BlockTree<ST, SCT, EPT, BPT, ESRT, CCT, CRT>> {
         match &self.consensus {
             ConsensusMode::Sync { .. } => None,
             ConsensusMode::Live(consensus) => Some(consensus.blocktree()),
@@ -828,15 +828,15 @@ where
     }
 }
 
-pub struct MonadStateBuilder<ST, SCT, EPT, BPT, SBT, VTF, LT, BVT, CCT, CRT>
+pub struct MonadStateBuilder<ST, SCT, EPT, BPT, ESRT, VTF, LT, BVT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
-    BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    BPT: BlockPolicy<ST, SCT, EPT, ESRT, CCT, CRT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     VTF: ValidatorSetTypeFactory<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    BVT: BlockValidator<ST, SCT, EPT, BPT, SBT, CCT, CRT>,
+    BVT: BlockValidator<ST, SCT, EPT, BPT, ESRT, CCT, CRT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -844,7 +844,7 @@ where
     pub leader_election: LT,
     pub block_validator: BVT,
     pub block_policy: BPT,
-    pub state_backend: SBT,
+    pub state_read: ESRT,
     pub forkpoint: Forkpoint<ST, SCT, EPT>,
     pub locked_epoch_validators: Vec<ValidatorSetDataWithEpoch<SCT>>,
     pub key: ST::KeyPairType,
@@ -860,24 +860,24 @@ where
     pub _phantom: PhantomData<EPT>,
 }
 
-impl<ST, SCT, EPT, BPT, SBT, VTF, LT, BVT, CCT, CRT>
-    MonadStateBuilder<ST, SCT, EPT, BPT, SBT, VTF, LT, BVT, CCT, CRT>
+impl<ST, SCT, EPT, BPT, ESRT, VTF, LT, BVT, CCT, CRT>
+    MonadStateBuilder<ST, SCT, EPT, BPT, ESRT, VTF, LT, BVT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
-    BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    BPT: BlockPolicy<ST, SCT, EPT, ESRT, CCT, CRT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     LT: LeaderElection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     VTF: ValidatorSetTypeFactory<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    BVT: BlockValidator<ST, SCT, EPT, BPT, SBT, CCT, CRT>,
+    BVT: BlockValidator<ST, SCT, EPT, BPT, ESRT, CCT, CRT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
     pub fn build(
         self,
     ) -> (
-        MonadState<ST, SCT, EPT, BPT, SBT, VTF, LT, BVT, CCT, CRT>,
+        MonadState<ST, SCT, EPT, BPT, ESRT, VTF, LT, BVT, CCT, CRT>,
         Vec<
             Command<
                 MonadEvent<ST, SCT, EPT>,
@@ -886,7 +886,7 @@ where
                 SCT,
                 EPT,
                 BPT,
-                SBT,
+                ESRT,
                 CCT,
                 CRT,
             >,
@@ -945,7 +945,7 @@ where
             block_timestamp,
             block_validator: self.block_validator,
             block_policy: self.block_policy,
-            state_backend: self.state_backend,
+            state_read: self.state_read,
             beneficiary: self.beneficiary,
 
             metrics: Metrics::default(),
@@ -976,17 +976,17 @@ where
     }
 }
 
-impl<ST, SCT, EPT, BPT, SBT, VTF, LT, BVT, CCT, CRT>
-    MonadState<ST, SCT, EPT, BPT, SBT, VTF, LT, BVT, CCT, CRT>
+impl<ST, SCT, EPT, BPT, ESRT, VTF, LT, BVT, CCT, CRT>
+    MonadState<ST, SCT, EPT, BPT, ESRT, VTF, LT, BVT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
-    BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    BPT: BlockPolicy<ST, SCT, EPT, ESRT, CCT, CRT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     LT: LeaderElection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     VTF: ValidatorSetTypeFactory<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    BVT: BlockValidator<ST, SCT, EPT, BPT, SBT, CCT, CRT>,
+    BVT: BlockValidator<ST, SCT, EPT, BPT, ESRT, CCT, CRT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -1001,7 +1001,7 @@ where
             SCT,
             EPT,
             BPT,
-            SBT,
+            ESRT,
             CCT,
             CRT,
         >,
@@ -1027,7 +1027,10 @@ where
                     .iter()
                     .any(|cmd| matches!(cmd.command, ConsensusCommand::EnterRound(_, _)))
                 {
-                    self.metrics.node_state.self_stake_bps = self.get_self_stake_bps();
+                    self.metrics
+                        .node_state
+                        .self_stake_bps
+                        .set(self.get_self_stake_bps());
                 }
 
                 let mut cmds = consensus_cmds
@@ -1071,15 +1074,33 @@ where
                     ValidatorMapping::new(validator_set_data.validators.get_cert_pubkeys()),
                 );
 
-                let mut cmds = vec![
-                    Command::RouterCommand(RouterCommand::AddEpochValidatorSet {
-                        epoch: validator_set_data.epoch,
-                        validator_set: validator_set_data.validators.get_stakes(),
-                    }),
-                    Command::ConfigFileCommand(ConfigFileCommand::ValidatorSetData {
-                        validator_set_data,
-                    }),
-                ];
+                let mut cmds = Vec::new();
+
+                // The epoch start should already be scheduled in the
+                // epoch manager before its validator set update
+                // arrives. A missing start signals a bug or config
+                // mismatch.
+                match self.epoch_manager.get_epoch_start(validator_set_data.epoch) {
+                    Some(epoch_start) => {
+                        cmds.push(Command::RouterCommand(
+                            RouterCommand::AddEpochValidatorSet {
+                                epoch: validator_set_data.epoch,
+                                epoch_start,
+                                validator_set: validator_set_data.validators.get_stakes(),
+                            },
+                        ));
+                    }
+                    None => {
+                        tracing::error!(
+                            epoch = ?validator_set_data.epoch,
+                            "epoch start not scheduled for updated validator set"
+                        );
+                    }
+                }
+
+                cmds.push(Command::ConfigFileCommand(
+                    ConfigFileCommand::ValidatorSetData { validator_set_data },
+                ));
 
                 // if expand_to_group and not live and is_validator, emit
                 // validator peers to statesync
@@ -1218,13 +1239,13 @@ where
             MonadEvent::ControlPanelEvent(control_panel_event) => match control_panel_event {
                 ControlPanelEvent::GetMetricsEvent => {
                     vec![Command::ControlPanelCommand(ControlPanelCommand::Read(
-                        ReadCommand::GetMetrics(GetMetrics::Response(self.metrics)),
+                        ReadCommand::GetMetrics(GetMetrics::Response(self.metrics.snapshot())),
                     ))]
                 }
                 ControlPanelEvent::ClearMetricsEvent => {
-                    self.metrics = Default::default();
+                    self.metrics.clear();
                     vec![Command::ControlPanelCommand(ControlPanelCommand::Write(
-                        WriteCommand::ClearMetrics(ClearMetrics::Response(self.metrics)),
+                        WriteCommand::ClearMetrics(ClearMetrics::Response(self.metrics.snapshot())),
                     ))]
                 }
                 ControlPanelEvent::UpdateLogFilter(filter) => {
@@ -1356,7 +1377,7 @@ where
             SCT,
             EPT,
             BPT,
-            SBT,
+            ESRT,
             CCT,
             CRT,
         >,
@@ -1424,7 +1445,7 @@ where
 
             // We use get_execution_result as a proxy to determine if the delay_block has been executed.
             let delay_executed = self
-                .state_backend
+                .state_read
                 .get_execution_result(&delay_block_id, &delay_seq_num, true)
                 .is_ok();
 
@@ -1444,7 +1465,7 @@ where
                 "always 1 execution result after first k-1 blocks for now"
             );
 
-            let maybe_latest_finalized_block = self.state_backend.raw_read_latest_finalized_block();
+            let maybe_latest_finalized_block = self.state_read.raw_read_latest_finalized_block();
             if let Some(latest_finalized_block) = maybe_latest_finalized_block {
                 if latest_finalized_block.saturating_add(STATESYNC_BLOCK_THRESHOLD) < delay_seq_num
                 {
@@ -1459,7 +1480,7 @@ where
                 warn!("starting from empty state, consider fetching a snapshot first");
             }
 
-            self.metrics.consensus_events.trigger_state_sync += 1;
+            self.metrics.consensus_events.trigger_state_sync.inc();
             return vec![Command::StateSyncCommand(StateSyncCommand::RequestSync(
                 delayed_execution_result
                     .first()
@@ -1514,6 +1535,10 @@ where
 
         // commit blocks
         for block in last_two_delay_committed_blocks {
+            // ensure that epoch_manager covers epochs for
+            // locked_epoch_validators.
+            self.epoch_manager
+                .schedule_epoch_start(block.get_seq_num(), block.get_block_round());
             commands.push(Command::LedgerCommand(LedgerCommand::LedgerCommit(
                 OptimisticCommit::Proposed {
                     block: block.deref().to_owned(),
@@ -1546,7 +1571,7 @@ where
                     NodeId<SCT::NodeIdPubKey>,
                     (Stake, SignatureCollectionPubKeyType<SCT>),
                 > = self
-                    .state_backend
+                    .state_read
                     .read_valset_at_block(delay_seq_num, locked_epoch) // TODO use root_seq_num here
                     .into_iter()
                     .map(|(pubkey, cert_pubkey, stake)| (NodeId::new(pubkey), (stake, cert_pubkey)))
@@ -1574,12 +1599,20 @@ where
             high_certificate.clone(),
         );
         let current_round = consensus.get_current_round();
+        let current_epoch = consensus.get_current_epoch();
         tracing::info!(
             ?root_info,
             ?high_certificate,
             "done syncing, initializing consensus"
         );
         self.consensus = ConsensusMode::Live(consensus);
+        // Pacemaker emits EnterRound only on a strictly higher
+        // certificate, seed RaptorCast/PeerDiscovery/etc with the
+        // bootstrap round here.
+        commands.push(Command::RouterCommand(RouterCommand::UpdateCurrentRound(
+            current_epoch,
+            current_round,
+        )));
         commands.push(Command::StateSyncCommand(StateSyncCommand::StartExecution));
         // technically we should be waiting for the vote pacing timer
         // to expire before we set scheduled_vote to TimerFired
@@ -1632,9 +1665,7 @@ where
 mod test {
     use monad_bls::BlsSignatureCollection;
     use monad_consensus_types::{
-        quorum_certificate::QuorumCertificate,
-        validator_data::{ValidatorData, ValidatorSetData, ValidatorsConfig},
-        voting::Vote,
+        quorum_certificate::QuorumCertificate, validator_data::ValidatorSetData, voting::Vote,
     };
     use monad_crypto::{certificate_signature::CertificateSignaturePubKey, signing_domain};
     use monad_eth_types::EthExecutionProtocol;
@@ -1744,33 +1775,23 @@ mod test {
 
     #[test]
     fn test_forkpoint_validate_1() {
-        let (mut forkpoint, mut locked_validator_sets, election) = get_forkpoint();
-        let locked_epoch_1 = forkpoint.0.validator_sets.pop().unwrap();
-        let locked_val_set_1 = locked_validator_sets.pop().unwrap();
-        let _ = forkpoint.0.validator_sets.pop().unwrap();
-        let _ = locked_validator_sets.pop().unwrap();
+        let (mut forkpoint, _locked, election) = get_forkpoint();
+        let one = forkpoint.0.validator_sets[0].clone();
 
+        // Stage 1: validator-set count bounds. Both checks return before
+        // `validate` touches the locked sets, so `&[]` suffices.
+
+        // Too few: zero validator sets.
+        forkpoint.0.validator_sets = Vec::new().into();
         assert_eq!(
-            forkpoint.validate(
-                &ValidatorSetFactory::default(),
-                &locked_validator_sets,
-                &election
-            ),
+            forkpoint.validate(&ValidatorSetFactory::default(), &[], &election),
             Err(ForkpointValidationError::TooFewValidatorSets)
         );
 
-        forkpoint.0.validator_sets.push(locked_epoch_1.clone());
-        forkpoint.0.validator_sets.push(locked_epoch_1.clone());
-        forkpoint.0.validator_sets.push(locked_epoch_1);
-        locked_validator_sets.push(locked_val_set_1.clone());
-        locked_validator_sets.push(locked_val_set_1.clone());
-        locked_validator_sets.push(locked_val_set_1);
+        // Too many: > 2 (count rejected before consecutiveness, so dupes are fine).
+        forkpoint.0.validator_sets = vec![one.clone(), one.clone(), one].into();
         assert_eq!(
-            forkpoint.validate(
-                &ValidatorSetFactory::default(),
-                &locked_validator_sets,
-                &election
-            ),
+            forkpoint.validate(&ValidatorSetFactory::default(), &[], &election),
             Err(ForkpointValidationError::TooManyValidatorSets)
         );
     }
@@ -1844,56 +1865,6 @@ mod test {
             ),
             Err(ForkpointValidationError::InvalidQC)
         );
-    }
-
-    #[test]
-    fn test_validators_config() {
-        let (keys, cert_keys, _valset, _valmap) = create_keys_w_validators::<
-            SignatureType,
-            SignatureCollectionType,
-            _,
-        >(1, ValidatorSetFactory::default());
-
-        let make_val_set_data = |stake: Stake| {
-            ValidatorSetData(
-                vec![ValidatorData {
-                    node_id: NodeId::new(keys[0].pubkey()),
-                    cert_pubkey: cert_keys[0].pubkey(),
-                    stake,
-                }]
-                .into(),
-            )
-        };
-
-        let validators_config: ValidatorsConfig<SignatureCollectionType> = ValidatorsConfig {
-            validators: vec![
-                (Epoch(1), make_val_set_data(Stake::ONE)),
-                (Epoch(2), make_val_set_data(Stake::from(2))),
-                (Epoch(4), make_val_set_data(Stake::from(3))),
-                (Epoch(10), make_val_set_data(Stake::from(4))),
-            ]
-            .into_iter()
-            .collect(),
-        };
-
-        let expected = vec![
-            (Epoch(1), make_val_set_data(Stake::ONE)),
-            (Epoch(2), make_val_set_data(Stake::from(2))),
-            (Epoch(3), make_val_set_data(Stake::from(2))),
-            (Epoch(4), make_val_set_data(Stake::from(3))),
-            (Epoch(5), make_val_set_data(Stake::from(3))),
-            (Epoch(6), make_val_set_data(Stake::from(3))),
-            (Epoch(7), make_val_set_data(Stake::from(3))),
-            (Epoch(8), make_val_set_data(Stake::from(3))),
-            (Epoch(9), make_val_set_data(Stake::from(3))),
-            (Epoch(10), make_val_set_data(Stake::from(4))),
-            (Epoch(11), make_val_set_data(Stake::from(4))),
-            (Epoch(12), make_val_set_data(Stake::from(4))),
-        ];
-
-        for (epoch, val_set) in &expected {
-            assert_eq!(val_set, validators_config.get_validator_set(epoch))
-        }
     }
 
     // Confirm that version values greather than 2^16 for version fields don't cause deser issue

@@ -56,6 +56,7 @@ use monad_peer_discovery::{
 use monad_peer_score::IdentityScore;
 use monad_types::{DropTimer, Epoch, ExecutionProtocol, NodeId, Round, RouterTarget, UdpPriority};
 use monad_validator::{
+    proposer_schedule::BoxedProposerSchedule,
     signature_collection::SignatureCollection,
     validator_set::{ValidatorSet, ValidatorSetType as _},
 };
@@ -63,15 +64,15 @@ use packet::regular;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, debug_span, error, info, trace, warn};
 use util::{
-    AutoRebroadcast, BroadcastGroup, BroadcastGroupError, BuildTarget, Collector, FullNodeGroupMap,
-    PeerAddrLookup, PrimaryBroadcastGroup, Recipient, Redundancy, SecondaryBroadcastGroup,
-    SecondaryGroupAssignment, UdpMessage,
+    budgeted, AutoRebroadcast, BroadcastGroup, BroadcastGroupError, BuildTarget, Collector,
+    FullNodeGroupMap, PeerAddrLookup, PrimaryBroadcastGroup, Recipient, Redundancy,
+    SecondaryBroadcastGroup, SecondaryGroupAssignment, UdpMessage,
 };
 
 use crate::{
     auth::NopScore,
     metrics::{
-        COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_FALLBACK,
+        init_router_executor_metrics, COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_FALLBACK,
         COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_OVERSIZE, COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_SENT,
         GAUGE_RAPTORCAST_TOTAL_DESERIALIZE_ERRORS, GAUGE_RAPTORCAST_TOTAL_MESSAGES_RECEIVED,
         GAUGE_RAPTORCAST_TOTAL_RECV_ERRORS,
@@ -123,6 +124,7 @@ where
 
     epoch_validators: BTreeMap<Epoch, ValidatorSet<CertificateSignaturePubKey<ST>>>,
     full_node_groups: FullNodeGroupMap<CertificateSignaturePubKey<ST>>,
+    proposer_schedule: BoxedProposerSchedule<CertificateSignaturePubKey<ST>>,
 
     dedicated_full_nodes: Vec<NodeId<CertificateSignaturePubKey<ST>>>,
     peer_discovery_driver: Arc<Mutex<PeerDiscoveryDriver<PD>>>,
@@ -184,6 +186,7 @@ where
         control: DataplaneControl,
         peer_discovery_driver: Arc<Mutex<PeerDiscoveryDriver<PD>>>,
         current_epoch: Epoch,
+        proposer_schedule: BoxedProposerSchedule<CertificateSignaturePubKey<ST>>,
     ) -> Self {
         let (tcp_reader, tcp_writer) = tcp_socket.split();
 
@@ -269,6 +272,7 @@ where
         let secondary_message_builder = OwnedMessageBuilder::new(config.shared_key.clone())
             .segment_size(segment_size)
             .redundancy(secondary_redundancy);
+        let peer_discovery_metrics = peer_discovery_driver.lock().unwrap().metrics().clone();
 
         let mut udp_state = udp::UdpState::new(
             self_id,
@@ -282,6 +286,7 @@ where
             is_dynamic_fullnode,
             epoch_validators: Default::default(),
             full_node_groups: Default::default(),
+            proposer_schedule,
 
             dedicated_full_nodes: config.primary_instance.fullnode_dedicated.clone(),
             peer_discovery_driver,
@@ -290,9 +295,8 @@ where
             message_builder,
             secondary_message_builder: Some(secondary_message_builder),
 
-            // TODO: call UpdateCurrentRound instead of pass in
-            // current_{epoch,round} as argument to allow downstream
-            // components to initialize appropriately.
+            // Seeded from the forkpoint at boot; updated by
+            // RouterCommand::UpdateCurrentRound.
             current_epoch,
 
             udp_state,
@@ -309,8 +313,8 @@ where
             channel_from_secondary_outbound: None,
 
             waker: None,
-            metrics: Default::default(),
-            peer_discovery_metrics: Default::default(),
+            metrics: init_router_executor_metrics(),
+            peer_discovery_metrics,
             _phantom: PhantomData,
         }
     }
@@ -392,7 +396,7 @@ where
         make_app_message: impl FnOnce() -> Bytes,
         completion: Option<oneshot::Sender<()>>,
     ) {
-        match self.peer_discovery_driver.lock().unwrap().get_addr(to) {
+        match self.peer_discovery_driver.lock().unwrap().get_tcp_addr(to) {
             None => {
                 warn!(
                     ?to,
@@ -436,17 +440,13 @@ where
         let mut sink = DualUdpPacketSender::new(&mut self.dual_socket, &self.peer_discovery_driver);
 
         match outbound_msg {
-            SecondaryOutboundMessage::SendSingle {
-                msg_bytes,
-                dest,
-                epoch,
-            } => {
+            SecondaryOutboundMessage::SendSingle { msg_bytes, dest } => {
                 trace!(
                     ?dest,
                     msg_len = msg_bytes.len(),
                     "raptorcastprimary handling single message from secondary"
                 );
-                let build_target = BuildTarget::point_to_point(epoch, &dest);
+                let build_target = BuildTarget::point_to_point(self.current_epoch, &dest);
                 builder
                     .build_into(&msg_bytes, &build_target, &mut sink)
                     .unwrap_log_on_error(&msg_bytes, &build_target)
@@ -620,7 +620,9 @@ where
     ) {
         // fall back to raptorcast point-to-point when direct UDP is not configured.
         let Some(socket) = self.direct_udp_transport.as_mut() else {
-            self.metrics[COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_FALLBACK] += 1;
+            self.metrics
+                .gauge(COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_FALLBACK)
+                .inc();
             self.handle_publish(
                 RouterTarget::PointToPoint(target),
                 message,
@@ -640,7 +642,9 @@ where
 
             // Fall back when peer discovery doesn't have a direct UDP address for the target.
             let Some(discovered_addr) = discovered_addr else {
-                self.metrics[COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_FALLBACK] += 1;
+                self.metrics
+                    .gauge(COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_FALLBACK)
+                    .inc();
                 self.handle_publish(
                     RouterTarget::PointToPoint(target),
                     message,
@@ -676,7 +680,9 @@ where
         let max_message_size = TX_FORWARD_DIRECT_UDP_MAX_MESSAGE_SIZE_BYTES;
 
         if payload_len > max_message_size {
-            self.metrics[COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_OVERSIZE] += 1;
+            self.metrics
+                .gauge(COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_OVERSIZE)
+                .inc();
             warn!(
                 ?target,
                 payload_len, max_message_size, "direct udp payload exceeds max message size"
@@ -688,7 +694,9 @@ where
             .write_buffered(&target_pubkey, outbound_message, priority)
             .is_ok()
         {
-            self.metrics[COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_SENT] += 1;
+            self.metrics
+                .gauge(COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_SENT)
+                .inc();
         } else {
             warn!(
                 ?target,
@@ -778,10 +786,17 @@ pub fn create_dataplane_for_tests(with_direct_udp: bool) -> DataplaneHandles {
     }
 }
 
+// used where the proposer schedule is irrelevant (e.g. v0): every round
+// resolves to an unknown proposer.
+pub fn dummy_proposer_schedule<PT: PubKey>() -> BoxedProposerSchedule<PT> {
+    Box::new(crate::util::StubProposerSchedule::default())
+}
+
 pub fn new_defaulted_raptorcast_for_tests<ST, M, OM, SE>(
     dataplane: DataplaneHandles,
     known_addresses: HashMap<NodeId<CertificateSignaturePubKey<ST>>, SocketAddrV4>,
     shared_key: Arc<ST::KeyPairType>,
+    current_epoch: Epoch,
 ) -> RaptorCast<
     ST,
     M,
@@ -838,7 +853,8 @@ where
         dataplane.non_authenticated_socket,
         dataplane.control,
         shared_pd,
-        Epoch(0),
+        current_epoch,
+        dummy_proposer_schedule(),
     )
 }
 
@@ -846,6 +862,7 @@ pub fn new_wireauth_raptorcast_for_tests<ST, M, OM, SE>(
     dataplane: DataplaneHandles,
     known_addresses: HashMap<NodeId<CertificateSignaturePubKey<ST>>, SocketAddrV4>,
     shared_key: Arc<ST::KeyPairType>,
+    current_epoch: Epoch,
 ) -> RaptorCast<
     ST,
     M,
@@ -903,7 +920,8 @@ where
         dataplane.non_authenticated_socket,
         dataplane.control,
         shared_pd,
-        Epoch(0),
+        current_epoch,
+        dummy_proposer_schedule(),
     )
 }
 
@@ -952,6 +970,8 @@ where
 
                     self.udp_state.update_current_round(round);
                     self.full_node_groups.delete_expired(round);
+                    let proposer_cutoff = round.saturating_sub(round_info::CACHE_MAX_PAST_ROUNDS);
+                    self.proposer_schedule.prune_below(proposer_cutoff);
                     self.peer_discovery_driver
                         .lock()
                         .unwrap()
@@ -959,9 +979,20 @@ where
                 }
                 RouterCommand::AddEpochValidatorSet {
                     epoch,
+                    epoch_start,
                     validator_set,
                 } => {
-                    trace!(?epoch, ?validator_set, "RaptorCast AddEpochValidatorSet");
+                    trace!(
+                        ?epoch,
+                        ?epoch_start,
+                        ?validator_set,
+                        "RaptorCast AddEpochValidatorSet"
+                    );
+                    // SAFETY: the validator_set comes from
+                    // ValidatorSetData, which should not have duplicates
+                    // or invalid entries.
+                    let validators =
+                        ValidatorSet::new_unchecked(validator_set.iter().cloned().collect());
                     if let Some(epoch_validators) = self.epoch_validators.get(&epoch) {
                         assert_eq!(validator_set.len(), epoch_validators.len());
 
@@ -974,15 +1005,12 @@ where
 
                         warn!("duplicate validator set update (this is safe but unexpected)")
                     } else {
-                        // SAFETY: the validator_set comes from
-                        // ValidatorSetData, which should not have
-                        // duplicates or invalid entries.
-                        let validators = ValidatorSet::new_unchecked(
-                            validator_set.clone().into_iter().collect(),
-                        );
-                        let removed = self.epoch_validators.insert(epoch, validators);
+                        let removed = self.epoch_validators.insert(epoch, validators.clone());
                         assert!(removed.is_none());
                     }
+
+                    self.proposer_schedule
+                        .insert_epoch(epoch, epoch_start, validators);
                     self.peer_discovery_driver.lock().unwrap().update(
                         PeerDiscoveryEvent::UpdateValidatorSet {
                             epoch,
@@ -1025,11 +1053,11 @@ where
                         }
                     };
 
-                    let node_addrs = self
+                    let node_auth_addrs = self
                         .peer_discovery_driver
                         .lock()
                         .unwrap()
-                        .get_known_addresses();
+                        .get_known_auth_udp_addrs();
 
                     let _timer = DropTimer::start(Duration::from_millis(20), |elapsed| {
                         warn!(
@@ -1044,7 +1072,7 @@ where
                             // No need to send to self. TODO: maybe loopback the message.
                             continue;
                         }
-                        if !node_addrs.contains_key(node) {
+                        if !node_auth_addrs.contains_key(node) {
                             continue;
                         }
 
@@ -1138,9 +1166,12 @@ fn iter_ips<'a, ST: CertificateSignatureRecoverable, PD: PeerDiscoveryAlgo<Signa
     validators
         .get_members()
         .keys()
-        .filter_map(|node_id| peer_discovery.get_addr(node_id))
-        .map(|socket| socket.ip())
+        .filter_map(|node_id| peer_discovery.get_ip(node_id))
 }
+
+const RAPTORCAST_POLL_QUOTA: usize = 256;
+const DIRECT_UDP_POLL_QUOTA: usize = 64;
+const TCP_POLL_QUOTA: usize = 16;
 
 impl<ST, M, OM, E, PD, AP, DS> Stream for RaptorCast<ST, M, OM, E, PD, AP, DS>
 where
@@ -1170,17 +1201,20 @@ where
             return Poll::Ready(Some(event.into()));
         }
 
+        let mut poll_quota = RAPTORCAST_POLL_QUOTA;
         loop {
             let message = {
-                let mut sock = pin!(this.dual_socket.recv());
+                let mut sock = pin!(budgeted(this.dual_socket.recv(), &mut poll_quota));
 
                 match sock.poll_unpin(cx) {
                     Poll::Ready(Ok(msg)) => {
-                        this.metrics[GAUGE_RAPTORCAST_TOTAL_MESSAGES_RECEIVED] += 1;
+                        this.metrics
+                            .gauge(GAUGE_RAPTORCAST_TOTAL_MESSAGES_RECEIVED)
+                            .inc();
                         msg
                     }
                     Poll::Ready(Err(e)) => {
-                        this.metrics[GAUGE_RAPTORCAST_TOTAL_RECV_ERRORS] += 1;
+                        this.metrics.gauge(GAUGE_RAPTORCAST_TOTAL_RECV_ERRORS).inc();
                         trace!(error=?e, "socket recv error");
                         continue;
                     }
@@ -1205,6 +1239,7 @@ where
                 this.udp_state.handle_message(
                     &this.epoch_validators,
                     &this.full_node_groups,
+                    &*this.proposer_schedule,
                     |targets, payload, bcast_stride| {
                         for target in targets {
                             rebroadcast_packet(
@@ -1296,7 +1331,9 @@ where
                         }
                     },
                     Err(err) => {
-                        this.metrics[GAUGE_RAPTORCAST_TOTAL_DESERIALIZE_ERRORS] += 1;
+                        this.metrics
+                            .gauge(GAUGE_RAPTORCAST_TOTAL_DESERIALIZE_ERRORS)
+                            .inc();
                         debug!(?from, ?err, "failed to deserialize message");
                     }
                 }
@@ -1308,8 +1345,9 @@ where
         }
 
         if let Some(socket) = this.direct_udp_transport.as_mut() {
+            let mut poll_quota = DIRECT_UDP_POLL_QUOTA;
             loop {
-                let mut recv_fut = pin!(socket.recv());
+                let mut recv_fut = pin!(budgeted(socket.recv(), &mut poll_quota));
                 match recv_fut.poll_unpin(cx) {
                     Poll::Ready(Ok(msg)) => {
                         let from = msg
@@ -1353,8 +1391,10 @@ where
             }
         }
 
+        let mut poll_quota = TCP_POLL_QUOTA;
         loop {
-            let Poll::Ready(msg) = pin!(this.tcp_reader.recv()).poll_unpin(cx) else {
+            let mut recv_fut = pin!(budgeted(this.tcp_reader.recv(), &mut poll_quota));
+            let Poll::Ready(msg) = recv_fut.poll_unpin(cx) else {
                 break;
             };
             let RecvTcpMsg { payload, src_addr } = msg;
@@ -1381,7 +1421,9 @@ where
                 match InboundRouterMessage::<M, ST>::try_deserialize(&app_message_bytes) {
                     Ok(message) => message,
                     Err(err) => {
-                        this.metrics[GAUGE_RAPTORCAST_TOTAL_DESERIALIZE_ERRORS] += 1;
+                        this.metrics
+                            .gauge(GAUGE_RAPTORCAST_TOTAL_DESERIALIZE_ERRORS)
+                            .inc();
                         debug!(?err, ?src_addr, "failed to deserialize message");
                         this.dataplane_control.disconnect(src_addr);
                         continue;
@@ -1489,9 +1531,6 @@ where
                     } => {
                         send_peer_disc_msg(this, target, Some(name_record), message);
                     }
-                    PeerDiscoveryEmit::MetricsCommand(executor_metrics) => {
-                        this.peer_discovery_metrics = executor_metrics;
-                    }
                 }
             }
         }
@@ -1507,11 +1546,11 @@ where
                         if this.full_node_groups.try_insert(group).is_none() {
                             // TODO: convert to an assertion?
                             error!(
-                                round_span =? round_span,
-                                publisher_id =? publisher_id,
+                                round_span = ?round_span,
+                                publisher_id = ?publisher_id,
                                 "Accepted group assignment contains overlaps"
                             );
-                        };
+                        }
                     }
                     Poll::Ready(None) => {
                         error!("RaptorCast secondary->primary channel disconnected.");
@@ -1690,7 +1729,10 @@ where
                 return Some(addr);
             }
 
-            Some(SocketAddr::V4(target_name_record.name_record.udp_socket()))
+            target_name_record
+                .name_record
+                .udp_socket()
+                .map(SocketAddr::V4)
         } else {
             // otherwise lookup address using peer-discovery
             let peer_lookup = (&*self.dual_socket, self.peer_disc_driver);
@@ -1784,13 +1826,13 @@ fn rebroadcast_packet<ST, PD, AP>(
                 peer_discovery_driver
                     .lock()
                     .ok()
-                    .and_then(|pd| pd.get_addr(target))
+                    .and_then(|pd| pd.get_udp_addr(target))
             })
     } else {
         peer_discovery_driver
             .lock()
             .ok()
-            .and_then(|pd| pd.get_addr(target))
+            .and_then(|pd| pd.get_udp_addr(target))
     };
 
     let Some(target_addr) = target_addr else {

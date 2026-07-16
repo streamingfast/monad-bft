@@ -61,7 +61,6 @@ pub enum SecondaryOutboundMessage<PT: PubKey> {
     SendSingle {
         msg_bytes: bytes::Bytes,
         dest: NodeId<PT>,
-        epoch: Epoch,
     },
     SendToGroup {
         msg_bytes: bytes::Bytes,
@@ -92,8 +91,6 @@ where
     // Represents only the group logic, excluding everything network related.
     role: Role<ST>,
 
-    curr_epoch: Epoch,
-
     peer_discovery_driver: Arc<Mutex<PeerDiscoveryDriver<PD>>>,
 
     channel_from_primary: UnboundedReceiver<FullNodesGroupMessage<ST>>,
@@ -123,7 +120,6 @@ where
         channel_to_primary_outbound: UnboundedSender<
             SecondaryOutboundMessage<CertificateSignaturePubKey<ST>>,
         >,
-        current_epoch: Epoch,
     ) -> Self {
         let node_id = NodeId::new(config.shared_key.pubkey());
 
@@ -148,7 +144,6 @@ where
 
         Self {
             role,
-            curr_epoch: current_epoch,
             peer_discovery_driver,
             channel_from_primary,
             channel_to_primary_outbound,
@@ -180,7 +175,6 @@ where
         let outbound = SecondaryOutboundMessage::SendSingle {
             msg_bytes,
             dest: dest_node,
-            epoch: self.curr_epoch,
         };
         if let Err(err) = self.channel_to_primary_outbound.send(outbound) {
             error!(?err, "failed to send message to primary");
@@ -219,7 +213,20 @@ where
             filled_confirm_msg.name_records = Default::default();
             for node_id in dest_node_ids.iter() {
                 if let Some(name_record) = name_records.get(node_id) {
-                    filled_confirm_msg.name_records.push(name_record.clone());
+                    if let Err(err) = filled_confirm_msg
+                        .name_records
+                        .try_push(name_record.clone())
+                    {
+                        warn!(
+                            ?node_id,
+                            ?group_msg,
+                            capacity = err.capacity,
+                            "RaptorCastSecondary: ConfirmGroup.name_records at capacity; \
+                             dropping remaining records. Should be unreachable given \
+                             boot-time max_group_size validation.",
+                        );
+                        break;
+                    }
                 } else {
                     // Maybe can happen if peer discovery gets pruned just
                     // before sending a ConfirmGroup message.
@@ -299,7 +306,6 @@ where
                             ?round,
                             "RaptorCastSecondary UpdateCurrentRound (Publisher)"
                         );
-                        self.curr_epoch = epoch;
                         // The publisher needs to be periodically informed about new nodes out there,
                         // so that it can randomize when creating new groups.
                         let full_nodes = self

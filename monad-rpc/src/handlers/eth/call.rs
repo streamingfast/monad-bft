@@ -48,6 +48,7 @@ use crate::{
     types::{
         eth_json::{BlockTagOrHash, MonadCreateAccessListResult},
         ethhex,
+        json_serialized_len::JsonSerializedLen,
         jsonrpc::{JsonRpcError, JsonRpcResult},
     },
 };
@@ -478,8 +479,8 @@ pub struct EnrichedTracerObject {
 #[derive(Debug, Deserialize, schemars::JsonSchema, Clone)]
 pub struct MonadDebugTraceCallParams {
     transaction: CallRequest,
-    #[serde(default)]
     block: BlockTagOrHash,
+    #[serde(default)]
     tracer: EnrichedTracerObject,
 }
 
@@ -745,7 +746,8 @@ pub async fn monad_eth_call<T: Triedb + TriedbPath>(
     method = "debug_traceCall",
     ignore = "eth_call_handler_config",
     ignore = "eth_call_executor",
-    ignore = "chain_id"
+    ignore = "chain_id",
+    ignore = "max_response_size"
 )]
 #[allow(non_snake_case)]
 pub async fn monad_debug_traceCall<T: Triedb + TriedbPath>(
@@ -753,6 +755,7 @@ pub async fn monad_debug_traceCall<T: Triedb + TriedbPath>(
     eth_call_handler_config: &EthCallHandlerConfig,
     eth_call_executor: &EthCallExecutor,
     chain_id: u64,
+    max_response_size: usize,
     params: MonadDebugTraceCallParams,
 ) -> JsonRpcResult<Box<RawValue>> {
     debug!(?params, "monad_debug_traceCall");
@@ -787,12 +790,20 @@ pub async fn monad_debug_traceCall<T: Triedb + TriedbPath>(
                 &tracer_params,
             )
             .await?;
+
+            if frame.json_serialized_len() > max_response_size {
+                return Err(JsonRpcError::max_response_size_exceeded());
+            }
             serde_json::value::to_raw_value(&frame).map_err(|e| {
                 JsonRpcError::internal_error(format!("json serialization error: {}", e))
             })
         }
 
         MonadTracer::PreStateTracer | MonadTracer::StateDiffTracer => {
+            // reject on the approximated encoded length before serialization
+            if raw_payload.len() > max_response_size {
+                return Err(JsonRpcError::max_response_size_exceeded());
+            }
             let v: serde_cbor::Value = serde_cbor::from_slice(&raw_payload)
                 .map_err(|e| JsonRpcError::internal_error(format!("cbor decode error: {}", e)))?;
             serde_json::value::to_raw_value(&v).map_err(|e| {
@@ -1226,6 +1237,43 @@ mod tests {
         let params: MonadDebugTraceCallParams = from_str(raw).unwrap();
 
         assert_eq!(params.tracer.tracer_params.tracer, Tracer::PreStateTracer);
+    }
+
+    #[test]
+    fn parse_trace_call_request_with_default_tracer() {
+        let raw = r#"
+        [
+          {
+            "from": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+            "to": "0x0000000000a39bb272e79075ade125fd351887ac",
+            "gas": "0x1E9EF",
+            "gasPrice": "0xBD32B2ABC",
+            "data": "0xd0e30db0"
+          },
+          "latest"
+        ]
+        "#;
+
+        let params: MonadDebugTraceCallParams = from_str(raw).unwrap();
+
+        assert_eq!(params.tracer.tracer_params.tracer, Tracer::CallTracer);
+    }
+
+    #[test]
+    fn parse_trace_call_request_requires_block() {
+        let raw = r#"
+        [
+          {
+            "from": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+            "to": "0x0000000000a39bb272e79075ade125fd351887ac",
+            "gas": "0x1E9EF",
+            "gasPrice": "0xBD32B2ABC",
+            "data": "0xd0e30db0"
+          }
+        ]
+        "#;
+
+        assert!(from_str::<MonadDebugTraceCallParams>(raw).is_err());
     }
 
     #[test]

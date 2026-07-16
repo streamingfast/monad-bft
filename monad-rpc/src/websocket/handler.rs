@@ -726,6 +726,7 @@ mod tests {
             data_provider: None,
             event_server_client: Some(event_server_client),
             batch_request_limit: 5,
+            batch_concurrent_limit: 5,
             max_response_size: 25_000_000,
             allow_unprotected_txs: false,
             logs_max_block_range: 1000,
@@ -734,6 +735,7 @@ mod tests {
             dry_run_get_logs_index: false,
             use_eth_get_logs_index: false,
             max_finalized_block_cache_len: 200,
+            enable_eth_simulate_v1: false,
             metrics: None,
             rpc_comparator: None,
         };

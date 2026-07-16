@@ -288,6 +288,9 @@ async fn main() -> std::io::Result<()> {
                 max_concurrent_permits: args.eth_call_max_concurrent_requests as usize,
                 provider_gas_limit_eth_call: args.eth_call_provider_gas_limit,
                 provider_gas_limit_eth_estimate_gas: args.eth_estimate_gas_provider_gas_limit,
+                provider_gas_limit_eth_simulate: args.eth_simulate_gas_limit,
+                provider_max_calls_eth_simulate: args.eth_simulate_max_calls,
+                provider_max_blocks_eth_simulate: args.eth_simulate_max_blocks,
             },
             triedb_path,
         )
@@ -300,8 +303,6 @@ async fn main() -> std::io::Result<()> {
             std::time::Duration::from_secs(5),
         )
     });
-
-    let decompression_guard = DecompressionGuard::new(args.max_request_size);
 
     // Configure event ring, websocket server and event cache.
     let event_server_client = if let Some(exec_event_path) = args.exec_event_path {
@@ -368,6 +369,7 @@ async fn main() -> std::io::Result<()> {
         data_provider,
         event_server_client.clone(),
         args.batch_request_limit,
+        args.batch_concurrent_limit,
         args.max_response_size,
         args.allow_unprotected_txs,
         args.eth_get_logs_max_block_range,
@@ -376,6 +378,7 @@ async fn main() -> std::io::Result<()> {
         args.dry_run_get_logs_index,
         args.use_eth_get_logs_index,
         args.max_finalized_block_cache_len,
+        args.enable_eth_simulate_v1,
         with_metrics.clone(),
         rpc_comparator.clone(),
     );
@@ -403,8 +406,8 @@ async fn main() -> std::io::Result<()> {
     let app = match with_metrics {
         Some(metrics) => HttpServer::new(move || {
             App::new()
-                .wrap(decompression_guard.clone())
                 .wrap(metrics.clone())
+                .wrap(DecompressionGuard::default())
                 .wrap(TracingLogger::<MonadJsonRootSpanBuilder>::new())
                 .wrap(TimingMiddleware)
                 .app_data(web::PayloadConfig::default().limit(args.max_request_size))
@@ -417,7 +420,7 @@ async fn main() -> std::io::Result<()> {
         .run(),
         None => HttpServer::new(move || {
             App::new()
-                .wrap(decompression_guard.clone())
+                .wrap(DecompressionGuard::default())
                 .wrap(TracingLogger::<MonadJsonRootSpanBuilder>::new())
                 .wrap(TimingMiddleware)
                 .app_data(web::PayloadConfig::default().limit(args.max_request_size))
