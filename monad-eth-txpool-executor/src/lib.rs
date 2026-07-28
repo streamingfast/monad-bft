@@ -52,7 +52,10 @@ use monad_execution_state_read::ExecutionStateRead;
 use monad_executor::{Executor, ExecutorMetrics, ExecutorMetricsChain};
 use monad_peer_score::{ema, StdClock};
 use monad_secp::RecoverableAddress;
-use monad_types::{DropTimer, Epoch, ExecutionProtocol, NodeId, Round, SeqNum};
+use monad_types::{
+    DropTimer, Epoch, ExecutionProtocol, LimitedVec, NodeId, Round, SeqNum,
+    MAX_FORWARDED_TXS_PER_MESSAGE,
+};
 use monad_validator::signature_collection::SignatureCollection;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use tokio::{sync::mpsc, time::Instant};
@@ -148,7 +151,7 @@ where
         sender_gas: BTreeMap<NodeId<SCT::NodeIdPubKey>, u64>,
     },
 
-    ForwardTxs(Vec<Bytes>),
+    ForwardTxs(LimitedVec<Bytes, MAX_FORWARDED_TXS_PER_MESSAGE>),
 }
 
 pub struct EthTxPoolExecutor<ST, SCT, ESRT, CCT, CRT, TIS>
@@ -1087,7 +1090,7 @@ mod test {
 
         client.exec(vec![TxPoolCommand::InsertForwardedTxs {
             sender: node_id::<SignatureType>(),
-            txs: make_forwarded_txs(0, 4),
+            txs: make_forwarded_txs(0, 4).into(),
         }]);
 
         let metrics = client.metrics().into_inner();
@@ -1178,7 +1181,7 @@ mod test {
                 command_tx
                     .send(vec![TxPoolCommand::InsertForwardedTxs {
                         sender: node_id::<SignatureType>(),
-                        txs: expected_txs.clone(),
+                        txs: expected_txs.clone().into(),
                     }])
                     .expect("forwarded txs are queued");
                 tokio::task::yield_now().await;
@@ -1216,7 +1219,7 @@ mod test {
                 command_tx
                     .send(vec![TxPoolCommand::InsertForwardedTxs {
                         sender: node_id::<SignatureType>(),
-                        txs: expected_txs_after_second_batch.clone(),
+                        txs: expected_txs_after_second_batch.clone().into(),
                     }])
                     .expect("forwarded txs are queued");
                 tokio::task::yield_now().await;

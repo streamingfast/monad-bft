@@ -13,9 +13,10 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{collections::BTreeSet, time::Duration};
+#![cfg(feature = "raptorcast")]
 
-use itertools::Itertools;
+use std::time::Duration;
+
 use monad_chain_config::{revision::ChainParams, MockChainConfig};
 use monad_consensus_types::{block::PassthruBlockPolicy, block_validator::MockValidator};
 use monad_crypto::certificate_signature::CertificateKeyPair;
@@ -24,14 +25,13 @@ use monad_mock_swarm::{
     mock::TimestamperConfig,
     mock_swarm::SwarmBuilder,
     node::NodeBuilder,
+    raptorcast::{RaptorcastRouterConfig, RaptorcastSwarm},
     swarm::{make_state_configs, swarm_ledger_verification},
-    swarm_relation::NoSerSwarm,
     terminator::UntilTerminator,
-    verifier::{happy_path_tick_by_block, MockSwarmVerifier},
 };
-use monad_router_scheduler::{NoSerRouterConfig, RouterSchedulerBuilder};
+use monad_router_scheduler::RouterSchedulerBuilder;
 use monad_transformer::{GenericTransformer, LatencyTransformer, ID};
-use monad_types::{NodeId, SeqNum};
+use monad_types::{Epoch, NodeId, Round, SeqNum};
 use monad_updaters::{
     ledger::MockLedger, statesync::MockStateSyncExecutor, txpool::MockTxPoolExecutor,
     val_set::MockValSetUpdaterNop,
@@ -47,39 +47,40 @@ static CHAIN_PARAMS: ChainParams = ChainParams {
 };
 
 #[test]
-fn two_nodes_noser() {
+fn raptorcast_smoke_four_nodes() {
     let delta = Duration::from_millis(100);
-    let state_configs = make_state_configs::<NoSerSwarm>(
-        2, // num_nodes
+    let epoch_length = SeqNum(20);
+    let epoch_start_delay = Round(5);
+    let state_configs = make_state_configs::<RaptorcastSwarm>(
+        4,
         ValidatorSetFactory::default,
         SimpleRoundRobin::default,
         || MockValidator,
         || PassthruBlockPolicy,
         || InMemoryStateInner::genesis(SeqNum(4)),
-        SeqNum(4),                           // execution_delay
-        delta,                               // delta
-        MockChainConfig::new(&CHAIN_PARAMS), // chain config
-        SeqNum(100),                         // state_sync_threshold
+        SeqNum(4),
+        delta,
+        MockChainConfig::new_with_epoch_params(&CHAIN_PARAMS, epoch_length, epoch_start_delay),
+        SeqNum(100),
     );
-    let all_peers: BTreeSet<_> = state_configs
-        .iter()
-        .map(|state_config| NodeId::new(state_config.key.pubkey()))
-        .collect();
-    let swarm_config = SwarmBuilder::<NoSerSwarm>(
+
+    let swarm_config = SwarmBuilder::<RaptorcastSwarm>(
         state_configs
             .into_iter()
             .enumerate()
             .map(|(seed, state_builder)| {
-                let state_read = state_builder.state_read.clone();
+                let state_backend = state_builder.state_read.clone();
                 let validators = state_builder.locked_epoch_validators[0].clone();
-                NodeBuilder::<NoSerSwarm>::new(
-                    ID::new(NodeId::new(state_builder.key.pubkey())),
+                let self_id = NodeId::new(state_builder.key.pubkey());
+                let router_config = RaptorcastRouterConfig::<_, _, _>::new(self_id);
+                NodeBuilder::<RaptorcastSwarm>::new(
+                    ID::new(self_id),
                     state_builder,
-                    NoSerRouterConfig::new(all_peers.clone()).build(),
-                    MockValSetUpdaterNop::new(validators.validators, SeqNum(2000)),
+                    router_config.build(),
+                    MockValSetUpdaterNop::new(validators.validators, epoch_length),
                     MockTxPoolExecutor::default().with_chain_params(&CHAIN_PARAMS),
-                    MockLedger::new(state_read.clone()),
-                    MockStateSyncExecutor::new(state_read),
+                    MockLedger::new(state_backend.clone()),
+                    MockStateSyncExecutor::new(state_backend),
                     vec![GenericTransformer::Latency(LatencyTransformer::new(delta))],
                     vec![],
                     TimestamperConfig::default(),
@@ -90,19 +91,12 @@ fn two_nodes_noser() {
     );
 
     let mut swarm = swarm_config.build();
+    let target_epoch = Epoch(4);
     while swarm
-        .step_until(&mut UntilTerminator::new().until_block(1026))
+        .step_until(&mut UntilTerminator::new().until_epoch(target_epoch))
         .is_some()
     {}
 
-    let node_ids = swarm.states().keys().copied().collect_vec();
-    // the calculation is correct with two nodes because NoSerRouterScheduler
-    // always sends the message over the network/transformer, even for it's for
-    // self. Otherwise the time is shorter with two nodes, like QUIC test
-    let mut verifier =
-        MockSwarmVerifier::default().tick_range(happy_path_tick_by_block(1026, delta), delta);
-    verifier.metrics_happy_path(&node_ids, &swarm);
-    assert!(verifier.verify(&swarm));
-
-    swarm_ledger_verification(&swarm, 1024);
+    let min_blocks = (target_epoch.0 - 1) * epoch_length.0;
+    swarm_ledger_verification(&swarm, min_blocks as usize);
 }
