@@ -23,44 +23,8 @@ use actix_server::Server;
 use actix_web::{http::header, web, App, HttpRequest, HttpResponse, HttpServer};
 use monad_consensus_types::metrics::Metrics as StateMetrics;
 use monad_executor::{metric_consts, ExecutorMetrics, ExecutorMetricsChain, Gauge};
+use monad_triedb_utils::MigrationPhase;
 use prometheus::{Encoder, ProtobufEncoder, Registry, TextEncoder};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Label {
-    pub key: String,
-    pub value: String,
-}
-
-pub fn parse_label(label: &str) -> Result<Label, String> {
-    let Some((key, value)) = label.split_once('=') else {
-        return Err("expected key=value".to_owned());
-    };
-
-    if key.is_empty() {
-        return Err("label key must not be empty".to_owned());
-    }
-
-    if !is_valid_label_key(key) {
-        return Err(format!(
-            "invalid label key {key:?}; expected [a-zA-Z_][a-zA-Z0-9_]*"
-        ));
-    }
-
-    Ok(Label {
-        key: key.to_owned(),
-        value: value.to_owned(),
-    })
-}
-
-fn is_valid_label_key(key: &str) -> bool {
-    let mut chars = key.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-
-    (first.is_ascii_alphabetic() || first == '_')
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-}
 
 pub fn default_prometheus_labels(
     service_name: String,
@@ -93,12 +57,35 @@ metric_consts! {
     }
 }
 
+metric_consts! {
+    pub GAUGE_TRIEDB_MIGRATION_PHASE {
+        name: "monad.triedb.migration_phase",
+        help: "Dual-DB migration phase: 0=legacy (not started), 1=dual-timeline (migrating), 2=page-encoded (complete)",
+    }
+}
+
 fn init_node_executor_metrics() -> ExecutorMetrics {
     ExecutorMetrics::with_metric_defs(&[
         GAUGE_TOTAL_UPTIME_US,
         GAUGE_STATE_TOTAL_UPDATE_US,
         GAUGE_NODE_INFO,
     ])
+}
+
+pub fn init_triedb_phase_metrics() -> ExecutorMetrics {
+    ExecutorMetrics::with_metric_defs(&[GAUGE_TRIEDB_MIGRATION_PHASE])
+}
+
+pub fn record_triedb_phase_metrics(metrics: &mut ExecutorMetrics, phase: MigrationPhase) {
+    // Map to the published 0/1/2 codes explicitly so the metric's wire contract
+    // stays fixed even if the MigrationPhase discriminants change upstream (the
+    // enum is defined in monad-triedb).
+    let code: u64 = match phase {
+        MigrationPhase::Legacy => 0,
+        MigrationPhase::DualTimeline => 1,
+        MigrationPhase::PageEncoded => 2,
+    };
+    metrics.gauge(GAUGE_TRIEDB_MIGRATION_PHASE).set(code);
 }
 
 fn duration_micros_u64(duration: &Duration) -> u64 {
@@ -254,4 +241,26 @@ pub fn start_metrics_server(addr: String, state: MetricsServerState) -> std::io:
     .bind(addr)?
     .workers(1)
     .run())
+}
+
+#[cfg(test)]
+mod migration_phase_tests {
+    use monad_triedb_utils::MigrationPhase;
+
+    use super::{
+        init_triedb_phase_metrics, record_triedb_phase_metrics, GAUGE_TRIEDB_MIGRATION_PHASE,
+    };
+
+    #[test]
+    fn records_phase_code() {
+        for (phase, code) in [
+            (MigrationPhase::Legacy, 0u64),
+            (MigrationPhase::DualTimeline, 1),
+            (MigrationPhase::PageEncoded, 2),
+        ] {
+            let mut metrics = init_triedb_phase_metrics();
+            record_triedb_phase_metrics(&mut metrics, phase);
+            assert_eq!(metrics.gauge(GAUGE_TRIEDB_MIGRATION_PHASE).get(), code);
+        }
+    }
 }

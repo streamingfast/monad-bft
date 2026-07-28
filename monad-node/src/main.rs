@@ -41,7 +41,7 @@ use monad_eth_block_validator::EthBlockValidator;
 use monad_eth_txpool_executor::{EthTxPoolExecutor, EthTxPoolIpcConfig};
 use monad_execution_state_read::ExecutionStateReadThreadClient;
 use monad_execution_state_read_cache::ExecutionStateReadCache;
-use monad_executor::{Executor, ExecutorMetricsChain};
+use monad_executor::{Executor, ExecutorMetrics, ExecutorMetricsChain};
 use monad_executor_glue::{LogFriendlyMonadEvent, Message, MonadEvent};
 use monad_ledger::MonadBlockFileLedger;
 use monad_node_config::{
@@ -85,7 +85,8 @@ use self::{
     cli::Cli,
     error::NodeSetupError,
     metrics::{
-        default_prometheus_labels, start_metrics_server, MetricsServerState, NodePrometheusMetrics,
+        default_prometheus_labels, init_triedb_phase_metrics, record_triedb_phase_metrics,
+        start_metrics_server, MetricsServerState, NodePrometheusMetrics,
     },
     state::NodeState,
 };
@@ -307,6 +308,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         .expect("uds bind failed"),
         loopback: LoopbackExecutor::default(),
         state_sync: StateSyncExecutor::<SignatureType, SignatureCollectionType>::new(
+            node_state.chain_config.chain_id(),
             vec![statesync_triedb_path.to_string_lossy().to_string()],
             node_state.statesync_sq_thread_cpu,
             state_sync_init_peers,
@@ -464,22 +466,36 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         MONAD_NODE_VERSION,
     );
     if let Some(metrics_config) = &node_state.metrics {
-        for label in &metrics_config.labels {
+        for (key, value) in &metrics_config.labels {
             if prometheus_labels
-                .insert(label.key.clone(), label.value.clone())
+                .insert(key.clone(), value.clone())
                 .is_some()
             {
-                error!(label = %label.key, "duplicate prometheus label");
+                error!(label = %key, "duplicate prometheus label");
                 return Err(());
             }
         }
+    }
+
+    // Read the dual-DB migration phase once at startup and record it into a
+    // dedicated metrics set pushed alongside the executor's. The phase only
+    // changes via the offline monad-mpt tool, which requires a restart, so
+    // there is nothing to refresh. If triedb can't be opened, leave the metric
+    // unreported (empty set) rather than emitting a misleading default.
+    let mut triedb_phase_metrics = ExecutorMetrics::with_metric_defs(&[]);
+    match TriedbReader::try_new(node_state.triedb_path.as_path()) {
+        Some(reader) => {
+            triedb_phase_metrics = init_triedb_phase_metrics();
+            record_triedb_phase_metrics(&mut triedb_phase_metrics, reader.migration_phase());
+        }
+        None => warn!("triedb unavailable, migration-phase metric will not be reported"),
     }
 
     let prometheus_metrics = Arc::new(
         NodePrometheusMetrics::new(
             prometheus_labels,
             state.metrics(),
-            executor.metrics(),
+            executor.metrics().push(&triedb_phase_metrics),
             process_start,
         )
         .map_err(|err| {
@@ -529,7 +545,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                 None => futures_util::future::pending().boxed(),
             } => {
                 let otel_meter = maybe_otel_meter.as_ref().expect("otel_endpoint must have been set");
-                let executor_metrics = executor.metrics();
+                let executor_metrics = executor.metrics().push(&triedb_phase_metrics);
                 send_metrics(
                     otel_meter,
                     &mut gauge_cache,
@@ -619,6 +635,23 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
     Ok(())
 }
 
+enum NonAuthRaptorcastBind {
+    Shared { port: u16 },
+    TcpOnly { tcp_port: u16 },
+}
+
+impl NonAuthRaptorcastBind {
+    fn bind_addresses(self, host: IpAddr) -> (SocketAddr, Option<SocketAddr>) {
+        match self {
+            Self::Shared { port } => {
+                let bind_address = SocketAddr::new(host, port);
+                (bind_address, Some(bind_address))
+            }
+            Self::TcpOnly { tcp_port } => (SocketAddr::new(host, tcp_port), None),
+        }
+    }
+}
+
 fn build_raptorcast_router<ST, SCT, M, OM, DS>(
     node_config: NodeConfig<ST>,
     peer_discovery_config: PeerDiscoveryConfig<ST>,
@@ -652,18 +685,30 @@ where
     OM: Encodable + Clone + Send + Sync + 'static,
     DS: IdentityScore<Identity = NodeId<CertificateSignaturePubKey<ST>>>,
 {
-    let bind_address = SocketAddr::new(
-        IpAddr::V4(node_config.network.bind_address_host),
-        node_config.network.bind_address_port,
-    );
+    let network_config = node_config.network;
+    let self_udp_port = peer_discovery_config.udp_port();
+    let non_auth_raptorcast_bind = if self_udp_port.is_some() {
+        NonAuthRaptorcastBind::Shared {
+            port: network_config
+                .bind_address_port
+                .expect("network.bind_address_port must be set when peer discovery UDP is enabled"),
+        }
+    } else {
+        NonAuthRaptorcastBind::TcpOnly {
+            tcp_port: network_config.bind_address_tcp_port.expect(
+                "network.bind_address_tcp_port must be set when peer discovery UDP is disabled",
+            ),
+        }
+    };
+    let (tcp_bind_address, non_authenticated_bind_address) =
+        non_auth_raptorcast_bind.bind_addresses(IpAddr::V4(network_config.bind_address_host));
     let authenticated_bind_address = SocketAddr::new(
-        IpAddr::V4(node_config.network.bind_address_host),
-        node_config.network.authenticated_bind_address_port,
+        IpAddr::V4(network_config.bind_address_host),
+        network_config.authenticated_bind_address_port,
     );
-    let direct_udp_bind_address = node_config
-        .network
+    let direct_udp_bind_address = network_config
         .direct_udp_bind_address_port
-        .map(|port| SocketAddr::new(IpAddr::V4(node_config.network.bind_address_host), port));
+        .map(|port| SocketAddr::new(IpAddr::V4(network_config.bind_address_host), port));
     let self_id = NodeId::new(identity.pubkey());
     let self_tcp_port = peer_discovery_config.tcp_port();
     let name_record_address = if let Some(ip) = peer_discovery_config.ip() {
@@ -680,15 +725,14 @@ where
     };
 
     tracing::debug!(
-        ?bind_address,
+        ?tcp_bind_address,
+        ?non_authenticated_bind_address,
         ?authenticated_bind_address,
         ?direct_udp_bind_address,
         ?name_record_address,
         "Monad-node starting, pid: {}",
         process::id()
     );
-
-    let network_config = node_config.network;
 
     let mut dp_builder = DataplaneBuilder::new(network_config.max_mbps.into())
         .with_udp_multishot(network_config.enable_udp_multishot);
@@ -705,19 +749,19 @@ where
             network_config.tcp_rate_limit_burst,
         );
 
-    let mut udp_sockets: Vec<(UdpSocketId, std::net::SocketAddr)> = vec![
-        (UdpSocketId::Raptorcast, bind_address),
-        (
-            UdpSocketId::AuthenticatedRaptorcast,
-            authenticated_bind_address,
-        ),
-    ];
+    let mut udp_sockets: Vec<(UdpSocketId, SocketAddr)> = vec![(
+        UdpSocketId::AuthenticatedRaptorcast,
+        authenticated_bind_address,
+    )];
+    if let Some(address) = non_authenticated_bind_address {
+        udp_sockets.push((UdpSocketId::Raptorcast, address));
+    }
     if let Some(direct_addr) = direct_udp_bind_address {
         udp_sockets.push((UdpSocketId::DirectUdp, direct_addr));
     }
     dp_builder = dp_builder
         .with_udp_sockets(udp_sockets)
-        .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_address)]);
+        .with_tcp_sockets([(TcpSocketId::Raptorcast, tcp_bind_address)]);
 
     assert_eq!(
         peer_discovery_config.self_direct_udp_port.is_some(),
@@ -727,7 +771,7 @@ where
     let self_record = NameRecord::new_with_ports(
         *name_record_address.ip(),
         self_tcp_port.get(),
-        peer_discovery_config.udp_port().map(NonZeroU16::get),
+        self_udp_port.map(NonZeroU16::get),
         peer_discovery_config.self_auth_port.get(),
         peer_discovery_config
             .self_direct_udp_port
