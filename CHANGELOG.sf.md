@@ -9,12 +9,15 @@ changelog. The release workflow looks up the section matching the tag being rele
 publishes it as the GitHub release notes, so rename `## Unreleased` to the tag name (for
 example `## v0.15.3-fh3.0`) before tagging — the release job fails if no section matches.
 
-## Unreleased
+## v0.15.2-fh3.0-1
+
+> [!NOTE]
+> Re-release of v0.15.2-fh3.0 with CI pipeline fixed to publish images.
 
 * Build and publish `monad-node` / `monad-rpc` images on `release/**` branches and on
   `v*-fh*` tags, and create a GitHub release from this changelog on tag builds.
 
-## v0.15.2-fh3.0
+### v0.15.2-fh3.0
 
 * Bumped to [v0.15.2](https://github.com/category-labs/monad-bft/releases/tag/v0.15.2).
 
