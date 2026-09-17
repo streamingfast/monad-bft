@@ -44,12 +44,12 @@ use tracing::{debug, error, trace, warn};
 use self::{
     buffer::BlockBufferView,
     source::{
-        ArchiveDataSource, BlockPointer, DataSourceStack, HistoricalDataSource,
-        HistoricalDataSourceStack,
+        ArchiveDataSource, BlockPointer, DataSourceStack, HistoricalBlockData,
+        HistoricalDataSource, HistoricalDataSourceStack,
     },
 };
 use crate::{
-    data::source::{DataSourceError, TriedbDataSource},
+    data::source::{DataSourceError, HistoricalDataSourceExt, TriedbDataSource},
     handlers::eth::txn::FilterError,
     types::{
         eth_json::{BlockTagOrHash, BlockTags, MonadLog, MonadTransactionReceipt},
@@ -390,23 +390,16 @@ where
             }
         }
 
-        if let Some(block_pointer) = self
+        if let Some(header) = self
             .historical
-            .try_resolve(block)
+            .try_resolve_and_then(block, |source, pointer| source.get_block_header(pointer))
             .await
             .map_err(ChainStateError::DataSource)?
         {
-            if let Some(header) = self
-                .historical
-                .get_block_header(block_pointer)
-                .await
-                .map_err(ChainStateError::DataSource)?
-            {
-                return Ok(header);
-            }
+            Ok(header)
+        } else {
+            Err(ChainStateError::ResourceNotFound)
         }
-
-        Err(ChainStateError::ResourceNotFound)
     }
 
     pub async fn get_block(
@@ -425,28 +418,14 @@ where
             }
         }
 
-        if let Some(block_pointer) = self
+        let result = self
             .historical
-            .try_resolve(block)
+            .try_resolve_and_then(block, |source, pointer| source.get_block(pointer))
             .await
             .map_err(ChainStateError::DataSource)?
-        {
-            if let Some((header, transactions)) = self
-                .historical
-                .get_block(block_pointer)
-                .await
-                .map_err(ChainStateError::DataSource)?
-            {
-                return Ok(parse_block_content(
-                    header.hash_slow(),
-                    header,
-                    transactions,
-                    return_full_txns,
-                ));
-            }
-        }
+            .ok_or(ChainStateError::ResourceNotFound)?;
 
-        Err(ChainStateError::ResourceNotFound)
+        Ok(parse_block_content(result, return_full_txns))
     }
 
     /// Returns raw transaction receipts for a block.
@@ -1062,7 +1041,13 @@ async fn fetch_bloom_filtered_header_transactions_receipts_from_archive(
     Vec<ReceiptWithLogIndex>,
 )> {
     let block_pointer = BlockPointer::Finalized(block_number);
-    let Some((header, transactions)) = data_source
+
+    let Some(HistoricalBlockData {
+        header,
+        header_hash_precomputed,
+
+        transactions,
+    }) = data_source
         .get_block(block_pointer)
         .await
         .map_err(|e| JsonRpcError::internal_error(e.to_string()))?
@@ -1073,7 +1058,7 @@ async fn fetch_bloom_filtered_header_transactions_receipts_from_archive(
     };
 
     let header = BlockHeader {
-        hash: header.hash_slow(),
+        hash: header_hash_precomputed.unwrap_or_else(|| header.hash_slow()),
         header,
     };
 
@@ -1281,12 +1266,15 @@ fn calculate_block_size(header: &RlpHeader, transactions: &[TxEnvelopeWithSender
     alloy_rlp::length_of_length(block_payload_len) + block_payload_len
 }
 
-fn parse_block_content(
-    block_hash: FixedBytes<32>,
-    header: RlpHeader,
-    transactions: Vec<TxEnvelopeWithSender>,
-    return_full_txns: bool,
-) -> Block {
+fn parse_block_content(block_data: HistoricalBlockData, return_full_txns: bool) -> Block {
+    let HistoricalBlockData {
+        header,
+        header_hash_precomputed,
+
+        transactions,
+    } = block_data;
+
+    let block_hash = header_hash_precomputed.unwrap_or_else(|| header.hash_slow());
     let block_size = U256::from(calculate_block_size(&header, &transactions));
 
     // parse transactions
