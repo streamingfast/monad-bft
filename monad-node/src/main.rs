@@ -89,8 +89,9 @@ use self::{
     error::NodeSetupError,
     metrics::{
         default_prometheus_labels, init_triedb_phase_metrics, init_triedb_storage_metrics,
-        record_triedb_phase_metrics, record_triedb_storage_metrics, start_metrics_server,
-        MetricsServerState, NodePrometheusMetrics,
+        init_triedb_update_stats, record_triedb_phase_metrics, record_triedb_storage_metrics,
+        refresh_triedb_update_stats, start_metrics_server, MetricsServerState,
+        NodePrometheusMetrics,
     },
     state::NodeState,
 };
@@ -218,18 +219,6 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
     _ = std::fs::remove_file(node_state.control_panel_ipc_path.as_path());
     _ = std::fs::remove_file(node_state.statesync_ipc_path.as_path());
 
-    // FIXME this is super jank... we should always just pass the 1 file in monad-node
-    let mut statesync_triedb_path = node_state.triedb_path.clone();
-    if let Ok(files) = std::fs::read_dir(&statesync_triedb_path) {
-        let mut files: Vec<_> = files.collect();
-        assert_eq!(files.len(), 1, "nothing in triedb path");
-        statesync_triedb_path = files
-            .pop()
-            .unwrap()
-            .expect("failed to read triedb path")
-            .path();
-    }
-
     let mut bootstrap_nodes = Vec::new();
     for peer_config in &node_state.node_config.bootstrap.peers {
         let peer_id = NodeId::new(peer_config.secp256k1_pubkey);
@@ -314,7 +303,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         loopback: LoopbackExecutor::default(),
         state_sync: StateSyncExecutor::<SignatureType, SignatureCollectionType>::new(
             node_state.chain_config.chain_id(),
-            vec![statesync_triedb_path.to_string_lossy().to_string()],
+            node_state.triedb_path.to_string_lossy().to_string(),
             node_state.statesync_sq_thread_cpu,
             state_sync_init_peers,
             node_state
@@ -504,6 +493,12 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         }
     }
 
+    // A read-only triedb handle cannot see these counters; only the sidecar
+    // execution publishes carries them.
+    let triedb_stats_path = node_state.triedb_stats_path.clone();
+    let mut triedb_update_stats_metrics = init_triedb_update_stats(triedb_stats_path.as_deref());
+    let mut triedb_update_stats_misses = 0;
+
     let prometheus_metrics = Arc::new(
         NodePrometheusMetrics::new(
             prometheus_labels,
@@ -511,7 +506,8 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
             executor
                 .metrics()
                 .push(&triedb_phase_metrics)
-                .push(&triedb_storage_metrics),
+                .push(&triedb_storage_metrics)
+                .push(&triedb_update_stats_metrics),
             process_start,
         )
         .map_err(|err| {
@@ -564,7 +560,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                 None => futures_util::future::pending().boxed(),
             } => {
                 let otel_meter = maybe_otel_meter.as_ref().expect("otel_endpoint must have been set");
-                let executor_metrics = executor.metrics().push(&triedb_phase_metrics).push(&triedb_storage_metrics);
+                let executor_metrics = executor.metrics().push(&triedb_phase_metrics).push(&triedb_storage_metrics).push(&triedb_update_stats_metrics);
                 send_metrics(
                     otel_meter,
                     &mut gauge_cache,
@@ -577,6 +573,13 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                     record_triedb_storage_metrics(
                         &mut triedb_storage_metrics,
                         reader.storage_stats(),
+                    );
+                }
+                if let Some(path) = triedb_stats_path.as_deref() {
+                    refresh_triedb_update_stats(
+                        path,
+                        &mut triedb_update_stats_misses,
+                        &mut triedb_update_stats_metrics,
                     );
                 }
             }
