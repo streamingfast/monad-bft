@@ -302,7 +302,6 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         .expect("uds bind failed"),
         loopback: LoopbackExecutor::default(),
         state_sync: StateSyncExecutor::<SignatureType, SignatureCollectionType>::new(
-            node_state.chain_config.chain_id(),
             node_state.triedb_path.to_string_lossy().to_string(),
             node_state.statesync_sq_thread_cpu,
             state_sync_init_peers,
@@ -765,6 +764,7 @@ where
     );
 
     let mut dp_builder = DataplaneBuilder::new(network_config.max_mbps.into())
+        .with_udp_peer_bandwidth_mbps(network_config.peer_max_mbps.into())
         .with_udp_multishot(network_config.enable_udp_multishot);
     if let Some(buffer_size) = network_config.buffer_size {
         dp_builder = dp_builder.with_udp_buffer_size(buffer_size);
