@@ -9,6 +9,11 @@ changelog. The release workflow looks up the section matching the tag being rele
 publishes it as the GitHub release notes, so rename `## Unreleased` to the tag name (for
 example `## v0.15.3-fh3.0`) before tagging — the release job fails if no section matches.
 
+## v0.16.6-fh3.1
+
+* Bumped to [v0.16.6](https://github.com/category-labs/monad-bft/releases/tag/v0.16.6).
+* `monad-execution` points at the StreamingFast monad fork `v0.16.6-fh3.1`.
+
 ## v0.16.5-fh3.1
 
 * Bumped to [v0.16.5](https://github.com/category-labs/monad-bft/releases/tag/v0.16.5).
